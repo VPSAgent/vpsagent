@@ -7,6 +7,19 @@ const SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,46}[a-z0-9]$/;
 const DOMAIN_PATTERN =
   /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 const ENV_KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const DOCKER_IMAGE_REF_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{1,200}$/;
+const GIT_BRANCH_PATTERN = /^[A-Za-z0-9._/-]{1,120}$/;
+const DOCKERFILE_PATH_PATTERN = /^[A-Za-z0-9._/-]{1,200}$/;
+
+const FORBIDDEN_APP_ENV_PREFIXES = ["VPSAGENT_", "VPS_OS_", "DOCKER_", "LD_"];
+const FORBIDDEN_APP_ENV_EXACT = new Set([
+  "PATH",
+  "HOME",
+  "HOSTALIASES",
+  "IFS",
+  "ENV",
+  "BASH_ENV",
+]);
 
 const RESERVED_SLUGS = new Set([
   "core",
@@ -132,6 +145,73 @@ export function validateEnvKey(key: string): string {
     );
   }
   return key;
+}
+
+/**
+ * Returns true if an environment variable key is reserved/forbidden inside user apps
+ * (such as host control-plane prefixes or dynamic linker variables).
+ */
+export function isForbiddenAppEnvKey(key: string): boolean {
+  return (
+    FORBIDDEN_APP_ENV_EXACT.has(key) ||
+    FORBIDDEN_APP_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))
+  );
+}
+
+/**
+ * Validates a Docker image reference (registry/name:tag or @digest).
+ */
+export function validateDockerImageRef(image: string): string {
+  const trimmed = image.trim();
+  if (
+    !DOCKER_IMAGE_REF_PATTERN.test(trimmed) ||
+    trimmed.includes("..") ||
+    trimmed.includes("$")
+  ) {
+    throw new Error(`Invalid Docker image reference "${image}".`);
+  }
+  return trimmed;
+}
+
+/**
+ * Validates a Git branch or tag name, blocking flag injection (`-`), traversal (`..`),
+ * and control characters.
+ */
+export function validateGitBranch(branch: string): string {
+  const trimmed = branch.trim();
+  if (
+    !GIT_BRANCH_PATTERN.test(trimmed) ||
+    trimmed.startsWith("-") ||
+    trimmed.startsWith("/") ||
+    trimmed.endsWith("/") ||
+    trimmed.endsWith(".lock") ||
+    trimmed.includes("..") ||
+    trimmed.includes("//") ||
+    trimmed.includes("@{")
+  ) {
+    throw new Error(`Invalid Git branch name "${branch}".`);
+  }
+  return trimmed;
+}
+
+/**
+ * Validates a relative Dockerfile path inside a repository (e.g. `Dockerfile` or `docker/Dockerfile.prod`).
+ */
+export function validateDockerfilePath(dockerfilePath: string): string {
+  const trimmed = dockerfilePath.trim();
+  if (
+    !DOCKERFILE_PATH_PATTERN.test(trimmed) ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("-") ||
+    trimmed.includes("\\") ||
+    trimmed.includes("..") ||
+    trimmed.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
+    throw new Error(
+      `Invalid Dockerfile path "${dockerfilePath}": must be a safe relative path inside the repository.`,
+    );
+  }
+  return trimmed;
 }
 
 /**

@@ -1,0 +1,730 @@
+import http from "node:http";
+import https from "node:https";
+import { z } from "zod";
+import {
+  redactSecrets,
+  validateAppSlug,
+  validateDockerfilePath,
+  validateDomain,
+  validateGitBranch,
+  validateHttpBaseUrl,
+} from "./safety.js";
+import type { RegistryStore } from "./store.js";
+import {
+  type AppRecord,
+  type AppStatus,
+  AppStatusSchema,
+  DiskMetricsSchema,
+  SystemMetricsSchema,
+} from "./types.js";
+
+export const RuntimeLifecycleActionSchema = z.enum([
+  "start",
+  "stop",
+  "restart",
+  "status",
+]);
+export type RuntimeLifecycleAction = z.infer<
+  typeof RuntimeLifecycleActionSchema
+>;
+
+export const RuntimeLifecycleResultSchema = z.object({
+  slug: z.string(),
+  status: AppStatusSchema,
+  detail: z.string().optional(),
+});
+export type RuntimeLifecycleResult = z.infer<
+  typeof RuntimeLifecycleResultSchema
+>;
+
+export const RuntimeLogsResultSchema = z.object({
+  slug: z.string(),
+  lines: z.array(z.string()),
+});
+export type RuntimeLogsResult = z.infer<typeof RuntimeLogsResultSchema>;
+
+export const RuntimeRouteCaddyResultSchema = z.object({
+  ok: z.boolean(),
+  slug: z.string(),
+  domain: z.string().nullable(),
+  routed: z.boolean(),
+});
+export type RuntimeRouteCaddyResult = z.infer<
+  typeof RuntimeRouteCaddyResultSchema
+>;
+
+export const RuntimeRemoveResultSchema = z.object({
+  ok: z.boolean(),
+  slug: z.string(),
+});
+export type RuntimeRemoveResult = z.infer<typeof RuntimeRemoveResultSchema>;
+
+export const RuntimeStatusesResultSchema = z.object({
+  statuses: z.record(z.string(), AppStatusSchema),
+});
+export type RuntimeStatusesResult = z.infer<typeof RuntimeStatusesResultSchema>;
+
+export const RuntimeHealthResultSchema = z.object({
+  ok: z.boolean(),
+  service: z.string().optional(),
+});
+export type RuntimeHealthResult = z.infer<typeof RuntimeHealthResultSchema>;
+
+export const RuntimeHostStatsResultSchema = z.object({
+  metrics: SystemMetricsSchema,
+  disk: DiskMetricsSchema,
+});
+export type RuntimeHostStatsResult = z.infer<
+  typeof RuntimeHostStatsResultSchema
+>;
+
+export const RuntimeBuildGitResultSchema = z.object({
+  ok: z.boolean(),
+  slug: z.string(),
+  image: z.string(),
+  commitSha: z.string().nullable(),
+  durationMs: z.number().nonnegative(),
+  buildLogTail: z.array(z.string()),
+});
+export type RuntimeBuildGitResult = z.infer<typeof RuntimeBuildGitResultSchema>;
+
+export const ContainerSecurityAuditSchema = z.object({
+  capDropAll: z.boolean(),
+  noNewPrivileges: z.boolean(),
+  privileged: z.boolean(),
+  hasDockerSocketMount: z.boolean(),
+  isolatedNetworkOnly: z.boolean(),
+  memoryLimitMb: z.number().int().nonnegative().nullable(),
+  nanoCpus: z.number().int().nonnegative().nullable(),
+  lockedApartmentCompliant: z.boolean(),
+});
+export type ContainerSecurityAudit = z.infer<
+  typeof ContainerSecurityAuditSchema
+>;
+
+export const InspectedContainerSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  image: z.string(),
+  state: z.string(),
+  running: z.boolean(),
+  exitCode: z.number().int(),
+  restartCount: z.number().int().nonnegative(),
+  startedAt: z.string().nullable(),
+  healthStatus: z.enum(["healthy", "unhealthy", "starting", "none"]),
+  lastHealthOutput: z.string().nullable(),
+  networks: z.array(z.string()),
+  ipAddress: z.string().nullable(),
+  security: ContainerSecurityAuditSchema,
+});
+export type InspectedContainer = z.infer<typeof InspectedContainerSchema>;
+
+export const HttpProbeResultSchema = z.object({
+  attempted: z.boolean(),
+  ok: z.boolean(),
+  statusCode: z.number().int().nullable(),
+  latencyMs: z.number().nonnegative().nullable(),
+  contentType: z.string().nullable(),
+  error: z.string().nullable(),
+});
+export type HttpProbeResult = z.infer<typeof HttpProbeResultSchema>;
+
+export const RuntimeInspectResultSchema = z.object({
+  slug: z.string(),
+  status: AppStatusSchema,
+  workspaceExists: z.boolean(),
+  composeExists: z.boolean(),
+  caddyRouteConfigured: z.boolean(),
+  caddyDomains: z.array(z.string()),
+  containers: z.array(InspectedContainerSchema),
+  lockedApartmentCompliant: z.boolean(),
+  httpProbe: HttpProbeResultSchema.nullable(),
+});
+export type RuntimeInspectResult = z.infer<typeof RuntimeInspectResultSchema>;
+
+export const RuntimeReadinessResultSchema = z.object({
+  ready: z.boolean(),
+  slug: z.string(),
+  status: AppStatusSchema,
+  attempts: z.number().int().nonnegative(),
+  elapsedMs: z.number().nonnegative(),
+  httpProbe: HttpProbeResultSchema.nullable(),
+  reason: z.string().nullable(),
+});
+export type RuntimeReadinessResult = z.infer<
+  typeof RuntimeReadinessResultSchema
+>;
+
+export interface RuntimeInspectOptions {
+  probeHttp?: boolean | undefined;
+  internalPort?: number | undefined;
+  probePath?: string | undefined;
+}
+
+export interface RuntimeBuildGitInput {
+  slug: string;
+  gitRepoUrl: string;
+  gitBranch?: string | null | undefined;
+  dockerfilePath?: string | undefined;
+  timeoutSeconds?: number | undefined;
+}
+
+export interface RuntimeReadinessOptions {
+  internalPort: number;
+  probePath?: string | undefined;
+  timeoutSeconds?: number | undefined;
+  pollIntervalMs?: number | undefined;
+}
+
+/** Narrow, allowlisted runtime bridge interface between core services and host Docker/Caddy. */
+export interface RuntimeBridge {
+  health(): Promise<RuntimeHealthResult>;
+  getHostStats(): Promise<RuntimeHostStatsResult>;
+  lifecycle(
+    slug: string,
+    action: RuntimeLifecycleAction,
+  ): Promise<RuntimeLifecycleResult>;
+  buildGitImage(input: RuntimeBuildGitInput): Promise<RuntimeBuildGitResult>;
+  getLogs(slug: string, tail: number): Promise<string[]>;
+  routeCaddy(input: {
+    slug: string;
+    domain: string | null;
+    internalPort: number;
+  }): Promise<RuntimeRouteCaddyResult>;
+  removeWorkload(
+    slug: string,
+    options?: { removeFiles?: boolean | undefined },
+  ): Promise<RuntimeRemoveResult>;
+  getStatuses(slugs: string[]): Promise<Record<string, AppStatus>>;
+  inspectWorkload(
+    slug: string,
+    options?: RuntimeInspectOptions,
+  ): Promise<RuntimeInspectResult>;
+  waitForReadiness(
+    slug: string,
+    options: RuntimeReadinessOptions,
+  ): Promise<RuntimeReadinessResult>;
+}
+
+export class RuntimeBridgeError extends Error {
+  readonly statusCode: number;
+
+  constructor(statusCode: number, message: string) {
+    super(redactSecrets(message));
+    this.name = "RuntimeBridgeError";
+    this.statusCode = statusCode;
+  }
+}
+
+export interface HttpRuntimeBridgeClientOptions {
+  socketPath?: string | undefined;
+  baseUrl?: string | undefined;
+  runtimeToken?: string | undefined;
+  defaultTimeoutMs?: number | undefined;
+  maxResponseBytes?: number | undefined;
+}
+
+const DEFAULT_TIMEOUT_MS = 240_000;
+const BUILD_TIMEOUT_MS = 630_000;
+const SHORT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+const MAX_STATUS_BATCH = 100;
+
+/**
+ * Typed HTTP-over-Unix-Socket (or loopback HTTP for tests) client for the host
+ * `vpsagent-runtime` daemon. Enforces input validation, wall-clock timeouts,
+ * response caps, and secret redaction on every boundary.
+ */
+export class HttpRuntimeBridgeClient implements RuntimeBridge {
+  private readonly socketPath: string | undefined;
+  private readonly parsedBaseUrl: URL | undefined;
+  private readonly runtimeToken: string | undefined;
+  private readonly defaultTimeoutMs: number;
+  private readonly maxResponseBytes: number;
+
+  constructor(options: HttpRuntimeBridgeClientOptions) {
+    const socket = options.socketPath?.trim() || undefined;
+    const rawUrl = options.baseUrl?.trim() || undefined;
+    if (!socket && !rawUrl) {
+      throw new Error(
+        "HttpRuntimeBridgeClient requires either socketPath or baseUrl.",
+      );
+    }
+
+    this.socketPath = socket;
+    this.parsedBaseUrl = rawUrl
+      ? new URL(validateHttpBaseUrl(rawUrl))
+      : undefined;
+    this.runtimeToken = options.runtimeToken?.trim() || undefined;
+    this.defaultTimeoutMs = Math.max(
+      500,
+      options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS,
+    );
+    this.maxResponseBytes = Math.max(
+      4096,
+      options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES,
+    );
+  }
+
+  async health(): Promise<RuntimeHealthResult> {
+    const raw = await this.requestJson(
+      "GET",
+      "/health",
+      undefined,
+      SHORT_TIMEOUT_MS,
+    );
+    return RuntimeHealthResultSchema.parse(raw);
+  }
+
+  async getHostStats(): Promise<RuntimeHostStatsResult> {
+    const raw = await this.requestJson(
+      "GET",
+      "/v1/host/stats",
+      undefined,
+      SHORT_TIMEOUT_MS,
+    );
+    return RuntimeHostStatsResultSchema.parse(raw);
+  }
+
+  async lifecycle(
+    slug: string,
+    action: RuntimeLifecycleAction,
+  ): Promise<RuntimeLifecycleResult> {
+    const safeSlug = validateAppSlug(slug);
+    const safeAction = RuntimeLifecycleActionSchema.parse(action);
+    const timeoutMs =
+      safeAction === "status" ? SHORT_TIMEOUT_MS : this.defaultTimeoutMs;
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/lifecycle",
+      { slug: safeSlug, action: safeAction },
+      timeoutMs,
+    );
+    const parsed = RuntimeLifecycleResultSchema.parse(raw);
+    return {
+      ...parsed,
+      ...(parsed.detail !== undefined
+        ? { detail: redactSecrets(parsed.detail) }
+        : {}),
+    };
+  }
+
+  async buildGitImage(
+    input: RuntimeBuildGitInput,
+  ): Promise<RuntimeBuildGitResult> {
+    const safeSlug = validateAppSlug(input.slug);
+    const safeRepoUrl = validateHttpBaseUrl(input.gitRepoUrl, {
+      allowPrivateNetwork: false,
+    });
+    if (!safeRepoUrl.startsWith("https://")) {
+      throw new Error("Git repository URL must use https://.");
+    }
+    const safeBranch = input.gitBranch
+      ? validateGitBranch(input.gitBranch)
+      : undefined;
+    const safeDockerfile = input.dockerfilePath
+      ? validateDockerfilePath(input.dockerfilePath)
+      : "Dockerfile";
+    const safeTimeoutSeconds =
+      input.timeoutSeconds !== undefined
+        ? z.number().int().min(10).max(600).parse(input.timeoutSeconds)
+        : undefined;
+
+    const httpTimeoutMs = safeTimeoutSeconds
+      ? Math.max(SHORT_TIMEOUT_MS, (safeTimeoutSeconds + 30) * 1000)
+      : Math.max(this.defaultTimeoutMs, BUILD_TIMEOUT_MS);
+
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/build-git",
+      {
+        slug: safeSlug,
+        gitRepoUrl: safeRepoUrl,
+        ...(safeBranch !== undefined ? { gitBranch: safeBranch } : {}),
+        dockerfilePath: safeDockerfile,
+        ...(safeTimeoutSeconds !== undefined
+          ? { timeoutSeconds: safeTimeoutSeconds }
+          : {}),
+      },
+      httpTimeoutMs,
+    );
+    const parsed = RuntimeBuildGitResultSchema.parse(raw);
+    return {
+      ...parsed,
+      buildLogTail: parsed.buildLogTail.map((line) => redactSecrets(line)),
+    };
+  }
+
+  async getLogs(slug: string, tail: number): Promise<string[]> {
+    const safeSlug = validateAppSlug(slug);
+    const safeTail = z.number().int().min(1).max(500).parse(tail);
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/logs",
+      { slug: safeSlug, tail: safeTail },
+      SHORT_TIMEOUT_MS,
+    );
+    const parsed = RuntimeLogsResultSchema.parse(raw);
+    const joined = redactSecrets(parsed.lines.join("\n"));
+    return joined ? joined.split(/\r?\n/).slice(-safeTail) : [];
+  }
+
+  async routeCaddy(input: {
+    slug: string;
+    domain: string | null;
+    internalPort: number;
+  }): Promise<RuntimeRouteCaddyResult> {
+    const safeSlug = validateAppSlug(input.slug);
+    const safeDomain = input.domain ? validateDomain(input.domain) : null;
+    const safePort = z
+      .number()
+      .int()
+      .min(1)
+      .max(65535)
+      .parse(input.internalPort);
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/route-caddy",
+      {
+        slug: safeSlug,
+        domain: safeDomain,
+        internalPort: safePort,
+      },
+      this.defaultTimeoutMs,
+    );
+    return RuntimeRouteCaddyResultSchema.parse(raw);
+  }
+
+  async removeWorkload(
+    slug: string,
+    options?: { removeFiles?: boolean | undefined },
+  ): Promise<RuntimeRemoveResult> {
+    const safeSlug = validateAppSlug(slug);
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/remove",
+      {
+        slug: safeSlug,
+        removeFiles: Boolean(options?.removeFiles),
+      },
+      this.defaultTimeoutMs,
+    );
+    return RuntimeRemoveResultSchema.parse(raw);
+  }
+
+  async getStatuses(slugs: string[]): Promise<Record<string, AppStatus>> {
+    const uniqueSlugs = Array.from(
+      new Set(slugs.map((slug) => validateAppSlug(slug))),
+    );
+    if (uniqueSlugs.length === 0) {
+      return {};
+    }
+
+    const merged: Record<string, AppStatus> = {};
+    for (let i = 0; i < uniqueSlugs.length; i += MAX_STATUS_BATCH) {
+      const batch = uniqueSlugs.slice(i, i + MAX_STATUS_BATCH);
+      const raw = await this.requestJson(
+        "POST",
+        "/v1/apps/statuses",
+        { slugs: batch },
+        SHORT_TIMEOUT_MS,
+      );
+      const parsed = RuntimeStatusesResultSchema.parse(raw);
+      Object.assign(merged, parsed.statuses);
+    }
+    return merged;
+  }
+
+  async inspectWorkload(
+    slug: string,
+    options?: RuntimeInspectOptions,
+  ): Promise<RuntimeInspectResult> {
+    const safeSlug = validateAppSlug(slug);
+    const safePort =
+      options?.internalPort !== undefined
+        ? z.number().int().min(1).max(65535).parse(options.internalPort)
+        : undefined;
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/inspect",
+      {
+        slug: safeSlug,
+        probeHttp: Boolean(options?.probeHttp),
+        ...(safePort !== undefined ? { internalPort: safePort } : {}),
+        ...(options?.probePath !== undefined
+          ? { probePath: options.probePath }
+          : {}),
+      },
+      SHORT_TIMEOUT_MS,
+    );
+    return RuntimeInspectResultSchema.parse(raw);
+  }
+
+  async waitForReadiness(
+    slug: string,
+    options: RuntimeReadinessOptions,
+  ): Promise<RuntimeReadinessResult> {
+    const safeSlug = validateAppSlug(slug);
+    const safePort = z
+      .number()
+      .int()
+      .min(1)
+      .max(65535)
+      .parse(options.internalPort);
+    const safeTimeoutS =
+      options.timeoutSeconds !== undefined
+        ? z.number().min(0.1).max(60).parse(options.timeoutSeconds)
+        : undefined;
+    const safePollMs =
+      options.pollIntervalMs !== undefined
+        ? z.number().int().min(10).max(5000).parse(options.pollIntervalMs)
+        : undefined;
+
+    const httpTimeoutMs = Math.max(
+      SHORT_TIMEOUT_MS,
+      Math.ceil(((safeTimeoutS ?? 15) + 10) * 1000),
+    );
+
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/readiness",
+      {
+        slug: safeSlug,
+        internalPort: safePort,
+        ...(options.probePath !== undefined
+          ? { probePath: options.probePath }
+          : {}),
+        ...(safeTimeoutS !== undefined ? { timeoutSeconds: safeTimeoutS } : {}),
+        ...(safePollMs !== undefined ? { pollIntervalMs: safePollMs } : {}),
+      },
+      httpTimeoutMs,
+    );
+    return RuntimeReadinessResultSchema.parse(raw);
+  }
+
+  private async requestJson(
+    method: "GET" | "POST",
+    routePath: string,
+    body: Record<string, unknown> | undefined,
+    timeoutMs: number,
+  ): Promise<unknown> {
+    const payload = body !== undefined ? JSON.stringify(body) : undefined;
+    const headers: Record<string, string> = {
+      accept: "application/json",
+    };
+    if (this.runtimeToken) {
+      headers["x-vpsagent-runtime-token"] = this.runtimeToken;
+    }
+    if (payload !== undefined) {
+      headers["content-type"] = "application/json";
+      headers["content-length"] = String(Buffer.byteLength(payload, "utf8"));
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let req: http.ClientRequest | undefined;
+      const timer = setTimeout(() => {
+        req?.destroy();
+        fail(
+          new RuntimeBridgeError(
+            504,
+            `Host runtime bridge timed out after ${timeoutMs}ms.`,
+          ),
+        );
+      }, timeoutMs);
+      timer.unref();
+
+      const fail = (err: RuntimeBridgeError) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      };
+
+      const succeed = (value: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+
+      const onResponse = (res: http.IncomingMessage) => {
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+
+        res.on("data", (chunk: Buffer) => {
+          totalBytes += chunk.length;
+          if (totalBytes > this.maxResponseBytes) {
+            res.destroy();
+            fail(
+              new RuntimeBridgeError(
+                502,
+                "Runtime bridge response exceeded maximum allowed size.",
+              ),
+            );
+            return;
+          }
+          chunks.push(chunk);
+        });
+
+        res.on("error", (err) => {
+          fail(
+            new RuntimeBridgeError(
+              502,
+              `Runtime bridge stream error: ${err.message}`,
+            ),
+          );
+        });
+
+        res.on("end", () => {
+          if (settled) return;
+          const text = Buffer.concat(chunks).toString("utf8");
+          const status = res.statusCode ?? 502;
+          let parsed: unknown = null;
+          if (text.trim()) {
+            try {
+              parsed = JSON.parse(text);
+            } catch {
+              fail(
+                new RuntimeBridgeError(
+                  status >= 400 ? status : 502,
+                  `Runtime bridge returned invalid JSON (HTTP ${status}).`,
+                ),
+              );
+              return;
+            }
+          }
+
+          if (status >= 400) {
+            const msg =
+              typeof parsed === "object" &&
+              parsed !== null &&
+              "error" in parsed &&
+              typeof (parsed as { error: unknown }).error === "string"
+                ? (parsed as { error: string }).error
+                : `Runtime bridge failed with HTTP ${status}.`;
+            fail(new RuntimeBridgeError(status, msg));
+            return;
+          }
+
+          succeed(parsed);
+        });
+      };
+
+      if (this.socketPath) {
+        req = http.request(
+          {
+            socketPath: this.socketPath,
+            path: routePath,
+            method,
+            headers,
+          },
+          onResponse,
+        );
+      } else if (this.parsedBaseUrl) {
+        const basePath = this.parsedBaseUrl.pathname.replace(/\/+$/, "");
+        const transport =
+          this.parsedBaseUrl.protocol === "https:" ? https : http;
+        req = transport.request(
+          {
+            protocol: this.parsedBaseUrl.protocol,
+            hostname: this.parsedBaseUrl.hostname,
+            port: this.parsedBaseUrl.port || undefined,
+            path: `${basePath}${routePath}`,
+            method,
+            headers,
+          },
+          onResponse,
+        );
+      } else {
+        fail(
+          new RuntimeBridgeError(500, "Runtime bridge transport is unconfigured."),
+        );
+        return;
+      }
+
+      req.on("error", (err) => {
+        fail(
+          new RuntimeBridgeError(
+            503,
+            `Host runtime bridge is unavailable: ${err.message}`,
+          ),
+        );
+      });
+
+      if (payload !== undefined) {
+        req.write(payload);
+      }
+      req.end();
+    });
+  }
+}
+
+/** Builds an `HttpRuntimeBridgeClient` from standard `VPSAGENT_RUNTIME_*` environment variables. */
+export function createRuntimeBridgeFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): HttpRuntimeBridgeClient | undefined {
+  const socketPath = env.VPSAGENT_RUNTIME_SOCKET?.trim();
+  const baseUrl = env.VPSAGENT_RUNTIME_URL?.trim();
+  const runtimeToken = env.VPSAGENT_RUNTIME_TOKEN?.trim();
+  if (!socketPath && !baseUrl) {
+    return undefined;
+  }
+  return new HttpRuntimeBridgeClient({
+    socketPath,
+    baseUrl,
+    runtimeToken,
+  });
+}
+
+export type StatusSyncProvider =
+  | Pick<RuntimeBridge, "getStatuses">
+  | ((
+      slugs: string[],
+    ) => Promise<Record<string, AppStatus>> | Record<string, AppStatus>);
+
+/**
+ * Queries live container statuses from a runtime bridge and updates drifted registry
+ * records while preserving workloads currently in `"provisioning"` or `"building"`.
+ */
+export async function syncAppStatuses(
+  store: RegistryStore,
+  provider: StatusSyncProvider | undefined,
+  slugs?: string[],
+): Promise<AppRecord[]> {
+  const existingApps = store.listApps();
+  if (!provider || existingApps.length === 0) {
+    return existingApps;
+  }
+
+  const isSyncEligible = (app: AppRecord): boolean =>
+    app.status !== "provisioning" && app.status !== "building";
+
+  const targetSlugs = slugs
+    ? slugs.filter((s) =>
+        existingApps.some((app) => app.slug === s && isSyncEligible(app)),
+      )
+    : existingApps.filter(isSyncEligible).map((app) => app.slug);
+
+  if (targetSlugs.length === 0) {
+    return existingApps;
+  }
+
+  try {
+    const fetchStatuses =
+      typeof provider === "function"
+        ? provider
+        : (ids: string[]) => provider.getStatuses(ids);
+    const liveStatuses = await fetchStatuses(targetSlugs);
+    for (const app of existingApps) {
+      if (!isSyncEligible(app)) continue;
+      const live = liveStatuses[app.slug];
+      if (live && live !== app.status) {
+        store.updateAppStatus(app.slug, live);
+      }
+    }
+    return store.listApps();
+  } catch {
+    return existingApps;
+  }
+}

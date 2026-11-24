@@ -19,14 +19,14 @@ We built the foundation that keeps everything organized and safe:
 
 ---
 
-## Step 2 — The Locked Apartments *(Next)*
-Next, we build the part that actually runs your apps safely:
-- [ ] **Apartment blueprints:** Automatically creates the safety rules for each app — no master permissions, strict limits on how much power/memory it can use, and its own private room for optional databases (like Postgres or Redis).
-- [ ] **The trusted handyman (Runtime Bridge):** A small, locked-down helper on the server that only does a short list of allowed jobs: starting/stopping apps, downloading code from GitHub and packaging it, checking server health, and updating web addresses. Your AI never gets raw server access.
+## Step 2 — The Locked Apartments *(Done)*
+We built the part that actually runs your apps safely:
+- [x] **Apartment blueprints:** Automatically creates the safety rules for each app — no master permissions, strict limits on how much power/memory it can use, and its own private room for optional databases (like Postgres or Redis).
+- [x] **The trusted handyman (Runtime Bridge):** A small, locked-down helper on the server that only does a short list of allowed jobs: starting/stopping apps, downloading code from GitHub and packaging it, checking server health, and updating web addresses. Your AI never gets raw server access.
 
 ---
 
-## Step 3 — The Front Desk & AI Doorway
+## Step 3 — The Front Desk & AI Doorway *(Next)*
 Next, we connect everything to a web server so both you and your AI can talk to it:
 - [ ] **2-step first-time setup:** Right after you install VPSAgent, you open one private link to:
   1. Choose your login password.
