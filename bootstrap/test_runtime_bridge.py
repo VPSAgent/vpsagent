@@ -232,8 +232,9 @@ networks:
             "REDIS_PASSWORD": "r$dis_pass",
         }
         rendered = rb.validate_and_render_compose(compose, "shop-api", app_dir, env_map, "/tmp/safe.env")
-        self.assertEqual(rendered["services"]["postgres"]["environment"]["POSTGRES_PASSWORD"], "p$ss#word_with_dollar")
-        self.assertEqual(rendered["services"]["redis"]["command"][-1], "r$dis_pass")
+        # Literal `$` inside resolved passwords is escaped as `$$` so Docker Compose never re-interpolates
+        self.assertEqual(rendered["services"]["postgres"]["environment"]["POSTGRES_PASSWORD"], "p$$ss#word_with_dollar")
+        self.assertEqual(rendered["services"]["redis"]["command"][-1], "r$$dis_pass")
         self.assertEqual(rendered["services"]["app"]["env_file"], [{"path": "/tmp/safe.env", "required": True}])
 
         # Root user must be rejected
@@ -375,6 +376,191 @@ networks:
         )
         self.assertNotIn("vpsmcp_supersecret1234567890abcd", redacted)
         self.assertNotIn("mysecretvalue", redacted)
+
+    def test_core_domain_routing_and_atomic_rollback(self) -> None:
+        core_dir = os.path.join(self.tmp, "caddy-core")
+        os.makedirs(core_dir, exist_ok=True)
+        fail_flag = os.path.join(self.tmp, "fail-validate")
+        docker_py = os.path.join(self.tmp, "caddy_docker.py")
+        with open(docker_py, "w", encoding="utf-8") as fh:
+            fh.write(
+                f"""import os, sys
+args = sys.argv[1:]
+if "validate" in args and os.path.exists({fail_flag!r}):
+    sys.stderr.write("invalid caddy config\\n")
+    sys.exit(1)
+sys.exit(0)
+"""
+            )
+        docker_sh = os.path.join(self.tmp, "caddy-docker")
+        with open(docker_sh, "w", encoding="utf-8") as fh:
+            fh.write(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n')
+        os.chmod(docker_sh, 0o755)
+
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_core_dir=core_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+        )
+
+        # Success writes dashboard.caddy with HTTPS domain & tls email
+        res = svc.route_core_domain({"domain": "vps.example.com", "acmeEmail": "ops@example.com"})
+        self.assertTrue(res["httpsActive"])
+        dash_caddy = os.path.join(core_dir, "dashboard.caddy")
+        content = Path(dash_caddy).read_text(encoding="utf-8")
+        self.assertIn("vps.example.com {", content)
+        self.assertIn("tls ops@example.com", content)
+
+        # Failed caddy validate restores prior working dashboard.caddy
+        Path(fail_flag).write_text("1", encoding="utf-8")
+        with self.assertRaises(rb.BridgeRequestError) as ctx:
+            svc.route_core_domain({"domain": "broken.example.com", "acmeEmail": None})
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertIn("vps.example.com {", Path(dash_caddy).read_text(encoding="utf-8"))
+
+        # Conflict with an app domain returns 409
+        Path(fail_flag).unlink()
+        Path(os.path.join(self.caddy_dir, "blog.caddy")).write_text(
+            "blog.example.com {\n\treverse_proxy vpsagent-app-blog:3000\n}\n", encoding="utf-8"
+        )
+        with self.assertRaises(rb.BridgeRequestError) as ctx2:
+            svc.route_core_domain({"domain": "blog.example.com"})
+        self.assertEqual(ctx2.exception.status_code, 409)
+
+    def test_companion_volume_ownership_and_private_permissions(self) -> None:
+        from unittest import mock
+
+        app_dir = os.path.join(self.apps_root, "db-app")
+        os.makedirs(app_dir, exist_ok=True)
+        chown_calls: list[tuple[str, int, int]] = []
+
+        def fake_chown(p: str, uid: int, gid: int) -> None:
+            chown_calls.append((p, uid, gid))
+
+        with mock.patch.object(os, "geteuid", return_value=0), mock.patch.object(
+            os, "chown", side_effect=fake_chown
+        ):
+            pg_dir = rb._prepare_service_volume_dir(app_dir, "data/postgres", "70:70", "db-app")
+            redis_dir = rb._prepare_service_volume_dir(app_dir, "data/redis", "999:999", "db-app")
+
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(app_dir, "data")).st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(os.stat(pg_dir).st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(os.stat(redis_dir).st_mode), 0o700)
+        self.assertIn((pg_dir, 70, 70), chown_calls)
+        self.assertIn((redis_dir, 999, 999), chown_calls)
+
+    def test_pinned_git_connect_proxy_enforces_host_and_public_ip(self) -> None:
+        import socket as sock_mod
+
+        with rb._PinnedGitConnectProxy("github.com", 443, ["140.82.121.4"], connect_timeout=1.0) as proxy:
+            # Connecting to a mismatched host via CONNECT must return 403 Forbidden
+            with sock_mod.create_connection(("127.0.0.1", proxy.port), timeout=2.0) as conn:
+                conn.sendall(b"CONNECT evil.internal:443 HTTP/1.1\r\nHost: evil.internal:443\r\n\r\n")
+                resp = conn.recv(1024).decode("latin-1")
+                self.assertIn("403 Forbidden", resp)
+
+        # Even if a private IP were passed, proxy re-asserts public IP at connect time -> 502
+        with rb._PinnedGitConnectProxy("rebind.example.com", 443, ["127.0.0.1"], connect_timeout=1.0) as proxy2:
+            with sock_mod.create_connection(("127.0.0.1", proxy2.port), timeout=2.0) as conn:
+                conn.sendall(b"CONNECT rebind.example.com:443 HTTP/1.1\r\nHost: rebind.example.com:443\r\n\r\n")
+                resp = conn.recv(1024).decode("latin-1")
+                self.assertIn("502 Bad Gateway", resp)
+
+    def test_compose_context_separates_app_env_and_omits_cli_env_file(self) -> None:
+        app_dir = os.path.join(self.apps_root, "iso-app")
+        os.makedirs(os.path.join(app_dir, "data"), exist_ok=True)
+        Path(os.path.join(app_dir, ".env")).write_text("APP_SLUG='iso-app'\nSECRET='a$b'\n", encoding="utf-8")
+        Path(os.path.join(app_dir, "docker-compose.yml")).write_text(
+            'services:\n  app:\n    image: "nginx:alpine"\n    env_file:\n      - .env\n    cpus: "0.5"\n    mem_limit: "128m"\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    networks:\n      - app_net\nnetworks:\n  app_net:\n    driver: bridge\n',
+            encoding="utf-8",
+        )
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            runtime_token="secret-token-for-unit-test-1234",
+        )
+        with svc._validated_compose_context(app_dir, "iso-app") as (compose_path, project_dir):
+            self.assertNotEqual(project_dir, app_dir)
+            self.assertFalse(os.path.exists(os.path.join(project_dir, ".env")))
+            self.assertTrue(os.path.exists(os.path.join(project_dir, "app.env")))
+            cmd = svc._compose_cmd_base("iso-app", project_dir, compose_path)
+            self.assertNotIn("--env-file", cmd)
+            self.assertEqual(cmd[cmd.index("--project-directory") + 1], project_dir)
+
+    def test_logs_budget_and_readiness_starting_healthcheck_and_worker(self) -> None:
+        # 1. Byte-budgeted logs
+        app_dir = os.path.join(self.apps_root, "noisy-app")
+        os.makedirs(app_dir, exist_ok=True)
+        Path(os.path.join(app_dir, "docker-compose.yml")).write_text(
+            'services:\n  app:\n    image: "nginx:alpine"\n    cpus: "0.5"\n    mem_limit: "128m"\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    networks:\n      - app_net\nnetworks:\n  app_net:\n    driver: bridge\n',
+            encoding="utf-8",
+        )
+        health_state_file = os.path.join(self.tmp, "health-state.txt")
+        Path(health_state_file).write_text("starting", encoding="utf-8")
+        docker_py = os.path.join(self.tmp, "noisy_docker.py")
+        with open(docker_py, "w", encoding="utf-8") as fh:
+            fh.write(
+                f"""import json, sys
+from pathlib import Path
+args = sys.argv[1:]
+if "logs" in args:
+    for i in range(120):
+        print(f"line-{{i:04d}}-" + ("x" * 1000))
+    sys.exit(0)
+if args[:1] == ["ps"]:
+    print("cid-noisy")
+    sys.exit(0)
+if args[:1] == ["inspect"]:
+    h = Path({health_state_file!r}).read_text().strip()
+    print(json.dumps([{{
+        "Id": "1234567890abcdef",
+        "Name": "/vpsagent-app-noisy-app",
+        "RestartCount": 0,
+        "Config": {{"Image": "nginx:alpine"}},
+        "State": {{"Status": "running", "Running": True, "ExitCode": 0, "Health": {{"Status": h}}}},
+        "HostConfig": {{"CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges:true"], "Privileged": False, "Binds": []}},
+        "Mounts": [],
+        "NetworkSettings": {{"Networks": {{"vpsagent-noisy-app_app_net": {{"IPAddress": "127.0.0.1"}}}}}},
+    }}]))
+    sys.exit(0)
+sys.exit(0)
+"""
+            )
+        docker_sh = os.path.join(self.tmp, "noisy-docker")
+        with open(docker_sh, "w", encoding="utf-8") as fh:
+            fh.write(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n')
+        os.chmod(docker_sh, 0o755)
+
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+        )
+
+        log_res = svc.logs({"slug": "noisy-app", "tail": 200})
+        self.assertTrue(log_res["truncated"])
+        self.assertLessEqual(len(json.dumps(log_res).encode("utf-8")), rb.MAX_LOGS_RESPONSE_BYTES + 256)
+
+        # 2. Readiness must NOT return ready while Docker healthStatus is still "starting"
+        starting_res = svc.check_readiness(
+            {"slug": "noisy-app", "internalPort": 8080, "probeHttp": False, "timeoutSeconds": 0.4, "pollIntervalMs": 30}
+        )
+        self.assertFalse(starting_res["ready"])
+        self.assertIn("starting", starting_res["reason"])
+
+        # 3. Once Docker healthStatus transitions to "healthy", non-HTTP worker succeeds with probeHttp=False
+        Path(health_state_file).write_text("healthy", encoding="utf-8")
+        healthy_worker = svc.check_readiness(
+            {"slug": "noisy-app", "internalPort": 8080, "probeHttp": False, "timeoutSeconds": 1.0, "pollIntervalMs": 20}
+        )
+        self.assertTrue(healthy_worker["ready"])
+        self.assertIsNone(healthy_worker["httpProbe"])
 
 
 if __name__ == "__main__":

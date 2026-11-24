@@ -1,12 +1,9 @@
 import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { serve } from "@hono/node-server";
 import {
   RegistryStore,
   createRuntimeBridgeFromEnv,
-  formatEnvFile,
 } from "@vpsagent/shared";
 import { createVpsAgentApp } from "./app.js";
 
@@ -17,6 +14,10 @@ export * from "./mcp-gateway.js";
 
 function startServerFromEnv(): void {
   const port = Number.parseInt(process.env.PORT ?? "3001", 10);
+  const localSetupPort = Number.parseInt(
+    process.env.VPSAGENT_LOCAL_SETUP_PORT ?? "3002",
+    10,
+  );
   const dbPath =
     process.env.VPSAGENT_DB_PATH?.trim() || "/var/lib/vpsagent/data/registry.db";
   const appsRoot =
@@ -27,7 +28,6 @@ function startServerFromEnv(): void {
     crypto.randomBytes(32).toString("hex");
   const sessionSecret =
     process.env.VPSAGENT_SESSION_SECRET?.trim() || encryptionSecret;
-  const domainConfigFile = process.env.VPSAGENT_DOMAIN_CONFIG_FILE?.trim();
 
   const bridge = createRuntimeBridgeFromEnv(process.env);
   if (!bridge) {
@@ -37,6 +37,23 @@ function startServerFromEnv(): void {
   }
 
   const store = new RegistryStore(dbPath, { encryptionSecret });
+
+  // Sync initial HTTPS domain state if installer pre-configured a real domain in Caddy
+  const initialDomain = process.env.VPSAGENT_DOMAIN?.trim();
+  const initialEmail = process.env.VPSAGENT_ACME_EMAIL?.trim() || null;
+  if (
+    initialDomain &&
+    initialDomain !== "localhost" &&
+    !store.getSetupState().domain
+  ) {
+    store.updateSetupState({
+      domain: initialDomain,
+      acmeEmail: initialEmail,
+      httpsActive: true,
+    });
+  }
+
+  // 1. Primary Caddy-fronted server (strictly requires HTTPS via X-Forwarded-Proto)
   const { app, generatedClaimToken } = createVpsAgentApp({
     store,
     bridge,
@@ -46,31 +63,38 @@ function startServerFromEnv(): void {
     webDistDir: process.env.VPSAGENT_WEB_DIST,
     publicIp: process.env.VPSAGENT_PUBLIC_IP,
     trustProxy: process.env.VPSAGENT_TRUST_PROXY === "true",
-    onDomainUpdated: domainConfigFile
-      ? (domain, acmeEmail) => {
-          fs.mkdirSync(path.dirname(domainConfigFile), { recursive: true });
-          const vars: Record<string, string> = {
-            VPSAGENT_DOMAIN: domain ?? "localhost",
-            VPSAGENT_SITE_ADDRESS: domain ?? ":80",
-            ...(acmeEmail ? { VPSAGENT_ACME_EMAIL: acmeEmail } : {}),
-          };
-          fs.writeFileSync(domainConfigFile, formatEnvFile(vars), {
-            encoding: "utf8",
-            mode: 0o600,
-          });
-        }
-      : undefined,
+    isLocalListener: false,
   });
 
   if (generatedClaimToken) {
     console.log(
-      `[vpsagent-api] First-boot setup link ready (open in browser): /#claim=${generatedClaimToken}`,
+      `[vpsagent-api] First-boot setup link ready (open via HTTPS or SSH tunnel): /#claim=${generatedClaimToken}`,
     );
   }
 
   serve({ fetch: app.fetch, port }, (info) => {
-    console.log(`[vpsagent-api] Listening on http://0.0.0.0:${info.port}`);
+    console.log(`[vpsagent-api] Primary server listening on :${info.port}`);
   });
+
+  // 2. Dedicated loopback-only local setup listener (published ONLY on host 127.0.0.1:3002)
+  if (Number.isFinite(localSetupPort) && localSetupPort > 0 && localSetupPort !== port) {
+    const { app: localApp } = createVpsAgentApp({
+      store,
+      bridge,
+      appsRoot,
+      sessionSecret,
+      claimToken: process.env.VPSAGENT_CLAIM_TOKEN,
+      webDistDir: process.env.VPSAGENT_WEB_DIST,
+      publicIp: process.env.VPSAGENT_PUBLIC_IP,
+      trustProxy: false,
+      isLocalListener: true,
+    });
+    serve({ fetch: localApp.fetch, port: localSetupPort }, (info) => {
+      console.log(
+        `[vpsagent-api] Local-only SSH-tunnel setup listener on :${info.port}`,
+      );
+    });
+  }
 }
 
 const isEntrypoint =

@@ -3,11 +3,11 @@ set -euo pipefail
 
 # VPSAgent v2 — Lean One-Command Ubuntu LTS Installer
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/diegosg-dev/vpsagent/main/bootstrap/install.sh | sudo bash
-#   sudo bash bootstrap/install.sh [--domain vps.yourdomain.com] [--email you@yourdomain.com] [--force]
+#   curl -fsSL https://raw.githubusercontent.com/VPSAgent/vpsagent/main/bootstrap/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/VPSAgent/vpsagent/main/bootstrap/install.sh | sudo bash -s -- --domain vps.yourdomain.com --email you@yourdomain.com
 
 VPSAGENT_ROOT="${VPSAGENT_ROOT:-/var/lib/vpsagent}"
-VPSAGENT_REPO_URL="${VPSAGENT_REPO_URL:-https://github.com/diegosg-dev/vpsagent.git}"
+VPSAGENT_REPO_URL="${VPSAGENT_REPO_URL:-https://github.com/VPSAgent/vpsagent.git}"
 VPSAGENT_REPO_REF="${VPSAGENT_REPO_REF:-main}"
 VPSAGENT_REPO_DIR="${VPSAGENT_REPO_DIR:-/opt/vpsagent}"
 CORE_NETWORK="${CORE_NETWORK:-vpsagent-core}"
@@ -158,10 +158,36 @@ configure_firewall() {
   ufw --force enable
 }
 
+write_core_caddy_route() {
+  local core_route="${VPSAGENT_ROOT}/caddy/core.d/dashboard.caddy"
+  if [[ -n "${ARG_DOMAIN}" ]]; then
+    local tls_line=""
+    if [[ -n "${ARG_EMAIL}" ]]; then
+      tls_line="	tls ${ARG_EMAIL}"$'\n'
+    fi
+    cat > "${core_route}" <<EOF
+# Managed by VPSAgent Installer / Host Runtime Bridge (Core Dashboard & MCP)
+${ARG_DOMAIN} {
+${tls_line}	encode zstd gzip
+	handle /mcp {
+		reverse_proxy vpsagent-core:3001
+	}
+	handle {
+		reverse_proxy vpsagent-core:3001
+	}
+}
+EOF
+    chmod 644 "${core_route}"
+  elif [[ ! -f "${core_route}" || "${FORCE_OVERWRITE}" == "true" ]]; then
+    cp "${SCRIPT_DIR}/caddy/core.d/dashboard.caddy" "${core_route}"
+    chmod 644 "${core_route}"
+  fi
+}
+
 prepare_state_and_secrets() {
   log "Preparing ${VPSAGENT_ROOT} directories and secrets..."
   mkdir -p "${VPSAGENT_ROOT}/data" "${VPSAGENT_ROOT}/config" "${VPSAGENT_ROOT}/apps" \
-    "${VPSAGENT_ROOT}/run" "${VPSAGENT_ROOT}/caddy/apps.d"
+    "${VPSAGENT_ROOT}/run" "${VPSAGENT_ROOT}/caddy/core.d" "${VPSAGENT_ROOT}/caddy/apps.d"
   chmod 750 "${VPSAGENT_ROOT}" "${VPSAGENT_ROOT}/config" "${VPSAGENT_ROOT}/run" "${VPSAGENT_ROOT}/apps"
   chown 0:1000 "${VPSAGENT_ROOT}/run"
   chown 1000:1000 "${VPSAGENT_ROOT}/data" "${VPSAGENT_ROOT}/config" "${VPSAGENT_ROOT}/apps"
@@ -174,13 +200,11 @@ prepare_state_and_secrets() {
     SESSION_SECRET="$(openssl rand -hex 32)"
     ENCRYPTION_SECRET="$(openssl rand -hex 32)"
     CLAIM_TOKEN="$(openssl rand -hex 18)"
-    SITE_ADDR="${ARG_DOMAIN:-:80}"
     DOMAIN_VAL="${ARG_DOMAIN:-localhost}"
     EMAIL_VAL="${ARG_EMAIL:-admin@example.com}"
 
     cat > "${ENV_FILE}" <<EOF
 VPSAGENT_REPO_DIR=${REPO_ROOT}
-VPSAGENT_SITE_ADDRESS=${SITE_ADDR}
 VPSAGENT_DOMAIN=${DOMAIN_VAL}
 VPSAGENT_ACME_EMAIL=${EMAIL_VAL}
 VPSAGENT_PUBLIC_IP=${PUBLIC_IP}
@@ -190,6 +214,7 @@ VPSAGENT_ENCRYPTION_SECRET=${ENCRYPTION_SECRET}
 VPSAGENT_CLAIM_TOKEN=${CLAIM_TOKEN}
 VPSAGENT_RUNTIME_SOCKET=${VPSAGENT_ROOT}/run/runtime.sock
 VPSAGENT_APPS_ROOT=${VPSAGENT_ROOT}/apps
+VPSAGENT_CADDY_CORE_DIR=${VPSAGENT_ROOT}/caddy/core.d
 VPSAGENT_CADDY_APPS_DIR=${VPSAGENT_ROOT}/caddy/apps.d
 VPSAGENT_CADDY_CONTAINER=vpsagent-caddy
 EOF
@@ -201,6 +226,7 @@ EOF
   cp "${SCRIPT_DIR}/Caddyfile" "${VPSAGENT_ROOT}/Caddyfile"
   cp "${SCRIPT_DIR}/docker-compose.core.yml" "${VPSAGENT_ROOT}/docker-compose.yml"
   cp "${SCRIPT_DIR}/caddy/apps.d/00-default.caddy" "${VPSAGENT_ROOT}/caddy/apps.d/00-default.caddy"
+  write_core_caddy_route
   install -m 0750 "${SCRIPT_DIR}/runtime-bridge.py" "${VPSAGENT_ROOT}/runtime-bridge.py"
 }
 
@@ -239,20 +265,20 @@ start_core_stack() {
 }
 
 print_ready_banner() {
-  local base_url
-  if [[ -n "${ARG_DOMAIN}" ]]; then
-    base_url="https://${ARG_DOMAIN}"
-  elif [[ -n "${PUBLIC_IP:-}" ]]; then
-    base_url="http://${PUBLIC_IP}"
-  else
-    base_url="http://localhost"
-  fi
-
+  local token_display="${CLAIM_TOKEN:-<see /var/lib/vpsagent/.env>}"
   printf '\n=================================================================\n'
   printf '  VPSAgent v2 is installed and running!\n'
   printf '=================================================================\n'
-  printf '  Open your private first-time setup link:\n'
-  printf '    %s/#claim=%s\n\n' "${base_url}" "${CLAIM_TOKEN:-<see /var/lib/vpsagent/.env>}"
+  if [[ -n "${ARG_DOMAIN}" ]]; then
+    printf '  Open your private HTTPS first-time setup link:\n'
+    printf '    https://%s/#claim=%s\n\n' "${ARG_DOMAIN}" "${token_display}"
+  else
+    printf '  No domain was provided yet, so remote plaintext HTTP login is disabled\n'
+    printf '  for your safety. Open a private SSH tunnel from your computer:\n'
+    printf '    ssh -L 3002:127.0.0.1:3002 root@%s\n\n' "${PUBLIC_IP:-<YOUR_SERVER_IP>}"
+    printf '  Then open your private first-time setup link in your browser:\n'
+    printf '    http://localhost:3002/#claim=%s\n\n' "${token_display}"
+  fi
   printf '  Step 1: Choose your dashboard password\n'
   printf '  Step 2: Connect your domain name for automatic HTTPS\n'
   printf '=================================================================\n\n'

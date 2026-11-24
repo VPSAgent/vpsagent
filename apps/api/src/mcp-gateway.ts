@@ -6,7 +6,6 @@ import {
   type RegistryStore,
   type RiskLevel,
   type RuntimeBridge,
-  assertHttpsForRemoteHost,
   canScopeMutate,
   redactSecrets,
   redactStructuredValue,
@@ -14,14 +13,24 @@ import {
   syncAppStatuses,
   validateAppSlug,
 } from "@vpsagent/shared";
-import { getRequestHost, getRequestProtocol } from "./auth.js";
+import {
+  type TransportContextOptions,
+  assertSecureTransport,
+  validateMcpHostAndOrigin,
+} from "./auth.js";
 import {
   type AppExecutor,
   DeployAppInputSchema,
   UpdateAppEnvInputSchema,
 } from "./executor.js";
 
-const MCP_PROTOCOL_VERSION = "2025-03-26";
+export const SUPPORTED_MCP_PROTOCOL_VERSIONS = [
+  "2025-11-25",
+  "2025-06-18",
+  "2025-03-26",
+] as const;
+const DEFAULT_MCP_PROTOCOL_VERSION = SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
+const MAX_MCP_LOG_REPLY_BYTES = 48 * 1024;
 
 const JsonRpcRequestSchema = z.object({
   jsonrpc: z.literal("2.0"),
@@ -51,7 +60,7 @@ export const MCP_TOOLS: McpToolDefinition[] = [
   {
     name: "get_app_logs",
     description:
-      "Read recent container logs for an app (all secrets are automatically scrubbed).",
+      "Read recent container logs for an app (all secrets are automatically scrubbed and output is byte-budgeted).",
     inputSchema: {
       type: "object",
       properties: {
@@ -110,6 +119,8 @@ export const MCP_TOOLS: McpToolDefinition[] = [
         dockerfilePath: { type: "string", default: "Dockerfile" },
         domain: { type: ["string", "null"] },
         internalPort: { type: "integer", default: 8080 },
+        probeHttp: { type: "boolean", default: true },
+        probePath: { type: "string", default: "/" },
         cpuLimit: { type: "string", default: "0.5" },
         memoryLimitMb: { type: "integer", default: 512 },
         companions: {
@@ -241,20 +252,102 @@ function toolErr(message: string) {
   };
 }
 
+/**
+ * Builds a dedicated, safe approval preview for the dashboard UI so environment
+ * values marked secret (regardless of key name) or deploy env values never leak.
+ */
+export function buildSafeApprovalPreview(
+  action: ApprovalActionType,
+  rawPayload: Record<string, unknown>,
+): Record<string, unknown> {
+  if (action === "update_env") {
+    const vars = Array.isArray(rawPayload.vars) ? rawPayload.vars : [];
+    const safeVars = vars.map((entry) => {
+      if (!entry || typeof entry !== "object") return entry;
+      const item = entry as {
+        key?: unknown;
+        value?: unknown;
+        isSecret?: unknown;
+      };
+      const key = String(item.key ?? "");
+      const markedSecret = item.isSecret !== false;
+      const rawVal = typeof item.value === "string" ? item.value : "";
+      return {
+        key,
+        isSecret: markedSecret,
+        value: markedSecret ? "[REDACTED]" : redactSecrets(rawVal),
+      };
+    });
+    return {
+      slug: rawPayload.slug,
+      vars: safeVars,
+      deleteKeys: Array.isArray(rawPayload.deleteKeys)
+        ? rawPayload.deleteKeys
+        : [],
+    };
+  }
+
+  if (action === "deploy_app") {
+    const copy = { ...rawPayload };
+    if (copy.envVars && typeof copy.envVars === "object") {
+      const maskedEnv: Record<string, string> = {};
+      for (const key of Object.keys(copy.envVars as Record<string, unknown>)) {
+        maskedEnv[key] = "[REDACTED]";
+      }
+      copy.envVars = maskedEnv;
+    }
+    return redactStructuredValue(copy) as Record<string, unknown>;
+  }
+
+  return redactStructuredValue(rawPayload) as Record<string, unknown>;
+}
+
+/** Applies a strict final UTF-8 JSON byte budget to log replies, keeping newest lines. */
+function budgetLogsReply(
+  slug: string,
+  lines: string[],
+  alreadyTruncated: boolean,
+  maxBytes = MAX_MCP_LOG_REPLY_BYTES,
+): { slug: string; lines: string[]; truncated: boolean } {
+  let truncated = alreadyTruncated;
+  const keptReversed: string[] = [];
+  let usedBytes = Buffer.byteLength(
+    JSON.stringify({ slug, lines: [], truncated: true }),
+    "utf8",
+  );
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    const encodedLineBytes = Buffer.byteLength(JSON.stringify(line), "utf8") + 2;
+    if (usedBytes + encodedLineBytes > maxBytes) {
+      truncated = true;
+      break;
+    }
+    keptReversed.push(line);
+    usedBytes += encodedLineBytes;
+  }
+  keptReversed.reverse();
+  return { slug, lines: keptReversed, truncated };
+}
+
 export interface McpSetupSnippets {
   mcpUrl: string;
+  httpsReady: boolean;
   claudeCode: string;
   cursor: string;
   codex: string;
 }
 
 /** Builds ready-to-paste client setup snippets for Claude Code, Cursor, and Codex. */
-export function buildMcpSetupSnippets(mcpUrl: string): McpSetupSnippets {
+export function buildMcpSetupSnippets(
+  mcpUrl: string,
+  httpsReady: boolean,
+): McpSetupSnippets {
   const cleanUrl = mcpUrl.replace(/\/+$/, "");
   const tokenPlaceholder = "vpsmcp_YOUR_TOKEN_HERE";
 
   return {
     mcpUrl: cleanUrl,
+    httpsReady,
     claudeCode: `claude mcp add --transport http vpsagent ${cleanUrl} \\\n  --header "Authorization: Bearer ${tokenPlaceholder}"`,
     cursor: JSON.stringify(
       {
@@ -278,11 +371,42 @@ export interface McpGatewayDeps {
   store: RegistryStore;
   bridge: RuntimeBridge;
   executor: AppExecutor;
-  trustProxy: boolean;
+  transportOptions: TransportContextOptions;
+}
+
+export function enforceMcpBoundary(
+  c: Context,
+  store: RegistryStore,
+  transportOptions: TransportContextOptions,
+): { ok: true } | { ok: false; response: Response } {
+  const setup = store.getSetupState();
+  try {
+    const transport = assertSecureTransport(c, transportOptions);
+    validateMcpHostAndOrigin(c, {
+      setupDomain: setup.domain,
+      httpsActive: setup.httpsActive,
+      transport,
+      trustProxy: transportOptions.trustProxy,
+    });
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      response: c.json(
+        {
+          error:
+            err instanceof Error
+              ? err.message
+              : "Forbidden MCP request host, origin, or transport.",
+        },
+        403,
+      ),
+    };
+  }
 }
 
 export function createMcpPostHandler(deps: McpGatewayDeps) {
-  const { store, bridge, executor, trustProxy } = deps;
+  const { store, bridge, executor, transportOptions } = deps;
 
   async function handleMutation(
     token: McpTokenRecord,
@@ -298,6 +422,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
     if (!canScopeMutate(token.scope)) {
       store.recordAudit({
         actor: "agent",
+        actorTokenId: token.id,
         action: "mcp.blocked_mutation",
         targetSlug: input.targetSlug,
         summary: `Blocked read-only key "${token.name}" from running ${input.action}`,
@@ -309,18 +434,21 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
     }
 
     if (requiresApprovalForScope(token.scope)) {
+      const safePreview = buildSafeApprovalPreview(input.action, input.payload);
       const approval = store.createApproval({
         action: input.action,
         targetSlug: input.targetSlug,
         summary: input.summary,
-        payload: input.payload,
+        payload: safePreview,
         executionPayload: input.payload,
         requestedBy: token.name,
+        tokenId: token.id,
         tokenScope: token.scope,
         riskLevel: input.riskLevel,
       });
       store.recordAudit({
         actor: "agent",
+        actorTokenId: token.id,
         action: "approval.requested",
         targetSlug: input.targetSlug,
         summary: `AI key "${token.name}" requested approval (${approval.id}): ${input.summary}`,
@@ -341,20 +469,9 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
   }
 
   return async (c: Context) => {
-    const host = getRequestHost(c, trustProxy);
-    const proto = getRequestProtocol(c, trustProxy);
-    try {
-      assertHttpsForRemoteHost(host, proto);
-    } catch (err) {
-      return c.json(
-        {
-          error:
-            err instanceof Error
-              ? err.message
-              : "HTTPS is required for remote MCP access.",
-        },
-        403,
-      );
+    const guard = enforceMcpBoundary(c, store, transportOptions);
+    if (!guard.ok) {
+      return guard.response;
     }
 
     const authHeader = c.req.header("authorization") ?? "";
@@ -386,6 +503,24 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
 
     const { id = null, method, params = {} } = parsed.data;
 
+    // Validate MCP-Protocol-Version header on post-initialize requests (Streamable HTTP spec)
+    const headerVersion = c.req.header("mcp-protocol-version")?.trim();
+    if (method !== "initialize" && headerVersion) {
+      if (
+        !(SUPPORTED_MCP_PROTOCOL_VERSIONS as readonly string[]).includes(
+          headerVersion,
+        )
+      ) {
+        return c.json(
+          {
+            error: `Unsupported MCP-Protocol-Version "${headerVersion}". Supported: ${SUPPORTED_MCP_PROTOCOL_VERSIONS.join(", ")}.`,
+          },
+          400,
+        );
+      }
+      c.header("MCP-Protocol-Version", headerVersion);
+    }
+
     if (method === "notifications/initialized") {
       return c.body(null, 202);
     }
@@ -395,9 +530,19 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
     }
 
     if (method === "initialize") {
+      const requestedVersion =
+        typeof params.protocolVersion === "string"
+          ? params.protocolVersion.trim()
+          : "";
+      const negotiatedVersion = (
+        SUPPORTED_MCP_PROTOCOL_VERSIONS as readonly string[]
+      ).includes(requestedVersion)
+        ? requestedVersion
+        : DEFAULT_MCP_PROTOCOL_VERSION;
+      c.header("MCP-Protocol-Version", negotiatedVersion);
       return c.json(
         jsonRpcResult(id, {
-          protocolVersion: MCP_PROTOCOL_VERSION,
+          protocolVersion: negotiatedVersion,
           serverInfo: {
             name: "vpsagent",
             version: "2.0.0",
@@ -455,8 +600,15 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             typeof args.tail === "number"
               ? Math.min(Math.max(Math.trunc(args.tail), 1), 500)
               : 100;
-          const lines = await bridge.getLogs(slug, tail);
-          callResult = toolOk({ slug, lines });
+          const detailed = bridge.getLogsDetailed
+            ? await bridge.getLogsDetailed(slug, tail)
+            : { slug, lines: await bridge.getLogs(slug, tail), truncated: false };
+          const budgeted = budgetLogsReply(
+            slug,
+            detailed.lines,
+            Boolean(detailed.truncated),
+          );
+          callResult = toolOk(budgeted);
           break;
         }
 
@@ -464,10 +616,15 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           const slug = validateAppSlug(String(args.slug ?? ""));
           const app = store.getApp(slug);
           const inspect = await bridge.inspectWorkload(slug, {
-            probeHttp: Boolean(args.probeHttp),
+            probeHttp:
+              typeof args.probeHttp === "boolean"
+                ? args.probeHttp
+                : (app?.probeHttp ?? false),
             internalPort: app?.internalPort ?? 8080,
             probePath:
-              typeof args.probePath === "string" ? args.probePath : "/",
+              typeof args.probePath === "string"
+                ? args.probePath
+                : (app?.probePath ?? "/"),
           });
           const envVars = store.listAppEnvVars(slug);
           callResult = toolOk({ app, inspect, envVars });
@@ -500,7 +657,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             summary: `Deploy ${input.sourceType} app "${input.name}" (${slug})`,
             payload: input as unknown as Record<string, unknown>,
             riskLevel: "medium",
-            run: () => executor.deployApp(input, "agent"),
+            run: () => executor.deployApp(input, "agent", token.id),
           });
           break;
         }
@@ -513,7 +670,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             summary: `Rebuild and restart app "${slug}"`,
             payload: { slug },
             riskLevel: "medium",
-            run: () => executor.rebuildApp(slug, "agent"),
+            run: () => executor.rebuildApp(slug, "agent", token.id),
           });
           break;
         }
@@ -527,7 +684,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             summary: `Update environment variables for "${slug}" (${envInput.vars.map((v) => v.key).join(", ") || "delete only"})`,
             payload: { slug, ...envInput },
             riskLevel: "medium",
-            run: () => executor.updateAppEnv(slug, envInput, "agent"),
+            run: () => executor.updateAppEnv(slug, envInput, "agent", token.id),
           });
           break;
         }
@@ -546,7 +703,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
               : `Remove domain from "${slug}"`,
             payload: { slug, domain },
             riskLevel: "medium",
-            run: () => executor.setAppDomain(slug, domain, "agent"),
+            run: () => executor.setAppDomain(slug, domain, "agent", token.id),
           });
           break;
         }
@@ -559,7 +716,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             summary: `Restart app "${slug}"`,
             payload: { slug },
             riskLevel: "low",
-            run: () => executor.lifecycleApp(slug, "restart", "agent"),
+            run: () => executor.lifecycleApp(slug, "restart", "agent", token.id),
           });
           break;
         }
@@ -572,7 +729,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             summary: `Stop app "${slug}"`,
             payload: { slug },
             riskLevel: "medium",
-            run: () => executor.lifecycleApp(slug, "stop", "agent"),
+            run: () => executor.lifecycleApp(slug, "stop", "agent", token.id),
           });
           break;
         }
@@ -586,7 +743,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             summary: `Delete app "${slug}"`,
             payload: { slug, removeFiles },
             riskLevel: "high",
-            run: () => executor.deleteApp(slug, removeFiles, "agent"),
+            run: () => executor.deleteApp(slug, removeFiles, "agent", token.id),
           });
           break;
         }

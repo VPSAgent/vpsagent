@@ -1,0 +1,12 @@
+# Managed by VPSAgent Host Runtime Bridge (Core Dashboard & MCP).
+# Before a public domain is bound, Caddy listens only on loopback; use the SSH
+# local tunnel printed by install.sh to complete first-time setup safely.
+127.0.0.1:80, localhost:80 {
+	encode zstd gzip
+	handle /mcp {
+		reverse_proxy vpsagent-core:3001
+	}
+	handle {
+		reverse_proxy vpsagent-core:3001
+	}
+}

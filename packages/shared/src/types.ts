@@ -34,6 +34,8 @@ export const AppRecordSchema = z.object({
   domain: z.string().min(1).max(253).nullable(),
   folderPath: z.string().min(1),
   internalPort: z.number().int().min(1).max(65535),
+  probeHttp: z.boolean().default(true),
+  probePath: z.string().min(1).max(128).default("/"),
   status: AppStatusSchema,
   cpuLimit: z.string().min(1).max(16),
   memoryLimitMb: z.number().int().min(64).max(131072),
@@ -60,6 +62,7 @@ export type RiskLevel = z.infer<typeof RiskLevelSchema>;
 export const AuditEventSchema = z.object({
   id: z.string().min(1),
   actor: ActorSchema,
+  actorTokenId: z.string().nullable().default(null),
   action: z.string().min(1).max(100),
   targetSlug: z.string().nullable(),
   summary: z.string().min(1).max(500),
@@ -95,6 +98,7 @@ export const ApprovalRequestSchema = z.object({
   summary: z.string().min(1).max(500),
   payload: z.record(z.string(), z.unknown()),
   requestedBy: z.string().min(1).max(120),
+  tokenId: z.string().nullable().default(null),
   tokenScope: McpTokenScopeSchema,
   status: ApprovalStatusSchema,
   riskLevel: RiskLevelSchema,
@@ -111,6 +115,7 @@ export const SetupStateSchema = z.object({
   claimed: z.boolean(),
   domain: z.string().nullable(),
   acmeEmail: z.string().nullable(),
+  httpsActive: z.boolean().default(false),
   claimedAt: z.string().nullable(),
 });
 export type SetupState = z.infer<typeof SetupStateSchema>;

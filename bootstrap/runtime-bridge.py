@@ -32,6 +32,7 @@ import json
 import os
 import platform
 import re
+import select
 import shutil
 import signal
 import socket
@@ -50,6 +51,7 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_COMPOSE_BYTES = 512 * 1024
 MAX_ENV_BYTES = 64 * 1024
 MAX_LOG_LINE_CHARS = 2000
+MAX_LOGS_RESPONSE_BYTES = 64 * 1024
 MAX_TAIL_LINES = 500
 MAX_STATUS_SLUGS = 100
 DEFAULT_STATUS_DEADLINE_S = 25.0
@@ -66,6 +68,9 @@ PROBE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=-]{0,127}$"
 SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,46}[a-z0-9]$")
 DOMAIN_PATTERN = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+)
+EMAIL_PATTERN = re.compile(
+    r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,63}$"
 )
 CONTAINER_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$")
 SERVICE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
@@ -219,6 +224,19 @@ def validate_domain(raw: Any) -> str:
     return normalized
 
 
+def validate_email(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise BridgeRequestError(400, "Field 'acmeEmail' must be a string or null.")
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    if not EMAIL_PATTERN.match(trimmed):
+        raise BridgeRequestError(400, f'Invalid email address "{raw}".')
+    return trimmed
+
+
 def validate_port(raw: Any) -> int:
     if not isinstance(raw, int) or isinstance(raw, bool) or raw < 1 or raw > 65535:
         raise BridgeRequestError(
@@ -349,18 +367,22 @@ def default_dns_resolver(hostname: str, port: int) -> list[str]:
     return ips
 
 
-def validate_git_repo_url(
+def validate_git_repo_url_with_ips(
     raw: Any, dns_resolver: DnsResolver | None = None
-) -> str:
+) -> tuple[str, str, int, list[str]]:
     """
-    Validates a public HTTPS Git repository URL and checks every DNS-resolved IP
-    against loopback, RFC1918/ULA private networks, CGNAT, and cloud metadata endpoints.
+    Validates a public HTTPS Git repository URL and returns
+    `(normalized_url, host, port, validated_public_ips)` so the subsequent
+    TCP connection can be pinned strictly to the validated public IP(s).
     """
     if not isinstance(raw, str) or not raw.strip():
         raise BridgeRequestError(400, "Field 'gitRepoUrl' must be a non-empty string.")
     trimmed = raw.strip()
     if any(ch.isspace() or ord(ch) < 32 for ch in trimmed):
-        raise BridgeRequestError(400, "Git repository URL contains invalid whitespace or control characters.")
+        raise BridgeRequestError(
+            400,
+            "Git repository URL contains invalid whitespace or control characters.",
+        )
 
     parsed = urlparse(trimmed)
     if parsed.scheme.lower() != "https":
@@ -379,7 +401,11 @@ def validate_git_repo_url(
     if host == "localhost" or host.endswith(".localhost"):
         raise BridgeRequestError(400, f'Blocked loopback host "{raw_hostname}".')
 
-    # Check if host is a literal IP address
+    try:
+        port = parsed.port or 443
+    except ValueError as exc:
+        raise BridgeRequestError(400, "Git repository URL has an invalid port.") from exc
+
     is_literal_ip = False
     try:
         ipaddress.ip_address(host.split("%", 1)[0])
@@ -387,18 +413,16 @@ def validate_git_repo_url(
     except ValueError:
         is_literal_ip = False
 
+    validated_ips: list[str] = []
     if is_literal_ip:
         _assert_public_ip_address(host, raw_hostname)
+        validated_ips.append(host.split("%", 1)[0])
     else:
         if "." not in host:
             raise BridgeRequestError(
                 400, f'Blocked single-label internal host "{raw_hostname}".'
             )
         resolver = dns_resolver or default_dns_resolver
-        try:
-            port = parsed.port or 443
-        except ValueError as exc:
-            raise BridgeRequestError(400, "Git repository URL has an invalid port.") from exc
         try:
             resolved_ips = resolver(host, port)
         except OSError as exc:
@@ -409,10 +433,164 @@ def validate_git_repo_url(
             raise BridgeRequestError(
                 400, f'Could not resolve Git host "{raw_hostname}".'
             )
+        seen: set[str] = set()
         for ip_str in resolved_ips:
             _assert_public_ip_address(ip_str, raw_hostname)
+            clean = ip_str.strip().strip("[]").split("%", 1)[0]
+            if clean not in seen:
+                seen.add(clean)
+                validated_ips.append(clean)
 
-    return trimmed
+    return trimmed, host, port, validated_ips
+
+
+def validate_git_repo_url(
+    raw: Any, dns_resolver: DnsResolver | None = None
+) -> str:
+    """
+    Validates a public HTTPS Git repository URL and checks every DNS-resolved IP
+    against loopback, RFC1918/ULA private networks, CGNAT, and cloud metadata endpoints.
+    """
+    url, _, _, _ = validate_git_repo_url_with_ips(raw, dns_resolver=dns_resolver)
+    return url
+
+
+class _PinnedGitConnectProxy:
+    """
+    Single-purpose ephemeral loopback HTTP CONNECT proxy used during `git clone`.
+    Enforces that Git/libcurl can ONLY connect to the exact validated hostname,
+    port, and pre-validated public IP(s) — eliminating DNS rebinding TOCTOU while
+    preserving full hostname SNI and TLS certificate verification.
+    """
+
+    def __init__(
+        self,
+        expected_host: str,
+        expected_port: int,
+        validated_ips: list[str],
+        connect_timeout: float = 15.0,
+    ) -> None:
+        self.expected_host = expected_host.lower().strip("[]").rstrip(".")
+        self.expected_port = expected_port
+        self.validated_ips = list(validated_ips)
+        self.connect_timeout = connect_timeout
+        self._sock: socket.socket | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.port = 0
+
+    def __enter__(self) -> "_PinnedGitConnectProxy":
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(8)
+        srv.settimeout(0.5)
+        self._sock = srv
+        self.port = int(srv.getsockname()[1])
+        self._thread = threading.Thread(target=self._accept_loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _accept_loop(self) -> None:
+        assert self._sock is not None
+        while not self._stop.is_set():
+            try:
+                client, _ = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(
+                target=self._handle_client, args=(client,), daemon=True
+            ).start()
+
+    def _handle_client(self, client: socket.socket) -> None:
+        upstream: socket.socket | None = None
+        try:
+            client.settimeout(10.0)
+            req_buf = b""
+            while b"\r\n\r\n" not in req_buf and len(req_buf) < 8192:
+                chunk = client.recv(2048)
+                if not chunk:
+                    return
+                req_buf += chunk
+            first_line = req_buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+            parts = first_line.split()
+            if len(parts) < 2 or parts[0].upper() != "CONNECT":
+                client.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+                return
+            authority = parts[1]
+            if authority.startswith("["):
+                host_part, _, port_part = authority[1:].partition("]:")
+            else:
+                host_part, _, port_part = authority.rpartition(":")
+            req_host = host_part.lower().rstrip(".")
+            try:
+                req_port = int(port_part)
+            except ValueError:
+                client.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                return
+            if req_host != self.expected_host or req_port != self.expected_port:
+                client.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+                return
+
+            last_err: OSError | None = None
+            for ip in self.validated_ips:
+                try:
+                    _assert_public_ip_address(ip, self.expected_host)
+                    upstream = socket.create_connection(
+                        (ip, self.expected_port), timeout=self.connect_timeout
+                    )
+                    break
+                except (OSError, BridgeRequestError) as exc:
+                    last_err = exc if isinstance(exc, OSError) else OSError(str(exc))
+                    upstream = None
+            if upstream is None:
+                client.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                return
+
+            client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            client.setblocking(False)
+            upstream.setblocking(False)
+            sockets = [client, upstream]
+            while not self._stop.is_set():
+                readable, _, exceptional = select.select(sockets, [], sockets, 1.0)
+                if exceptional:
+                    break
+                for src in readable:
+                    dst = upstream if src is client else client
+                    try:
+                        data = src.recv(16384)
+                    except OSError:
+                        return
+                    if not data:
+                        return
+                    dst.setblocking(True)
+                    dst.settimeout(10.0)
+                    dst.sendall(data)
+                    dst.setblocking(False)
+        except OSError:
+            pass
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+            try:
+                client.close()
+            except OSError:
+                pass
 
 
 def _probe_container_http(
@@ -956,12 +1134,73 @@ def _validate_no_symlink_volume_source(app_dir: str, rel_path: str, slug: str) -
     return current
 
 
+def _prepare_service_volume_dir(
+    app_dir: str, rel_path: str, user_spec: str | None, slug: str
+) -> str:
+    """
+    Validates a relative volume mount source has no symlinks and prepares private
+    host storage ownership for non-root services (e.g. Postgres 70:70, Redis 999:999).
+    """
+    abs_src = _validate_no_symlink_volume_source(app_dir, rel_path, slug)
+    parts = [p for p in rel_path.replace("\\", "/").split("/") if p and p != "."]
+    if parts:
+        # Ensure top-level ./data or ./workspace is traversable by non-root companion UIDs
+        top_dir = os.path.join(os.path.realpath(app_dir), parts[0])
+        if not os.path.exists(top_dir):
+            os.makedirs(top_dir, mode=0o755, exist_ok=True)
+        if len(parts) > 1:
+            try:
+                os.chmod(top_dir, 0o755)
+            except OSError:
+                pass
+    if not os.path.exists(abs_src):
+        os.makedirs(abs_src, mode=0o700 if user_spec else 0o750, exist_ok=True)
+
+    if user_spec:
+        m = NUMERIC_USER_PATTERN.match(user_spec)
+        if m:
+            uid = int(m.group(1))
+            gid = int(m.group(2)) if m.group(2) is not None else uid
+            try:
+                os.chmod(abs_src, 0o700)
+            except OSError:
+                pass
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                os.chown(abs_src, uid, gid)
+                for root_dir, dirs, files in os.walk(abs_src):
+                    if os.path.islink(root_dir):
+                        continue
+                    os.chown(root_dir, uid, gid)
+                    for d in dirs:
+                        p = os.path.join(root_dir, d)
+                        if not os.path.islink(p):
+                            os.chown(p, uid, gid)
+                    for f in files:
+                        p = os.path.join(root_dir, f)
+                        if not os.path.islink(p):
+                            os.chown(p, uid, gid)
+    return abs_src
+
+
+def _escape_compose_dollars(value: Any) -> Any:
+    """Escape literal `$` as `$$` in rendered Compose values so Docker Compose never re-interpolates."""
+    if isinstance(value, str):
+        return value.replace("$", "$$")
+    if isinstance(value, list):
+        return [_escape_compose_dollars(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _escape_compose_dollars(v) for k, v in value.items()}
+    return value
+
+
 def validate_and_render_compose(
     compose_text: str,
     slug: str,
     app_dir: str,
     env_map: dict[str, str],
     env_file_override: str | None,
+    *,
+    prepare_volumes: bool = False,
 ) -> dict[str, Any]:
     """
     Structurally validates every section of an app's docker-compose.yml against
@@ -1262,7 +1501,14 @@ def validate_and_render_compose(
                         f'Compose isolation policy rejected "{slug}": volume "{vol}" escapes ./data or ./workspace.',
                     )
                 rel_src, rest = vol.split(":", 1)
-                abs_src = _validate_no_symlink_volume_source(app_dir, rel_src[2:], slug)
+                if prepare_volumes:
+                    abs_src = _prepare_service_volume_dir(
+                        app_dir, rel_src[2:], out_svc.get("user"), slug
+                    )
+                else:
+                    abs_src = _validate_no_symlink_volume_source(
+                        app_dir, rel_src[2:], slug
+                    )
                 rewritten_vols.append(f"{abs_src}:{rest}")
             out_svc["volumes"] = rewritten_vols
 
@@ -1290,7 +1536,7 @@ def validate_and_render_compose(
                 ]
                 out_svc["healthcheck"] = hc_copy
 
-        rendered_services[svc_key] = out_svc
+        rendered_services[svc_key] = _escape_compose_dollars(out_svc)
 
     return {
         "services": rendered_services,
@@ -1487,6 +1733,7 @@ class RuntimeService:
         *,
         apps_root: str,
         caddy_apps_dir: str,
+        caddy_core_dir: str | None = None,
         caddy_container: str,
         docker_bin: str = "docker",
         git_bin: str = "git",
@@ -1508,6 +1755,9 @@ class RuntimeService:
             )
         self.apps_root = apps_root
         self.caddy_apps_dir = caddy_apps_dir
+        self.caddy_core_dir = caddy_core_dir or os.path.join(
+            os.path.dirname(os.path.abspath(caddy_apps_dir)), "core.d"
+        )
         self.caddy_container = caddy_container
         self.docker_bin = docker_bin
         self.git_bin = git_bin
@@ -1541,13 +1791,15 @@ class RuntimeService:
 
     @contextmanager
     def _validated_compose_context(
-        self, app_dir: str, slug: str
-    ) -> Iterator[tuple[str, str | None]]:
+        self, app_dir: str, slug: str, *, prepare_volumes: bool = False
+    ) -> Iterator[tuple[str, str]]:
         """
         Reads `.env` and `docker-compose.yml` with O_NOFOLLOW, structurally
-        validates every field, and writes canonical validated copies into a
-        root-owned 0700 temporary directory so unprivileged containers cannot
-        mutate files between validation and `docker compose` execution (TOCTOU immunity).
+        validates every field, resolves only allowlisted interpolation variables,
+        and writes canonical validated copies into a root-owned 0700 temporary
+        directory. The container env file is named `app.env` (never `.env`) and
+        Docker Compose uses `tmp_dir` as `--project-directory` with NO `--env-file`
+        so Compose can never implicitly rediscover or interpolate app secrets.
         """
         compose_path = os.path.join(app_dir, "docker-compose.yml")
         compose_text = _read_regular_file_nofollow(
@@ -1567,19 +1819,24 @@ class RuntimeService:
         try:
             tmp_env_path: str | None = None
             if env_text is not None:
-                tmp_env_path = os.path.join(tmp_dir, ".env")
+                tmp_env_path = os.path.join(tmp_dir, "app.env")
                 with open(tmp_env_path, "w", encoding="utf-8") as fh:
                     fh.write(env_text)
                 os.chmod(tmp_env_path, 0o600)
 
             rendered_doc = validate_and_render_compose(
-                compose_text, slug, app_dir, env_map, tmp_env_path
+                compose_text,
+                slug,
+                app_dir,
+                env_map,
+                tmp_env_path,
+                prepare_volumes=prepare_volumes,
             )
             tmp_compose_path = os.path.join(tmp_dir, "docker-compose.json")
             with open(tmp_compose_path, "w", encoding="utf-8") as fh:
                 json.dump(rendered_doc, fh, indent=2)
             os.chmod(tmp_compose_path, 0o600)
-            yield tmp_compose_path, tmp_env_path
+            yield tmp_compose_path, tmp_dir
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1670,27 +1927,24 @@ class RuntimeService:
             )
 
     def _compose_cmd_base(
-        self, slug: str, app_dir: str, compose_path: str, env_path: str | None
+        self, slug: str, project_dir: str, compose_path: str
     ) -> list[str]:
-        cmd = [
+        return [
             "compose",
             "-p",
             f"vpsagent-{slug}",
             "--project-directory",
-            app_dir,
+            project_dir,
             "-f",
             compose_path,
         ]
-        if env_path:
-            cmd.extend(["--env-file", env_path])
-        return cmd
 
     def _compose_status(
-        self, slug: str, app_dir: str, compose_path: str, env_path: str | None
+        self, slug: str, project_dir: str, compose_path: str
     ) -> str:
         proc = self._run_docker(
             [
-                *self._compose_cmd_base(slug, app_dir, compose_path, env_path),
+                *self._compose_cmd_base(slug, project_dir, compose_path),
                 "ps",
                 "-a",
                 "--format",
@@ -1716,11 +1970,13 @@ class RuntimeService:
 
         with self._lock_for(slug):
             app_dir = resolve_scoped_app_dir(self.apps_root, slug)
-            with self._validated_compose_context(app_dir, slug) as (
+            with self._validated_compose_context(
+                app_dir, slug, prepare_volumes=(action == "start")
+            ) as (
                 compose_path,
-                env_path,
+                project_dir,
             ):
-                base = self._compose_cmd_base(slug, app_dir, compose_path, env_path)
+                base = self._compose_cmd_base(slug, project_dir, compose_path)
                 if action == "start":
                     self._run_docker(
                         [*base, "up", "-d", "--remove-orphans"], timeout=180
@@ -1730,7 +1986,7 @@ class RuntimeService:
                 elif action == "restart":
                     self._run_docker([*base, "restart"], timeout=90)
 
-                status = self._compose_status(slug, app_dir, compose_path, env_path)
+                status = self._compose_status(slug, project_dir, compose_path)
                 return {
                     "slug": slug,
                     "status": status,
@@ -1739,7 +1995,7 @@ class RuntimeService:
 
     def build_git(self, payload: dict[str, Any]) -> dict[str, Any]:
         slug = validate_slug(payload.get("slug"))
-        repo_url = validate_git_repo_url(
+        repo_url, repo_host, repo_port, validated_ips = validate_git_repo_url_with_ips(
             payload.get("gitRepoUrl"), dns_resolver=self.dns_resolver
         )
         branch = validate_git_branch(payload.get("gitBranch"))
@@ -1767,24 +2023,31 @@ class RuntimeService:
             os.chmod(build_dir, 0o700)
             clone_dir = os.path.join(build_dir, "repo")
             try:
-                clone_args = [
-                    "clone",
-                    "--depth",
-                    "1",
-                    "--single-branch",
-                    "-c",
-                    "protocol.file.allow=never",
-                    "-c",
-                    "http.followRedirects=false",
-                    "-c",
-                    "core.symlinks=false",
-                ]
-                if branch:
-                    clone_args.extend(["--branch", branch])
-                clone_args.extend(["--", repo_url, clone_dir])
-
                 clone_timeout = max(5.0, min(total_timeout_s * 0.4, 90.0))
-                self._run_git(clone_args, timeout=clone_timeout, check=True)
+                with _PinnedGitConnectProxy(
+                    repo_host,
+                    repo_port,
+                    validated_ips,
+                    connect_timeout=min(15.0, clone_timeout),
+                ) as proxy:
+                    clone_args = [
+                        "clone",
+                        "--depth",
+                        "1",
+                        "--single-branch",
+                        "-c",
+                        "protocol.file.allow=never",
+                        "-c",
+                        "http.followRedirects=false",
+                        "-c",
+                        "core.symlinks=false",
+                        "-c",
+                        f"http.proxy=http://127.0.0.1:{proxy.port}",
+                    ]
+                    if branch:
+                        clone_args.extend(["--branch", branch])
+                    clone_args.extend(["--", repo_url, clone_dir])
+                    self._run_git(clone_args, timeout=clone_timeout, check=True)
 
                 # Verify Dockerfile exists inside clone_dir and is not a symlink escape
                 real_clone_dir = os.path.realpath(clone_dir)
@@ -1864,21 +2127,41 @@ class RuntimeService:
         app_dir = resolve_scoped_app_dir(self.apps_root, slug)
         with self._validated_compose_context(app_dir, slug) as (
             compose_path,
-            env_path,
+            project_dir,
         ):
-            base = self._compose_cmd_base(slug, app_dir, compose_path, env_path)
+            base = self._compose_cmd_base(slug, project_dir, compose_path)
             proc = self._run_docker(
                 [*base, "logs", "--no-color", "--tail", str(tail)],
                 timeout=20,
             )
             combined = "\n".join(part for part in (proc.stdout, proc.stderr) if part)
             redacted_blob = redact_secrets(combined)
-            raw_lines = [
-                line[:MAX_LOG_LINE_CHARS]
-                for line in redacted_blob.splitlines()
-                if line
-            ]
-            return {"slug": slug, "lines": raw_lines[-tail:]}
+            truncated = False
+            raw_lines: list[str] = []
+            for line in redacted_blob.splitlines():
+                if not line:
+                    continue
+                if len(line) > MAX_LOG_LINE_CHARS:
+                    raw_lines.append(line[:MAX_LOG_LINE_CHARS])
+                    truncated = True
+                else:
+                    raw_lines.append(line)
+
+            if len(raw_lines) > tail:
+                raw_lines = raw_lines[-tail:]
+
+            # Enforce strict UTF-8 JSON byte budget on the finished log list (keeping newest lines)
+            kept_reversed: list[str] = []
+            used_bytes = 256  # overhead for JSON wrapper
+            for line in reversed(raw_lines):
+                line_bytes = len(json.dumps(line).encode("utf-8")) + 1
+                if used_bytes + line_bytes > MAX_LOGS_RESPONSE_BYTES:
+                    truncated = True
+                    break
+                kept_reversed.append(line)
+                used_bytes += line_bytes
+            kept_reversed.reverse()
+            return {"slug": slug, "lines": kept_reversed, "truncated": truncated}
 
     def _validate_and_reload_caddy(self) -> None:
         self._run_docker(
@@ -1940,6 +2223,101 @@ class RuntimeService:
             except OSError:
                 continue
         return None
+
+    def _resolve_core_caddy_path(self) -> str:
+        os.makedirs(self.caddy_core_dir, mode=0o755, exist_ok=True)
+        real_core_dir = ensure_real_directory(self.caddy_core_dir, "caddyCoreDir")
+        route_path = os.path.join(real_core_dir, "dashboard.caddy")
+        if os.path.islink(route_path):
+            raise BridgeRequestError(
+                400,
+                "Security boundary violation: core Caddy route cannot be a symlink.",
+            )
+        return route_path
+
+    def route_core_domain(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Applies the dashboard/MCP domain directly to Caddy's core.d/dashboard.caddy,
+        validates & reloads Caddy, and atomically restores the prior working config
+        if validation or reload fails.
+        """
+        raw_domain = payload.get("domain")
+        domain = None if raw_domain is None else validate_domain(raw_domain)
+        acme_email = validate_email(payload.get("acmeEmail"))
+
+        with self._caddy_lock:
+            if domain is not None and os.path.isdir(self.caddy_apps_dir):
+                real_apps_dir = ensure_real_directory(
+                    self.caddy_apps_dir, "caddyAppsDir"
+                )
+                owner = self._find_domain_owner(real_apps_dir, domain, "__core__")
+                if owner is not None:
+                    raise BridgeRequestError(
+                        409,
+                        f'Domain "{domain}" is already routed to app "{owner}".',
+                    )
+
+            route_path = self._resolve_core_caddy_path()
+            previous_content: str | None = None
+            if os.path.exists(route_path):
+                with open(route_path, "r", encoding="utf-8") as fh:
+                    previous_content = fh.read()
+
+            if domain is not None:
+                tls_line = f"\ttls {acme_email}\n" if acme_email else ""
+                route_body = (
+                    "# Managed by VPSAgent Host Runtime Bridge (Core Dashboard & MCP)\n"
+                    f"{domain} {{\n"
+                    f"{tls_line}"
+                    "\tencode zstd gzip\n"
+                    "\thandle /mcp {\n"
+                    "\t\treverse_proxy vpsagent-core:3001\n"
+                    "\t}\n"
+                    "\thandle {\n"
+                    "\t\treverse_proxy vpsagent-core:3001\n"
+                    "\t}\n"
+                    "}\n"
+                )
+            else:
+                route_body = (
+                    "# Managed by VPSAgent Host Runtime Bridge (Local-only fallback)\n"
+                    "127.0.0.1:80, localhost:80 {\n"
+                    "\tencode zstd gzip\n"
+                    "\thandle /mcp {\n"
+                    "\t\treverse_proxy vpsagent-core:3001\n"
+                    "\t}\n"
+                    "\thandle {\n"
+                    "\t\treverse_proxy vpsagent-core:3001\n"
+                    "\t}\n"
+                    "}\n"
+                )
+
+            try:
+                with open(route_path, "w", encoding="utf-8") as fh:
+                    fh.write(route_body)
+                os.chmod(route_path, 0o644)
+                self._validate_and_reload_caddy()
+            except Exception as exc:
+                if previous_content is not None:
+                    with open(route_path, "w", encoding="utf-8") as fh:
+                        fh.write(previous_content)
+                    os.chmod(route_path, 0o644)
+                elif os.path.exists(route_path):
+                    os.unlink(route_path)
+                if isinstance(exc, BridgeRequestError):
+                    raise BridgeRequestError(
+                        422, f"Caddy HTTPS domain update failed: {exc}"
+                    ) from exc
+                raise BridgeRequestError(
+                    500, f"Failed updating core Caddy domain: {exc}"
+                ) from exc
+
+            return {
+                "ok": True,
+                "domain": domain,
+                "acmeEmail": acme_email,
+                "httpsActive": domain is not None,
+            }
 
     def route_caddy(self, payload: dict[str, Any]) -> dict[str, Any]:
         slug = validate_slug(payload.get("slug"))
@@ -2078,12 +2456,12 @@ class RuntimeService:
                 try:
                     with self._validated_compose_context(app_dir, slug) as (
                         validated_compose,
-                        validated_env,
+                        project_dir,
                     ):
                         self._run_docker(
                             [
                                 *self._compose_cmd_base(
-                                    slug, app_dir, validated_compose, validated_env
+                                    slug, project_dir, validated_compose
                                 ),
                                 "down",
                                 "--remove-orphans",
@@ -2130,10 +2508,10 @@ class RuntimeService:
         try:
             with self._validated_compose_context(app_dir, slug) as (
                 validated_compose,
-                validated_env,
+                project_dir,
             ):
                 return slug, self._compose_status(
-                    slug, app_dir, validated_compose, validated_env
+                    slug, project_dir, validated_compose
                 )
         except BridgeRequestError:
             return slug, "error"
@@ -2192,7 +2570,9 @@ class RuntimeService:
             return exact
         return next((c for c in containers if c["running"] and c["ipAddress"]), None)
 
-    def inspect_workload(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def inspect_workload(
+        self, payload: dict[str, Any], *, timeout_budget_s: float | None = None
+    ) -> dict[str, Any]:
         slug = validate_slug(payload.get("slug"))
         raw_probe_http = payload.get("probeHttp", False)
         if not isinstance(raw_probe_http, bool):
@@ -2201,6 +2581,17 @@ class RuntimeService:
         probe_path = validate_probe_path(payload.get("probePath"))
         raw_port = payload.get("internalPort")
         internal_port = 8080 if raw_port is None else validate_port(raw_port)
+
+        deadline = (
+            time.monotonic() + max(0.05, float(timeout_budget_s))
+            if timeout_budget_s is not None
+            else None
+        )
+
+        def _budget(default_s: float) -> float:
+            if deadline is None:
+                return default_s
+            return max(0.05, min(default_s, deadline - time.monotonic()))
 
         app_dir = resolve_scoped_app_dir(self.apps_root, slug, require_exists=False)
         workspace_exists = os.path.isdir(app_dir)
@@ -2227,7 +2618,7 @@ class RuntimeService:
                 "--format",
                 "{{.ID}}",
             ],
-            timeout=15,
+            timeout=_budget(15.0),
             check=False,
         )
         targets: list[str] = []
@@ -2244,7 +2635,7 @@ class RuntimeService:
             targets = [f"vpsagent-app-{slug}"]
 
         inspect_proc = self._run_docker(
-            ["inspect", *targets], timeout=15, check=False
+            ["inspect", *targets], timeout=_budget(15.0), check=False
         )
         containers: list[dict[str, Any]] = []
         expected_net = f"vpsagent-{slug}_app_net"
@@ -2450,9 +2841,22 @@ class RuntimeService:
         if probe_http:
             target_container = self._select_primary_container(slug, containers)
             if target_container is not None:
-                http_probe = _probe_container_http(
-                    str(target_container["ipAddress"]), internal_port, probe_path
-                )
+                if deadline is not None and deadline - time.monotonic() <= 0:
+                    http_probe = {
+                        "attempted": False,
+                        "ok": False,
+                        "statusCode": None,
+                        "latencyMs": None,
+                        "contentType": None,
+                        "error": "Readiness timeout budget exhausted before HTTP probe.",
+                    }
+                else:
+                    http_probe = _probe_container_http(
+                        str(target_container["ipAddress"]),
+                        internal_port,
+                        probe_path,
+                        timeout_s=_budget(DEFAULT_PROBE_TIMEOUT_S),
+                    )
             else:
                 http_probe = {
                     "attempted": False,
@@ -2479,12 +2883,18 @@ class RuntimeService:
         """
         Bounded startup readiness wait:
         - Fails fast if container is stopped/error or reports healthStatus == 'unhealthy'.
-        - Retries while the app is still binding its port (e.g. ECONNREFUSED, 5xx).
-        - Accepts any non-5xx HTTP response (100 <= status < 500, including 4xx API roots)
-          as listening and ready to route.
+        - Waits while any configured container health check is still 'starting'.
+        - When probeHttp is True (default), retries while the app is still binding its port
+          and accepts any non-5xx HTTP response (100 <= status < 500, including 4xx API roots).
+        - When probeHttp is False (non-HTTP workers), completes once running and healthy.
+        - Strictly budgets remaining time before and after each inspection.
         """
         slug = validate_slug(payload.get("slug"))
         internal_port = validate_port(payload.get("internalPort"))
+        raw_probe_http = payload.get("probeHttp", True)
+        if not isinstance(raw_probe_http, bool):
+            raise BridgeRequestError(400, "Field 'probeHttp' must be a boolean.")
+        probe_http = raw_probe_http
         probe_path = validate_probe_path(payload.get("probePath"))
 
         raw_timeout = payload.get("timeoutSeconds", DEFAULT_READINESS_TIMEOUT_S)
@@ -2519,20 +2929,56 @@ class RuntimeService:
         last_reason = "Readiness probe did not succeed before timeout."
 
         while True:
-            attempts += 1
-            inspected = self.inspect_workload(
-                {
+            remaining_before = deadline - time.monotonic()
+            if attempts > 0 and remaining_before <= 0:
+                return {
+                    "ready": False,
                     "slug": slug,
-                    "probeHttp": True,
-                    "internalPort": internal_port,
-                    "probePath": probe_path,
+                    "status": last_status,
+                    "attempts": attempts,
+                    "elapsedMs": round((time.monotonic() - t0) * 1000, 1),
+                    "httpProbe": last_probe,
+                    "reason": redact_secrets(
+                        f'Timed out waiting for "{slug}" on port {internal_port}: {last_reason}'
+                    ),
                 }
-            )
+
+            attempts += 1
+            try:
+                inspected = self.inspect_workload(
+                    {
+                        "slug": slug,
+                        "probeHttp": probe_http,
+                        "internalPort": internal_port,
+                        "probePath": probe_path,
+                    },
+                    timeout_budget_s=max(0.05, remaining_before),
+                )
+            except BridgeRequestError as exc:
+                if exc.status_code == 504:
+                    if attempts == 1:
+                        last_reason = str(exc)
+                    return {
+                        "ready": False,
+                        "slug": slug,
+                        "status": last_status,
+                        "attempts": attempts,
+                        "elapsedMs": round((time.monotonic() - t0) * 1000, 1),
+                        "httpProbe": last_probe,
+                        "reason": redact_secrets(
+                            f'Timed out waiting for "{slug}" on port {internal_port}: {last_reason}'
+                        ),
+                    }
+                raise
+
             last_status = str(inspected["status"])
             last_probe = inspected.get("httpProbe")
             containers = inspected.get("containers") or []
             any_unhealthy = any(
                 c.get("healthStatus") == "unhealthy" for c in containers
+            )
+            any_starting = any(
+                c.get("healthStatus") == "starting" for c in containers
             )
 
             if last_status != "running" or any_unhealthy:
@@ -2550,7 +2996,19 @@ class RuntimeService:
                     "reason": reason,
                 }
 
-            if isinstance(last_probe, dict) and last_probe.get("attempted"):
+            if any_starting:
+                last_reason = "Waiting for container health check to finish starting."
+            elif not probe_http:
+                return {
+                    "ready": True,
+                    "slug": slug,
+                    "status": last_status,
+                    "attempts": attempts,
+                    "elapsedMs": round((time.monotonic() - t0) * 1000, 1),
+                    "httpProbe": None,
+                    "reason": None,
+                }
+            elif isinstance(last_probe, dict) and last_probe.get("attempted"):
                 code = last_probe.get("statusCode")
                 if last_probe.get("ok") or (
                     isinstance(code, int) and 100 <= code < 500
@@ -2571,8 +3029,8 @@ class RuntimeService:
             elif isinstance(last_probe, dict) and last_probe.get("error"):
                 last_reason = str(last_probe["error"])
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            remaining_after = deadline - time.monotonic()
+            if remaining_after <= 0:
                 return {
                     "ready": False,
                     "slug": slug,
@@ -2584,7 +3042,7 @@ class RuntimeService:
                         f'Timed out waiting for "{slug}" on port {internal_port}: {last_reason}'
                     ),
                 }
-            time.sleep(min(poll_s, remaining))
+            time.sleep(min(poll_s, remaining_after))
 
 
 def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
@@ -2690,6 +3148,8 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(200, service.logs(payload))
                 elif self.path == "/v1/apps/route-caddy":
                     self._send_json(200, service.route_caddy(payload))
+                elif self.path == "/v1/core/route-domain":
+                    self._send_json(200, service.route_core_domain(payload))
                 elif self.path == "/v1/apps/remove":
                     self._send_json(200, service.remove_workload(payload))
                 elif self.path == "/v1/apps/statuses":
@@ -2763,6 +3223,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--caddy-core-dir",
+        default=os.environ.get("VPSAGENT_CADDY_CORE_DIR", ""),
+    )
+    parser.add_argument(
         "--caddy-container",
         default=os.environ.get("VPSAGENT_CADDY_CONTAINER", "vpsagent-caddy"),
     )
@@ -2808,6 +3272,7 @@ def main(argv: list[str] | None = None) -> int:
     service = RuntimeService(
         apps_root=args.apps_root,
         caddy_apps_dir=args.caddy_apps_dir,
+        caddy_core_dir=args.caddy_core_dir or None,
         caddy_container=args.caddy_container,
         docker_bin=args.docker_bin,
         git_bin=args.git_bin,

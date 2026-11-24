@@ -46,6 +46,8 @@ interface AppRow {
   domain: string | null;
   folder_path: string;
   internal_port: number;
+  probe_http: number;
+  probe_path: string;
   status: AppStatus;
   cpu_limit: string;
   memory_limit_mb: number;
@@ -69,6 +71,7 @@ interface ApprovalRow {
   summary: string;
   payload_json: string;
   requested_by: string;
+  token_id: string | null;
   token_scope: McpTokenScope;
   status: ApprovalStatus;
   risk_level: RiskLevel;
@@ -83,6 +86,7 @@ interface ApprovalRow {
 interface AuditRow {
   id: string;
   actor: Actor;
+  actor_token_id: string | null;
   action: string;
   target_slug: string | null;
   summary: string;
@@ -110,6 +114,7 @@ const DEFAULT_SETUP_STATE: SetupState = {
   claimed: false,
   domain: null,
   acmeEmail: null,
+  httpsActive: false,
   claimedAt: null,
 };
 
@@ -205,6 +210,8 @@ export class RegistryStore {
         domain TEXT,
         folder_path TEXT NOT NULL,
         internal_port INTEGER NOT NULL,
+        probe_http INTEGER NOT NULL DEFAULT 1,
+        probe_path TEXT NOT NULL DEFAULT '/',
         status TEXT NOT NULL CHECK (status IN ('provisioning', 'building', 'running', 'stopped', 'error')),
         cpu_limit TEXT NOT NULL,
         memory_limit_mb INTEGER NOT NULL,
@@ -229,6 +236,7 @@ export class RegistryStore {
         summary TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         requested_by TEXT NOT NULL,
+        token_id TEXT,
         token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'auto-approve')),
         status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'executed', 'failed')),
         risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high')),
@@ -253,6 +261,7 @@ export class RegistryStore {
       CREATE TABLE IF NOT EXISTS audit_events (
         id TEXT PRIMARY KEY,
         actor TEXT NOT NULL CHECK (actor IN ('user', 'agent', 'system')),
+        actor_token_id TEXT,
         action TEXT NOT NULL,
         target_slug TEXT,
         summary TEXT NOT NULL,
@@ -280,6 +289,19 @@ export class RegistryStore {
         updated_at TEXT NOT NULL
       );
     `);
+    this.ensureColumn("apps", "probe_http", "INTEGER NOT NULL DEFAULT 1");
+    this.ensureColumn("apps", "probe_path", "TEXT NOT NULL DEFAULT '/'");
+    this.ensureColumn("approval_requests", "token_id", "TEXT");
+    this.ensureColumn("audit_events", "actor_token_id", "TEXT");
+  }
+
+  private ensureColumn(table: string, column: string, definition: string): void {
+    const cols = this.db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as unknown as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
+    }
   }
 
   close(): void {
@@ -291,7 +313,9 @@ export class RegistryStore {
   // ---------------------------------------------------------------------------
 
   upsertApp(
-    input: Omit<AppRecord, "createdAt" | "updatedAt"> & {
+    input: Omit<AppRecord, "createdAt" | "updatedAt" | "probeHttp" | "probePath"> & {
+      probeHttp?: boolean;
+      probePath?: string;
       createdAt?: string;
       updatedAt?: string;
     },
@@ -305,6 +329,8 @@ export class RegistryStore {
       ...input,
       slug: safeSlug,
       domain: safeDomain,
+      probeHttp: input.probeHttp ?? existing?.probeHttp ?? true,
+      probePath: input.probePath ?? existing?.probePath ?? "/",
       createdAt: existing?.createdAt ?? input.createdAt ?? now,
       updatedAt: input.updatedAt ?? now,
     });
@@ -313,9 +339,9 @@ export class RegistryStore {
       .prepare(
         `INSERT INTO apps (
           slug, name, source_type, image, git_repo_url, git_branch, dockerfile_path,
-          domain, folder_path, internal_port, status, cpu_limit, memory_limit_mb,
-          companions_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          domain, folder_path, internal_port, probe_http, probe_path, status, cpu_limit,
+          memory_limit_mb, companions_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(slug) DO UPDATE SET
           name = excluded.name,
           source_type = excluded.source_type,
@@ -326,6 +352,8 @@ export class RegistryStore {
           domain = excluded.domain,
           folder_path = excluded.folder_path,
           internal_port = excluded.internal_port,
+          probe_http = excluded.probe_http,
+          probe_path = excluded.probe_path,
           status = excluded.status,
           cpu_limit = excluded.cpu_limit,
           memory_limit_mb = excluded.memory_limit_mb,
@@ -343,6 +371,8 @@ export class RegistryStore {
         record.domain,
         record.folderPath,
         record.internalPort,
+        record.probeHttp ? 1 : 0,
+        record.probePath,
         record.status,
         record.cpuLimit,
         record.memoryLimitMb,
@@ -409,6 +439,8 @@ export class RegistryStore {
       domain: row.domain,
       folderPath: row.folder_path,
       internalPort: row.internal_port,
+      probeHttp: row.probe_http !== 0,
+      probePath: row.probe_path || "/",
       status: row.status,
       cpuLimit: row.cpu_limit,
       memoryLimitMb: row.memory_limit_mb,
@@ -503,6 +535,7 @@ export class RegistryStore {
     /** Optional unredacted payload encrypted at rest strictly for post-approval execution (never returned in list/read views). */
     executionPayload?: Record<string, unknown>;
     requestedBy: string;
+    tokenId?: string | null;
     tokenScope: McpTokenScope;
     riskLevel?: RiskLevel;
   }): ApprovalRequest {
@@ -524,10 +557,10 @@ export class RegistryStore {
     this.db
       .prepare(
         `INSERT INTO approval_requests (
-          id, action, target_slug, summary, payload_json, requested_by, token_scope,
+          id, action, target_slug, summary, payload_json, requested_by, token_id, token_scope,
           status, risk_level, decided_by, decision_note, result_summary,
           created_at, decided_at, executed_at, execution_owner
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, ?, NULL, NULL, NULL)`,
       )
       .run(
         id,
@@ -536,6 +569,7 @@ export class RegistryStore {
         safeSummary,
         JSON.stringify(safePayload),
         input.requestedBy,
+        input.tokenId ?? null,
         input.tokenScope,
         riskLevel,
         now,
@@ -688,6 +722,7 @@ export class RegistryStore {
       summary: row.summary,
       payload: JSON.parse(row.payload_json) as Record<string, unknown>,
       requestedBy: row.requested_by,
+      tokenId: row.token_id ?? null,
       tokenScope: row.token_scope,
       status: row.status,
       riskLevel: row.risk_level,
@@ -706,6 +741,7 @@ export class RegistryStore {
 
   recordAudit(input: {
     actor: Actor;
+    actorTokenId?: string | null;
     action: string;
     targetSlug?: string | null;
     summary: string;
@@ -717,6 +753,7 @@ export class RegistryStore {
     const event = AuditEventSchema.parse({
       id,
       actor: input.actor,
+      actorTokenId: input.actorTokenId ?? null,
       action: input.action,
       targetSlug: input.targetSlug ?? null,
       summary: safeSummary,
@@ -726,12 +763,13 @@ export class RegistryStore {
 
     this.db
       .prepare(
-        `INSERT INTO audit_events (id, actor, action, target_slug, summary, risk_level, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO audit_events (id, actor, actor_token_id, action, target_slug, summary, risk_level, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         event.id,
         event.actor,
+        event.actorTokenId,
         event.action,
         event.targetSlug,
         event.summary,
@@ -764,6 +802,7 @@ export class RegistryStore {
       AuditEventSchema.parse({
         id: row.id,
         actor: row.actor,
+        actorTokenId: row.actor_token_id ?? null,
         action: row.action,
         targetSlug: row.target_slug,
         summary: row.summary,

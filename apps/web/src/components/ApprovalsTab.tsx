@@ -33,10 +33,10 @@ export function ApprovalsTab({
         await api.rejectRequest(id);
         setNotice("Request rejected.");
       }
-      await onRefresh(searchQuery);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Action failed.");
     } finally {
+      await onRefresh(searchQuery);
       setBusyId(null);
     }
   };

@@ -233,7 +233,7 @@ export function OverviewTab({
               active AI visitor pass{data.activeMcpTokens === 1 ? "" : "es"}.
             </p>
             <p className="text-xs text-slate-400 mt-2">
-              {data.setup.domain ? (
+              {data.setup.domain && data.setup.httpsActive ? (
                 <>
                   Protected with automatic HTTPS at{" "}
                   <code className="text-emerald-300">
@@ -241,7 +241,7 @@ export function OverviewTab({
                   </code>
                 </>
               ) : (
-                "Connect a domain in AI Keys & Settings to turn on remote HTTPS access for Claude Code, Cursor, or Codex."
+                "Connect a domain in AI Keys & Settings to turn on remote HTTPS access in Caddy for Claude Code, Cursor, or Codex."
               )}
             </p>
           </div>

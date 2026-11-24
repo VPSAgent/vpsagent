@@ -15,6 +15,8 @@ import {
 } from "@vpsagent/shared";
 import {
   SessionManager,
+  type TransportContextOptions,
+  assertSecureTransport,
   getRequestHost,
   getRequestProtocol,
 } from "./auth.js";
@@ -23,7 +25,11 @@ import {
   DeployAppInputSchema,
   UpdateAppEnvInputSchema,
 } from "./executor.js";
-import { buildMcpSetupSnippets, createMcpPostHandler } from "./mcp-gateway.js";
+import {
+  buildMcpSetupSnippets,
+  createMcpPostHandler,
+  enforceMcpBoundary,
+} from "./mcp-gateway.js";
 
 export interface VpsAgentAppOptions {
   store: RegistryStore;
@@ -34,16 +40,22 @@ export interface VpsAgentAppOptions {
   webDistDir?: string | undefined;
   publicIp?: string | undefined;
   trustProxy?: boolean | undefined;
+  /** Set true ONLY for the loopback-only local setup server (127.0.0.1:3002). */
+  isLocalListener?: boolean | undefined;
+  /** Optional default peer IP for unit tests without a real Node TCP socket. */
+  defaultPeerIp?: string | undefined;
   lookupFn?: HostLookupFn | undefined;
   readinessTimeoutSeconds?: number | undefined;
   readinessPollIntervalMs?: number | undefined;
   buildTimeoutSeconds?: number | undefined;
-  onDomainUpdated?: ((domain: string | null, acmeEmail: string | null) => Promise<void> | void) | undefined;
 }
 
 const ClaimInputSchema = z.object({
   claimToken: z.string().min(1),
-  passphrase: z.string().min(8, "Password must be at least 8 characters long.").max(256),
+  passphrase: z
+    .string()
+    .min(8, "Password must be at least 8 characters long.")
+    .max(256),
 });
 
 const LoginInputSchema = z.object({
@@ -81,7 +93,10 @@ function toStatusCode(code: number): ContentfulStatusCode {
   return 500;
 }
 
-function handleError(err: unknown): { status: ContentfulStatusCode; error: string } {
+function handleError(err: unknown): {
+  status: ContentfulStatusCode;
+  error: string;
+} {
   if (err instanceof RuntimeBridgeError) {
     return { status: toStatusCode(err.statusCode), error: err.message };
   }
@@ -89,13 +104,19 @@ function handleError(err: unknown): { status: ContentfulStatusCode; error: strin
     const first = err.issues[0];
     return {
       status: 400,
-      error: first ? `${first.path.join(".") || "input"}: ${first.message}` : "Invalid request payload.",
+      error: first
+        ? `${first.path.join(".") || "input"}: ${first.message}`
+        : "Invalid request payload.",
     };
   }
-  const message = redactSecrets(err instanceof Error ? err.message : String(err));
+  const message = redactSecrets(
+    err instanceof Error ? err.message : String(err),
+  );
   const status: ContentfulStatusCode = /not found/i.test(message)
     ? 404
-    : /invalid|reserved|blocked|cannot|must|required|duplicate/i.test(message)
+    : /invalid|reserved|blocked|cannot|must|required|duplicate|exceeds/i.test(
+          message,
+        )
       ? 400
       : 500;
   return { status, error: message };
@@ -109,6 +130,11 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
 } {
   const { store, bridge } = options;
   const trustProxy = Boolean(options.trustProxy);
+  const transportOptions: TransportContextOptions = {
+    trustProxy,
+    isLocalListener: options.isLocalListener,
+    defaultPeerIp: options.defaultPeerIp,
+  };
 
   const sessions = new SessionManager({
     store,
@@ -168,10 +194,20 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
 
   // ---------------------------------------------------------------------------
-  // 2-Step First-Boot Setup + Login / Logout
+  // 2-Step First-Boot Setup + Login / Logout (HTTPS or genuine local loopback)
   // ---------------------------------------------------------------------------
 
   app.post("/api/setup/claim", async (c) => {
+    let transport: { isHttps: boolean; isLocalLoopback: boolean };
+    try {
+      transport = assertSecureTransport(c, transportOptions);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "HTTPS required." },
+        403,
+      );
+    }
+
     if (store.getSetupState().claimed) {
       return c.json(
         { error: "This VPSAgent server has already been claimed." },
@@ -182,7 +218,10 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       const body = ClaimInputSchema.parse(await c.req.json());
       if (!sessions.verifyClaimToken(body.claimToken)) {
         return c.json(
-          { error: "Invalid setup link token. Check the link printed by the installer." },
+          {
+            error:
+              "Invalid setup link token. Check the link printed by the installer.",
+          },
           401,
         );
       }
@@ -199,9 +238,11 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         riskLevel: "high",
       });
 
-      const isSecure = getRequestProtocol(c, trustProxy) === "https";
       const token = sessions.createSessionToken();
-      c.header("Set-Cookie", sessions.buildSetSessionCookie(token, isSecure));
+      c.header(
+        "Set-Cookie",
+        sessions.buildSetSessionCookie(token, transport.isHttps),
+      );
       return c.json({ ok: true, setup });
     } catch (err) {
       const { status, error } = handleError(err);
@@ -210,6 +251,16 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
 
   app.post("/api/auth/login", async (c) => {
+    let transport: { isHttps: boolean; isLocalLoopback: boolean };
+    try {
+      transport = assertSecureTransport(c, transportOptions);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "HTTPS required." },
+        403,
+      );
+    }
+
     if (!store.getSetupState().claimed) {
       return c.json(
         { error: "Complete first-time setup before logging in." },
@@ -231,9 +282,11 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         return c.json({ error: "Incorrect password." }, 401);
       }
       sessions.clearLoginFailures(clientKey);
-      const isSecure = getRequestProtocol(c, trustProxy) === "https";
       const token = sessions.createSessionToken();
-      c.header("Set-Cookie", sessions.buildSetSessionCookie(token, isSecure));
+      c.header(
+        "Set-Cookie",
+        sessions.buildSetSessionCookie(token, transport.isHttps),
+      );
       return c.json({ ok: true, setup: store.getSetupState() });
     } catch (err) {
       const { status, error } = handleError(err);
@@ -248,13 +301,26 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
 
   // ---------------------------------------------------------------------------
-  // Remote MCP Gateway (`POST /mcp` — bearer token auth + HTTPS enforcement)
+  // Remote MCP Gateway (`POST /mcp` — bearer token auth + HTTPS/Host/Origin)
   // ---------------------------------------------------------------------------
 
   app.post(
     "/mcp",
-    createMcpPostHandler({ store, bridge, executor, trustProxy }),
+    createMcpPostHandler({ store, bridge, executor, transportOptions }),
   );
+
+  // Streamable HTTP spec: return 405 Method Not Allowed on GET /mcp when SSE is not offered
+  app.get("/mcp", (c) => {
+    const guard = enforceMcpBoundary(c, store, transportOptions);
+    if (!guard.ok) {
+      return guard.response;
+    }
+    c.header("Allow", "POST");
+    return c.json(
+      { error: "Method Not Allowed: /mcp only accepts POST JSON-RPC requests." },
+      405,
+    );
+  });
 
   // ---------------------------------------------------------------------------
   // Authenticated Owner Dashboard API (`/api/*`)
@@ -279,25 +345,30 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   app.use("/api/audit", requireOwner);
   app.use("/api/mcp/*", requireOwner);
 
-  // Step 2 of first-boot setup (also reusable later in Settings)
+  // Step 2 of first-boot setup (applies directly to Caddy via Runtime Bridge!)
   app.post("/api/setup/domain", async (c) => {
     try {
       const body = SetupDomainInputSchema.parse(await c.req.json());
       const safeDomain = body.domain ? validateDomain(body.domain) : null;
       const acmeEmail = body.acmeEmail ?? null;
-      const setup = store.updateSetupState({
+
+      // Apply to Caddy and validate+reload BEFORE persisting setup state!
+      const applied = await bridge.routeCoreDomain({
         domain: safeDomain,
         acmeEmail,
       });
-      if (options.onDomainUpdated) {
-        await options.onDomainUpdated(safeDomain, acmeEmail);
-      }
+
+      const setup = store.updateSetupState({
+        domain: applied.domain,
+        acmeEmail: applied.acmeEmail,
+        httpsActive: applied.httpsActive,
+      });
       store.recordAudit({
         actor: "user",
         action: "setup.domain_updated",
-        summary: safeDomain
-          ? `Connected dashboard domain ${safeDomain} for automatic HTTPS`
-          : "Cleared dashboard custom domain",
+        summary: applied.domain
+          ? `Enabled automatic HTTPS in Caddy for dashboard domain ${applied.domain}`
+          : "Cleared dashboard custom domain (reverted to local-only mode)",
         riskLevel: "medium",
       });
       return c.json({ ok: true, setup });
@@ -433,8 +504,11 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       const tail = Number.isFinite(rawTail)
         ? Math.min(Math.max(rawTail, 1), 500)
         : 100;
-      const lines = await bridge.getLogs(c.req.param("slug"), tail);
-      return c.json({ slug: c.req.param("slug"), lines });
+      const slug = c.req.param("slug");
+      const detailed = bridge.getLogsDetailed
+        ? await bridge.getLogsDetailed(slug, tail)
+        : { slug, lines: await bridge.getLogs(slug, tail), truncated: false };
+      return c.json(detailed);
     } catch (err) {
       const { status, error } = handleError(err);
       return c.json({ error }, status);
@@ -446,8 +520,12 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       const slug = c.req.param("slug");
       const appRecord = store.getApp(slug);
       const inspect = await bridge.inspectWorkload(slug, {
-        probeHttp: c.req.query("probe") === "true",
+        probeHttp:
+          c.req.query("probe") === "true"
+            ? (appRecord?.probeHttp ?? true)
+            : false,
         internalPort: appRecord?.internalPort ?? 8080,
+        probePath: appRecord?.probePath ?? "/",
       });
       return c.json({ inspect });
     } catch (err) {
@@ -546,6 +624,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
 
       store.recordAudit({
         actor: "user",
+        actorTokenId: decided.tokenId,
         action: "approval.approved",
         targetSlug: decided.targetSlug,
         summary: `Approved ${decided.action} (${decided.id}) requested by ${decided.requestedBy}`,
@@ -559,6 +638,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
           ok: execution.ok,
           approval: finalRecord,
           summary: execution.summary,
+          ...(execution.ok ? {} : { error: execution.summary }),
         },
         execution.ok ? 200 : 502,
       );
@@ -585,6 +665,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       }
       store.recordAudit({
         actor: "user",
+        actorTokenId: decided.tokenId,
         action: "approval.rejected",
         targetSlug: decided.targetSlug,
         summary: `Rejected ${decided.action} (${decided.id}) requested by ${decided.requestedBy}`,
@@ -612,17 +693,26 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     return c.json({ events });
   });
 
-  // Tab 4 — AI Keys & Settings
+  // Tab 4 — AI Keys & Settings (creating raw keys requires HTTPS or genuine local loopback)
   app.get("/api/mcp/tokens", (c) => {
     return c.json({ tokens: store.listMcpTokens() });
   });
 
   app.post("/api/mcp/tokens", async (c) => {
     try {
+      assertSecureTransport(c, transportOptions);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "HTTPS required." },
+        403,
+      );
+    }
+    try {
       const input = CreateMcpTokenInputSchema.parse(await c.req.json());
       const { record, rawToken } = store.createMcpToken(input);
       store.recordAudit({
         actor: "user",
+        actorTokenId: record.id,
         action: "mcp.token_created",
         summary: `Created ${record.scope} AI pass "${record.name}" (${record.tokenPrefix}...)`,
         riskLevel: record.scope === "auto-approve" ? "high" : "medium",
@@ -642,6 +732,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     }
     store.recordAudit({
       actor: "user",
+      actorTokenId: id,
       action: "mcp.token_revoked",
       summary: `Revoked AI pass (${id})`,
       riskLevel: "medium",
@@ -651,12 +742,12 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
 
   app.get("/api/mcp/snippets", (c) => {
     const setup = store.getSetupState();
-    const host = getRequestHost(c, trustProxy);
-    const proto = getRequestProtocol(c, trustProxy);
-    const mcpUrl = setup.domain
+    const httpsReady = Boolean(setup.domain && setup.httpsActive);
+    const host = getRequestHost(c, trustProxy) || "localhost:3002";
+    const mcpUrl = httpsReady
       ? `https://${setup.domain}/mcp`
-      : `${proto}://${host}/mcp`;
-    return c.json(buildMcpSetupSnippets(mcpUrl));
+      : `http://${host}/mcp`;
+    return c.json(buildMcpSetupSnippets(mcpUrl, httpsReady));
   });
 
   // ---------------------------------------------------------------------------

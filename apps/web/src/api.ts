@@ -2,6 +2,7 @@ export interface SetupState {
   claimed: boolean;
   domain: string | null;
   acmeEmail: string | null;
+  httpsActive: boolean;
   claimedAt: string | null;
 }
 

@@ -30,11 +30,12 @@ export const DeployAppInputSchema = z.object({
   dockerfilePath: z.string().min(1).max(200).optional(),
   domain: z.string().min(1).max(253).nullable().optional(),
   internalPort: z.number().int().min(1).max(65535).default(8080),
+  probeHttp: z.boolean().default(true),
+  probePath: z.string().min(1).max(128).default("/"),
   cpuLimit: z.string().min(1).max(16).default("0.5"),
   memoryLimitMb: z.number().int().min(64).max(131072).default(512),
   companions: z.array(CompanionServiceSchema).default([]),
   envVars: z.record(z.string(), z.string()).default({}),
-  probePath: z.string().min(1).max(128).optional(),
 });
 export type DeployAppInput = z.input<typeof DeployAppInputSchema>;
 
@@ -100,6 +101,7 @@ export class AppExecutor {
   async deployApp(
     rawInput: DeployAppInput,
     actor: Actor,
+    actorTokenId?: string | null,
   ): Promise<{ app: AppRecord; readinessAttempts: number }> {
     const input = DeployAppInputSchema.parse(rawInput);
     const slug = validateAppSlug(input.slug);
@@ -131,10 +133,10 @@ export class AppExecutor {
         ...existingEnv,
         ...input.envVars,
       };
-      // Remove auto-managed slug/port before regenerating blueprint
       delete mergedUserEnv.APP_SLUG;
       delete mergedUserEnv.APP_PORT;
 
+      // Validate the full blueprint AND the 64 KiB .env size cap BEFORE mutating SQLite or disk!
       const blueprint = generateApartmentBlueprint({
         slug,
         sourceType: input.sourceType,
@@ -171,6 +173,8 @@ export class AppExecutor {
         domain: existing?.domain ?? null,
         folderPath: appDir,
         internalPort: input.internalPort,
+        probeHttp: input.probeHttp,
+        probePath: input.probePath,
         status: input.sourceType === "git" ? "building" : "provisioning",
         cpuLimit: input.cpuLimit,
         memoryLimitMb: input.memoryLimitMb,
@@ -202,7 +206,8 @@ export class AppExecutor {
 
         const readiness = await this.bridge.waitForReadiness(slug, {
           internalPort: input.internalPort,
-          probePath: input.probePath ?? "/",
+          probeHttp: input.probeHttp,
+          probePath: input.probePath,
           timeoutSeconds: this.readinessTimeoutSeconds,
           pollIntervalMs: this.readinessPollIntervalMs,
         });
@@ -226,6 +231,7 @@ export class AppExecutor {
         const running = this.store.updateAppStatus(slug, "running")!;
         this.store.recordAudit({
           actor,
+          actorTokenId: actorTokenId ?? null,
           action: "deploy_app",
           targetSlug: slug,
           summary: `Deployed ${input.sourceType} app "${input.name}" (${slug})${safeDomain ? ` on ${safeDomain}` : ""}`,
@@ -246,6 +252,7 @@ export class AppExecutor {
         }
         this.store.recordAudit({
           actor,
+          actorTokenId: actorTokenId ?? null,
           action: "deploy_app_failed",
           targetSlug: slug,
           summary: redactSecrets(
@@ -258,7 +265,11 @@ export class AppExecutor {
     });
   }
 
-  async rebuildApp(slugRaw: string, actor: Actor): Promise<AppRecord> {
+  async rebuildApp(
+    slugRaw: string,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<AppRecord> {
     const slug = validateAppSlug(slugRaw);
     const existing = this.store.getApp(slug);
     if (!existing) {
@@ -318,7 +329,8 @@ export class AppExecutor {
       await this.bridge.lifecycle(slug, "start");
       const readiness = await this.bridge.waitForReadiness(slug, {
         internalPort: existing.internalPort,
-        probePath: "/",
+        probeHttp: existing.probeHttp,
+        probePath: existing.probePath,
         timeoutSeconds: this.readinessTimeoutSeconds,
         pollIntervalMs: this.readinessPollIntervalMs,
       });
@@ -333,6 +345,7 @@ export class AppExecutor {
       const updated = this.store.updateAppStatus(slug, "running")!;
       this.store.recordAudit({
         actor,
+        actorTokenId: actorTokenId ?? null,
         action: "rebuild_app",
         targetSlug: slug,
         summary: `Rebuilt and restarted app "${slug}"`,
@@ -346,6 +359,7 @@ export class AppExecutor {
     slugRaw: string,
     rawInput: UpdateAppEnvInput,
     actor: Actor,
+    actorTokenId?: string | null,
   ): Promise<AppRecord> {
     const slug = validateAppSlug(slugRaw);
     const input = UpdateAppEnvInputSchema.parse(rawInput);
@@ -355,22 +369,24 @@ export class AppExecutor {
     }
 
     return this.withSlugLock(slug, async () => {
-      for (const delKey of input.deleteKeys) {
-        this.store.deleteAppEnvVar(slug, validateEnvKey(delKey));
+      // Compute the candidate merged env map and validate the full 64 KiB .env
+      // size & key rules BEFORE mutating SQLite or writing any file on disk!
+      const currentEnv = this.store.getAppEnvMapForRuntime(slug);
+      const candidateEnv: Record<string, string> = { ...currentEnv };
+      const validatedDeleteKeys = input.deleteKeys.map((k) => validateEnvKey(k));
+      for (const delKey of validatedDeleteKeys) {
+        delete candidateEnv[delKey];
       }
-      if (input.vars.length > 0) {
-        this.store.setAppEnvVars(
-          slug,
-          input.vars.map((v) => ({
-            key: validateEnvKey(v.key),
-            value: v.value,
-            ...(v.isSecret !== undefined ? { isSecret: v.isSecret } : {}),
-          })),
-        );
+      const validatedVars = input.vars.map((v) => ({
+        key: validateEnvKey(v.key),
+        value: v.value,
+        ...(v.isSecret !== undefined ? { isSecret: v.isSecret } : {}),
+      }));
+      for (const item of validatedVars) {
+        candidateEnv[item.key] = item.value;
       }
 
-      const runtimeEnv = this.store.getAppEnvMapForRuntime(slug);
-      const userEnv = { ...runtimeEnv };
+      const userEnv = { ...candidateEnv };
       delete userEnv.APP_SLUG;
       delete userEnv.APP_PORT;
 
@@ -387,14 +403,22 @@ export class AppExecutor {
         companions: existing.companions,
         envVars: userEnv,
         companionSecrets: {
-          ...(runtimeEnv.POSTGRES_PASSWORD
-            ? { postgresPassword: runtimeEnv.POSTGRES_PASSWORD }
+          ...(candidateEnv.POSTGRES_PASSWORD
+            ? { postgresPassword: candidateEnv.POSTGRES_PASSWORD }
             : {}),
-          ...(runtimeEnv.REDIS_PASSWORD
-            ? { redisPassword: runtimeEnv.REDIS_PASSWORD }
+          ...(candidateEnv.REDIS_PASSWORD
+            ? { redisPassword: candidateEnv.REDIS_PASSWORD }
             : {}),
         },
       });
+
+      // Validation succeeded — now persist to SQLite & write blueprint
+      for (const delKey of validatedDeleteKeys) {
+        this.store.deleteAppEnvVar(slug, delKey);
+      }
+      if (validatedVars.length > 0) {
+        this.store.setAppEnvVars(slug, validatedVars);
+      }
       writeApartmentBlueprint(this.appsRoot, blueprint);
 
       if (existing.status === "running") {
@@ -402,11 +426,12 @@ export class AppExecutor {
       }
 
       const changedKeys = [
-        ...input.vars.map((v) => v.key),
-        ...input.deleteKeys.map((k) => `-${k}`),
+        ...validatedVars.map((v) => v.key),
+        ...validatedDeleteKeys.map((k) => `-${k}`),
       ];
       this.store.recordAudit({
         actor,
+        actorTokenId: actorTokenId ?? null,
         action: "update_env",
         targetSlug: slug,
         summary: `Updated environment settings for "${slug}" (${changedKeys.join(", ") || "no changes"})`,
@@ -421,6 +446,7 @@ export class AppExecutor {
     slugRaw: string,
     domain: string | null,
     actor: Actor,
+    actorTokenId?: string | null,
   ): Promise<AppRecord> {
     const slug = validateAppSlug(slugRaw);
     const safeDomain = domain ? validateDomain(domain) : null;
@@ -438,6 +464,7 @@ export class AppExecutor {
       const updated = this.store.updateAppDomain(slug, safeDomain)!;
       this.store.recordAudit({
         actor,
+        actorTokenId: actorTokenId ?? null,
         action: "set_domain",
         targetSlug: slug,
         summary: safeDomain
@@ -453,6 +480,7 @@ export class AppExecutor {
     slugRaw: string,
     action: "start" | "stop" | "restart",
     actor: Actor,
+    actorTokenId?: string | null,
   ): Promise<AppRecord> {
     const slug = validateAppSlug(slugRaw);
     const existing = this.store.getApp(slug);
@@ -465,6 +493,7 @@ export class AppExecutor {
       const updated = this.store.updateAppStatus(slug, res.status)!;
       this.store.recordAudit({
         actor,
+        actorTokenId: actorTokenId ?? null,
         action: `${action}_app`,
         targetSlug: slug,
         summary: `Performed ${action} on "${slug}" (now ${res.status})`,
@@ -478,6 +507,7 @@ export class AppExecutor {
     slugRaw: string,
     removeFiles: boolean,
     actor: Actor,
+    actorTokenId?: string | null,
   ): Promise<{ ok: true; slug: string }> {
     const slug = validateAppSlug(slugRaw);
     const existing = this.store.getApp(slug);
@@ -490,6 +520,7 @@ export class AppExecutor {
       this.store.deleteApp(slug);
       this.store.recordAudit({
         actor,
+        actorTokenId: actorTokenId ?? null,
         action: "delete_app",
         targetSlug: slug,
         summary: `Deleted app "${slug}" (removeFiles=${String(removeFiles)})`,
@@ -500,7 +531,8 @@ export class AppExecutor {
   }
 
   /**
-   * Atomically claims an approved request and runs its underlying action exactly once.
+   * Atomically claims an approved request and runs its underlying action strictly
+   * from its sealed encrypted execution payload (never falling back to the redacted preview).
    */
   async executeApprovedRequest(approvalId: string): Promise<{
     ok: boolean;
@@ -518,8 +550,25 @@ export class AppExecutor {
       );
     }
 
-    const execPayload =
-      this.store.consumeApprovalExecutionPayload(approvalId) ?? claimed.payload;
+    let execPayload: Record<string, unknown> | null = null;
+    try {
+      execPayload = this.store.consumeApprovalExecutionPayload(approvalId);
+    } catch (err) {
+      const msg = redactSecrets(
+        `Sealed execution payload could not be decrypted; refusing to execute from redacted preview (${err instanceof Error ? err.message : String(err)}).`,
+      );
+      this.store.completeApprovalExecution(approvalId, "failed", msg);
+      return { ok: false, summary: msg };
+    }
+
+    if (!execPayload) {
+      const msg =
+        "Sealed execution payload is missing; refusing to execute from redacted preview.";
+      this.store.completeApprovalExecution(approvalId, "failed", msg);
+      return { ok: false, summary: msg };
+    }
+
+    const tokenId = claimed.tokenId;
 
     try {
       let data: unknown;
@@ -530,6 +579,7 @@ export class AppExecutor {
           const res = await this.deployApp(
             execPayload as DeployAppInput,
             "agent",
+            tokenId,
           );
           data = res.app;
           summary = `Deployed "${res.app.slug}" (${res.app.status})`;
@@ -537,7 +587,7 @@ export class AppExecutor {
         }
         case "rebuild_app": {
           const slug = String(execPayload.slug ?? claimed.targetSlug ?? "");
-          const app = await this.rebuildApp(slug, "agent");
+          const app = await this.rebuildApp(slug, "agent", tokenId);
           data = app;
           summary = `Rebuilt "${app.slug}" (${app.status})`;
           break;
@@ -551,6 +601,7 @@ export class AppExecutor {
               deleteKeys: (execPayload.deleteKeys as string[]) ?? [],
             },
             "agent",
+            tokenId,
           );
           data = app;
           summary = `Updated environment settings for "${app.slug}"`;
@@ -562,7 +613,7 @@ export class AppExecutor {
             execPayload.domain === null || execPayload.domain === undefined
               ? null
               : String(execPayload.domain);
-          const app = await this.setAppDomain(slug, domain, "agent");
+          const app = await this.setAppDomain(slug, domain, "agent", tokenId);
           data = app;
           summary = domain
             ? `Bound domain ${domain} to "${app.slug}"`
@@ -571,14 +622,14 @@ export class AppExecutor {
         }
         case "restart_app": {
           const slug = String(execPayload.slug ?? claimed.targetSlug ?? "");
-          const app = await this.lifecycleApp(slug, "restart", "agent");
+          const app = await this.lifecycleApp(slug, "restart", "agent", tokenId);
           data = app;
           summary = `Restarted "${app.slug}" (${app.status})`;
           break;
         }
         case "stop_app": {
           const slug = String(execPayload.slug ?? claimed.targetSlug ?? "");
-          const app = await this.lifecycleApp(slug, "stop", "agent");
+          const app = await this.lifecycleApp(slug, "stop", "agent", tokenId);
           data = app;
           summary = `Stopped "${app.slug}" (${app.status})`;
           break;
@@ -586,13 +637,15 @@ export class AppExecutor {
         case "delete_app": {
           const slug = String(execPayload.slug ?? claimed.targetSlug ?? "");
           const removeFiles = execPayload.removeFiles !== false;
-          const res = await this.deleteApp(slug, removeFiles, "agent");
+          const res = await this.deleteApp(slug, removeFiles, "agent", tokenId);
           data = res;
           summary = `Deleted "${slug}"`;
           break;
         }
         default: {
-          throw new Error(`Unsupported approval action "${String(claimed.action)}".`);
+          throw new Error(
+            `Unsupported approval action "${String(claimed.action)}".`,
+          );
         }
       }
 

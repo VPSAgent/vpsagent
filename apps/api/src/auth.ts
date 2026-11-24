@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import type { Context } from "hono";
-import type { RegistryStore } from "@vpsagent/shared";
+import { type RegistryStore, isLoopbackHost } from "@vpsagent/shared";
 
 export const SESSION_COOKIE_NAME = "vpsagent_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -14,6 +14,14 @@ interface SessionPayload {
   exp: number;
 }
 
+export interface TransportContextOptions {
+  trustProxy: boolean;
+  /** True ONLY on a dedicated loopback-only local listener (e.g. 127.0.0.1:3002 SSH tunnel). */
+  isLocalListener?: boolean | undefined;
+  /** Optional fallback peer IP for unit tests where no Node TCP socket is attached. */
+  defaultPeerIp?: string | undefined;
+}
+
 function sha256Hex(value: string): string {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
@@ -23,6 +31,31 @@ function timingSafeHexEqual(aHex: string, bHex: string): boolean {
   const b = Buffer.from(bHex, "utf8");
   if (a.length !== b.length) return false;
   return crypto.timingSafeEqual(a, b);
+}
+
+export function isLoopbackIp(ip: string | null | undefined): boolean {
+  if (!ip) return false;
+  const clean = ip.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  if (clean === "::1" || clean === "127.0.0.1" || clean === "::ffff:127.0.0.1") {
+    return true;
+  }
+  if (clean.startsWith("127.")) return true;
+  if (clean.startsWith("::ffff:127.")) return true;
+  return false;
+}
+
+export function getSocketPeerIp(
+  c: Context,
+  defaultPeerIp?: string,
+): string | null {
+  const env = c.env as
+    | { incoming?: { socket?: { remoteAddress?: string } } }
+    | undefined;
+  const socketIp = env?.incoming?.socket?.remoteAddress;
+  if (typeof socketIp === "string" && socketIp.trim()) {
+    return socketIp.trim();
+  }
+  return defaultPeerIp?.trim() || null;
 }
 
 export function getRequestHost(c: Context, trustProxy: boolean): string {
@@ -35,7 +68,7 @@ export function getRequestHost(c: Context, trustProxy: boolean): string {
   try {
     return new URL(c.req.url).host;
   } catch {
-    return "localhost";
+    return "";
   }
 }
 
@@ -43,12 +76,152 @@ export function getRequestProtocol(c: Context, trustProxy: boolean): string {
   if (trustProxy) {
     const fwdProto = c.req.header("x-forwarded-proto")?.split(",")[0]?.trim();
     if (fwdProto) return fwdProto.toLowerCase();
+    // Behind a trusted proxy with missing X-Forwarded-Proto, never assume https
+    return "http";
   }
   try {
     return new URL(c.req.url).protocol.replace(/:$/, "").toLowerCase();
   } catch {
     return "http";
   }
+}
+
+/**
+ * Determines whether a request arrived over genuine local loopback (NEVER using the
+ * spoofable `Host` header alone as proof of loopback).
+ */
+export function isGenuineLocalLoopback(
+  c: Context,
+  opts: TransportContextOptions,
+): boolean {
+  if (opts.isLocalListener) {
+    return true;
+  }
+  const xff = c.req.header("x-forwarded-for");
+  if (opts.trustProxy && xff) {
+    const firstClient = xff.split(",")[0]?.trim();
+    return isLoopbackIp(firstClient);
+  }
+  if (opts.trustProxy) {
+    // Missing proxy metadata on a proxied listener: only allow if actual socket peer is loopback
+    const peerIp = getSocketPeerIp(c, opts.defaultPeerIp);
+    return isLoopbackIp(peerIp);
+  }
+  const peerIp = getSocketPeerIp(c, opts.defaultPeerIp);
+  return isLoopbackIp(peerIp);
+}
+
+/**
+ * Requires HTTPS (from trusted proxy or TLS) or a genuinely local loopback connection
+ * before accepting owner credentials, creating keys, or serving Remote MCP.
+ */
+export function assertSecureTransport(
+  c: Context,
+  opts: TransportContextOptions,
+): { isHttps: boolean; isLocalLoopback: boolean } {
+  const proto = getRequestProtocol(c, opts.trustProxy);
+  if (proto === "https") {
+    return { isHttps: true, isLocalLoopback: false };
+  }
+  const localLoopback = isGenuineLocalLoopback(c, opts);
+  const host = getRequestHost(c, opts.trustProxy);
+  if (localLoopback && isLoopbackHost(host)) {
+    return { isHttps: false, isLocalLoopback: true };
+  }
+  throw new Error(
+    "HTTPS is required for remote access. Connect your domain for automatic HTTPS, or use a local SSH tunnel (ssh -L 3002:127.0.0.1:3002) for first-time setup.",
+  );
+}
+
+function normalizeHostWithoutDefaultPort(
+  hostHeader: string,
+  isHttps: boolean,
+): string {
+  const trimmed = hostHeader.trim().toLowerCase();
+  if (trimmed.startsWith("[")) {
+    return trimmed;
+  }
+  const colonIdx = trimmed.lastIndexOf(":");
+  if (colonIdx !== -1) {
+    const hostname = trimmed.slice(0, colonIdx);
+    const port = trimmed.slice(colonIdx + 1);
+    if ((isHttps && port === "443") || (!isHttps && port === "80")) {
+      return hostname;
+    }
+  }
+  return trimmed;
+}
+
+/**
+ * Validates `Host` and optional `Origin` headers on `/mcp` to prevent DNS rebinding
+ * and cross-origin browser attacks while still allowing CLI/server MCP clients that
+ * omit `Origin`.
+ */
+export function validateMcpHostAndOrigin(
+  c: Context,
+  params: {
+    setupDomain: string | null;
+    httpsActive: boolean;
+    transport: { isHttps: boolean; isLocalLoopback: boolean };
+    trustProxy: boolean;
+  },
+): void {
+  const rawHost = getRequestHost(c, params.trustProxy);
+  if (!rawHost) {
+    throw new Error("Missing Host header.");
+  }
+
+  const normalizedHost = normalizeHostWithoutDefaultPort(
+    rawHost,
+    params.transport.isHttps,
+  );
+  const expectedDomain =
+    params.setupDomain && params.httpsActive
+      ? params.setupDomain.trim().toLowerCase()
+      : null;
+
+  const hostIsLoopback =
+    params.transport.isLocalLoopback && isLoopbackHost(rawHost);
+  const hostMatchesDomain =
+    expectedDomain !== null &&
+    params.transport.isHttps &&
+    normalizedHost === expectedDomain;
+
+  if (!hostIsLoopback && !hostMatchesDomain) {
+    throw new Error(`Unexpected Host header "${rawHost}" for /mcp.`);
+  }
+
+  const originHeader = c.req.header("origin")?.trim();
+  if (!originHeader) {
+    // CLI / desktop MCP clients normally omit Origin — allow.
+    return;
+  }
+
+  let parsedOrigin: URL;
+  try {
+    parsedOrigin = new URL(originHeader);
+  } catch {
+    throw new Error(`Invalid Origin header "${originHeader}".`);
+  }
+
+  if (
+    expectedDomain !== null &&
+    parsedOrigin.protocol === "https:" &&
+    parsedOrigin.hostname.toLowerCase() === expectedDomain &&
+    (parsedOrigin.port === "" || parsedOrigin.port === "443")
+  ) {
+    return;
+  }
+
+  if (
+    params.transport.isLocalLoopback &&
+    (parsedOrigin.protocol === "http:" || parsedOrigin.protocol === "https:") &&
+    isLoopbackHost(parsedOrigin.host)
+  ) {
+    return;
+  }
+
+  throw new Error(`Disallowed Origin header "${originHeader}" for /mcp.`);
 }
 
 function parseCookies(cookieHeader: string | undefined): Record<string, string> {
@@ -110,7 +283,10 @@ export class SessionManager {
     if (!candidate) return false;
     const candidateHash = sha256Hex(candidate);
 
-    if (this.envClaimTokenHash && timingSafeHexEqual(candidateHash, this.envClaimTokenHash)) {
+    if (
+      this.envClaimTokenHash &&
+      timingSafeHexEqual(candidateHash, this.envClaimTokenHash)
+    ) {
       return true;
     }
     const stored = this.store.getSetting<{ hash: string }>(

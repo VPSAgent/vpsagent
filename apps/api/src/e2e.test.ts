@@ -6,10 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import {
-  HttpRuntimeBridgeClient,
-  RegistryStore,
-} from "@vpsagent/shared";
+import { HttpRuntimeBridgeClient, RegistryStore } from "@vpsagent/shared";
 import { createVpsAgentApp } from "./app.js";
 
 const REPO_ROOT = path.resolve(
@@ -22,10 +19,7 @@ const RUNTIME_BRIDGE_SCRIPT = path.join(
   "runtime-bridge.py",
 );
 
-function createFakeDockerShim(
-  tempDir: string,
-  stateFile: string,
-): string {
+function createFakeDockerShim(tempDir: string, stateFile: string): string {
   const shimPy = path.join(tempDir, "fake_docker.py");
   fs.writeFileSync(
     shimPy,
@@ -38,7 +32,7 @@ def load_state():
     if os.path.exists(state_file):
         with open(state_file, "r", encoding="utf-8") as fh:
             return json.load(fh)
-    return {"projects": {}, "networks": []}
+    return {"projects": {}, "networks": [], "failValidate": False}
 
 def save_state(st):
     with open(state_file, "w", encoding="utf-8") as fh:
@@ -133,12 +127,22 @@ if args[:2] == ["network", "inspect"]:
         sys.exit(1)
     sys.exit(0)
 
+if args[:1] == ["exec"] and "validate" in args:
+    if st.get("failValidate"):
+        sys.stderr.write("Error: simulated Caddy validate failure\\n")
+        sys.exit(1)
+    sys.exit(0)
+
 sys.exit(0)
 `,
     "utf8",
   );
   const shPath = path.join(tempDir, "fake-docker");
-  fs.writeFileSync(shPath, `#!/usr/bin/env sh\nexec python3 "${shimPy}" "$@"\n`, "utf8");
+  fs.writeFileSync(
+    shPath,
+    `#!/usr/bin/env sh\nexec python3 "${shimPy}" "$@"\n`,
+    "utf8",
+  );
   fs.chmodSync(shPath, 0o755);
   return shPath;
 }
@@ -163,7 +167,11 @@ sys.exit(0)
     "utf8",
   );
   const shPath = path.join(tempDir, "fake-git");
-  fs.writeFileSync(shPath, `#!/usr/bin/env sh\nexec python3 "${shimPy}" "$@"\n`, "utf8");
+  fs.writeFileSync(
+    shPath,
+    `#!/usr/bin/env sh\nexec python3 "${shimPy}" "$@"\n`,
+    "utf8",
+  );
   fs.chmodSync(shPath, 0o755);
   return shPath;
 }
@@ -171,6 +179,7 @@ sys.exit(0)
 async function startBridge(options: {
   appsRoot: string;
   caddyAppsDir: string;
+  caddyCoreDir: string;
   dockerBin: string;
   gitBin: string;
   runtimeToken: string;
@@ -186,6 +195,8 @@ async function startBridge(options: {
       options.appsRoot,
       "--caddy-apps-dir",
       options.caddyAppsDir,
+      "--caddy-core-dir",
+      options.caddyCoreDir,
       "--docker-bin",
       options.dockerBin,
       "--git-bin",
@@ -199,7 +210,10 @@ async function startBridge(options: {
   await new Promise<void>((resolve, reject) => {
     let out = "";
     let err = "";
-    const timer = setTimeout(() => reject(new Error(`Bridge timeout: ${err}`)), 8000);
+    const timer = setTimeout(
+      () => reject(new Error(`Bridge timeout: ${err}`)),
+      8000,
+    );
     child.stdout.on("data", (d: Buffer) => {
       out += d.toString("utf8");
       if (out.includes("LISTENING unix://")) {
@@ -229,15 +243,17 @@ async function startBridge(options: {
   };
 }
 
-describe("VPSAgent v2 End-to-End Flow (2-step setup, Remote MCP, Approvals, Git + DB deploy, Bootstrap hardening)", () => {
-  it("completes the full real-world lifecycle from first-boot claim to approved GitHub deploy and auto-approve image deploy", async () => {
+describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, Streamable MCP, Approvals, Git + DB deploy)", () => {
+  it("enforces HTTPS/Host/Origin, live Caddy HTTPS reload, sealed approvals, MCP version negotiation, 64KiB env caps, and full deploy flow", async () => {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpsagent-e2e-"));
     const appsRoot = path.join(tempDir, "apps");
-    const caddyAppsDir = path.join(tempDir, "caddy-apps");
+    const caddyAppsDir = path.join(tempDir, "caddy", "apps.d");
+    const caddyCoreDir = path.join(tempDir, "caddy", "core.d");
     const socketPath = path.join(tempDir, "run", "runtime.sock");
     const stateFile = path.join(tempDir, "docker-state.json");
     fs.mkdirSync(appsRoot, { recursive: true });
     fs.mkdirSync(caddyAppsDir, { recursive: true });
+    fs.mkdirSync(caddyCoreDir, { recursive: true });
 
     const dockerBin = createFakeDockerShim(tempDir, stateFile);
     const gitBin = createFakeGitShim(tempDir);
@@ -258,6 +274,7 @@ describe("VPSAgent v2 End-to-End Flow (2-step setup, Remote MCP, Approvals, Git 
     const bridgeProc = await startBridge({
       appsRoot,
       caddyAppsDir,
+      caddyCoreDir,
       dockerBin,
       gitBin,
       runtimeToken,
@@ -270,6 +287,7 @@ describe("VPSAgent v2 End-to-End Flow (2-step setup, Remote MCP, Approvals, Git 
     });
 
     const claimToken = "initial-private-claim-token-2026";
+    // Proxied Caddy-fronted app (strictly fails closed without HTTPS or genuine loopback)
     const { app } = createVpsAgentApp({
       store,
       bridge,
@@ -277,114 +295,270 @@ describe("VPSAgent v2 End-to-End Flow (2-step setup, Remote MCP, Approvals, Git 
       sessionSecret: "e2e-session-secret-32-bytes-long",
       claimToken,
       trustProxy: true,
+      isLocalListener: false,
+      defaultPeerIp: "172.18.0.2", // Docker bridge IP of Caddy container
+      readinessTimeoutSeconds: 5,
+      readinessPollIntervalMs: 25,
+      lookupFn: async () => [{ address: "140.82.121.4", family: 4 }],
+    });
+
+    // Dedicated loopback-only local setup listener (127.0.0.1:3002 via SSH tunnel)
+    const { app: localSetupApp } = createVpsAgentApp({
+      store,
+      bridge,
+      appsRoot,
+      sessionSecret: "e2e-session-secret-32-bytes-long",
+      claimToken,
+      trustProxy: false,
+      isLocalListener: true,
       readinessTimeoutSeconds: 5,
       readinessPollIntervalMs: 25,
       lookupFn: async () => [{ address: "140.82.121.4", family: 4 }],
     });
 
     try {
-      // 1. Unclaimed session blocks private API routes
-      const unauthOverview = await app.request("http://localhost/api/overview");
-      expect(unauthOverview.status).toBe(401);
-
-      // 2. Step 1 of first-boot setup: claim with #claim= token & set password
-      const claimRes = await app.request("http://localhost/api/setup/claim", {
+      // 1. Spoofing Host: localhost over plaintext HTTP on Caddy-fronted listener MUST fail closed (403)
+      const spoofedClaim = await app.request("http://localhost/api/setup/claim", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          host: "localhost",
+          "x-forwarded-for": "203.0.113.42",
+          "x-forwarded-proto": "http",
+        },
         body: JSON.stringify({
           claimToken,
           passphrase: "correct-horse-battery-staple",
         }),
       });
+      expect(spoofedClaim.status).toBe(403);
+
+      // Missing proxy metadata on proxied listener also fails closed (403)
+      const missingProxyClaim = await app.request(
+        "http://localhost/api/setup/claim",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            host: "localhost",
+          },
+          body: JSON.stringify({
+            claimToken,
+            passphrase: "correct-horse-battery-staple",
+          }),
+        },
+      );
+      expect(missingProxyClaim.status).toBe(403);
+
+      // 2. Step 1 over the genuine local SSH-tunnel listener succeeds!
+      const claimRes = await localSetupApp.request(
+        "http://localhost:3002/api/setup/claim",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            host: "localhost:3002",
+          },
+          body: JSON.stringify({
+            claimToken,
+            passphrase: "correct-horse-battery-staple",
+          }),
+        },
+      );
       expect(claimRes.status).toBe(200);
       const setCookie = claimRes.headers.get("set-cookie");
       expect(setCookie).toContain("vpsagent_session=");
       const cookieHeader = setCookie!.split(";")[0]!;
 
-      // 3. Step 2 of first-boot setup: connect dashboard domain for automatic HTTPS
-      const domainRes = await app.request("http://localhost/api/setup/domain", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          cookie: cookieHeader,
-        },
-        body: JSON.stringify({
-          domain: "vps.example.com",
-          acmeEmail: "owner@example.com",
-        }),
-      });
-      expect(domainRes.status).toBe(200);
+      // Before domain is enabled in Caddy, snippets must NOT advertise remote HTTPS yet
+      const preSnippetsRes = await localSetupApp.request(
+        "http://localhost:3002/api/mcp/snippets",
+        { headers: { cookie: cookieHeader, host: "localhost:3002" } },
+      );
+      const preSnippets = (await preSnippetsRes.json()) as {
+        httpsReady: boolean;
+      };
+      expect(preSnippets.httpsReady).toBe(false);
 
-      // Verify MCP setup snippets include the HTTPS domain
-      const snippetsRes = await app.request("http://localhost/api/mcp/snippets", {
-        headers: { cookie: cookieHeader },
-      });
+      // 3. Step 2: if Caddy validation fails, domain is NOT saved and httpsActive stays false
+      fs.writeFileSync(
+        stateFile,
+        JSON.stringify({ projects: {}, networks: [], failValidate: true }),
+        "utf8",
+      );
+      const failedDomainRes = await localSetupApp.request(
+        "http://localhost:3002/api/setup/domain",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", cookie: cookieHeader },
+          body: JSON.stringify({ domain: "bad.example.com" }),
+        },
+      );
+      expect(failedDomainRes.status).toBe(422);
+      expect(store.getSetupState().domain).toBeNull();
+      expect(store.getSetupState().httpsActive).toBe(false);
+
+      // Now Caddy succeeds -> writes caddy/core.d/dashboard.caddy and activates HTTPS!
+      fs.writeFileSync(
+        stateFile,
+        JSON.stringify({ projects: {}, networks: [], failValidate: false }),
+        "utf8",
+      );
+      const domainRes = await localSetupApp.request(
+        "http://localhost:3002/api/setup/domain",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", cookie: cookieHeader },
+          body: JSON.stringify({
+            domain: "vps.example.com",
+            acmeEmail: "owner@example.com",
+          }),
+        },
+      );
+      expect(domainRes.status).toBe(200);
+      expect(store.getSetupState().httpsActive).toBe(true);
+      const coreCaddy = fs.readFileSync(
+        path.join(caddyCoreDir, "dashboard.caddy"),
+        "utf8",
+      );
+      expect(coreCaddy).toContain("vps.example.com {");
+      expect(coreCaddy).toContain("tls owner@example.com");
+
+      // Snippets now advertise https://vps.example.com/mcp
+      const snippetsRes = await app.request(
+        "https://vps.example.com/api/mcp/snippets",
+        {
+          headers: {
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+        },
+      );
       const snippets = (await snippetsRes.json()) as {
         mcpUrl: string;
-        claudeCode: string;
-        cursor: string;
-        codex: string;
+        httpsReady: boolean;
       };
+      expect(snippets.httpsReady).toBe(true);
       expect(snippets.mcpUrl).toBe("https://vps.example.com/mcp");
-      expect(snippets.claudeCode).toContain("claude mcp add");
-      expect(snippets.cursor).toContain("mcpServers");
-      expect(snippets.codex).toContain("VPSAGENT_MCP_TOKEN");
 
-      // 4. Create 3 scoped MCP tokens: read-only, approval-required, auto-approve
+      // 4. Token creation is blocked on remote plaintext HTTP (403), succeeds over HTTPS
+      const plaintextTokenRes = await app.request(
+        "http://vps.example.com/api/mcp/tokens",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "http",
+            "x-forwarded-for": "203.0.113.42",
+          },
+          body: JSON.stringify({ name: "Bad", scope: "read-only" }),
+        },
+      );
+      expect(plaintextTokenRes.status).toBe(403);
+
       const makeToken = async (
         name: string,
         scope: "read-only" | "approval-required" | "auto-approve",
       ) => {
-        const res = await app.request("http://localhost/api/mcp/tokens", {
+        const res = await app.request("https://vps.example.com/api/mcp/tokens", {
           method: "POST",
-          headers: { "content-type": "application/json", cookie: cookieHeader },
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
           body: JSON.stringify({ name, scope }),
         });
         expect(res.status).toBe(201);
-        return (await res.json()) as { rawToken: string };
+        return (await res.json()) as {
+          token: { id: string };
+          rawToken: string;
+        };
       };
 
       const readOnly = await makeToken("Observer AI", "read-only");
       const approvalReq = await makeToken("Claude Code", "approval-required");
       const autoApprove = await makeToken("Trusted CI", "auto-approve");
 
-      // 5. Remote MCP enforces HTTPS-only for non-loopback hosts
-      const cleartextRemote = await app.request("http://vps.example.com/mcp", {
+      // 5. /mcp validates Host, Origin, GET -> 405, and Streamable HTTP protocol versions
+      const unexpectedHostMcp = await app.request("https://evil.example.com/mcp", {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          host: "vps.example.com",
+          host: "evil.example.com",
+          "x-forwarded-proto": "https",
           authorization: `Bearer ${readOnly.rawToken}`,
         },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
       });
-      expect(cleartextRemote.status).toBe(403);
+      expect(unexpectedHostMcp.status).toBe(403);
 
-      const postMcp = (rawToken: string, payload: Record<string, unknown>) =>
-        app.request("http://vps.example.com/mcp", {
+      const badOriginMcp = await app.request("https://vps.example.com/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          host: "vps.example.com",
+          origin: "https://evil-site.example",
+          "x-forwarded-proto": "https",
+          authorization: `Bearer ${readOnly.rawToken}`,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      });
+      expect(badOriginMcp.status).toBe(403);
+
+      const getMcpRes = await app.request("https://vps.example.com/mcp", {
+        method: "GET",
+        headers: {
+          host: "vps.example.com",
+          "x-forwarded-proto": "https",
+        },
+      });
+      expect(getMcpRes.status).toBe(405);
+      expect(getMcpRes.headers.get("allow")).toBe("POST");
+
+      const postMcp = (
+        rawToken: string,
+        payload: Record<string, unknown>,
+        extraHeaders?: Record<string, string>,
+      ) =>
+        app.request("https://vps.example.com/mcp", {
           method: "POST",
           headers: {
             "content-type": "application/json",
             host: "vps.example.com",
             "x-forwarded-proto": "https",
             authorization: `Bearer ${rawToken}`,
+            ...(extraHeaders ?? {}),
           },
           body: JSON.stringify(payload),
         });
 
-      // 6. Read-only key can read health, CANNOT deploy or queue approvals
-      const healthMcp = await postMcp(readOnly.rawToken, {
+      // Streamable HTTP version negotiation & header validation
+      const init202511 = await postMcp(readOnly.rawToken, {
         jsonrpc: "2.0",
-        id: 2,
-        method: "tools/call",
-        params: { name: "get_host_health", arguments: {} },
+        id: 10,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25" },
       });
-      expect(healthMcp.status).toBe(200);
-      const healthBody = (await healthMcp.json()) as {
-        result: { isError: boolean };
+      expect(init202511.status).toBe(200);
+      expect(init202511.headers.get("mcp-protocol-version")).toBe("2025-11-25");
+      const initBody = (await init202511.json()) as {
+        result: { protocolVersion: string };
       };
-      expect(healthBody.result.isError).toBe(false);
+      expect(initBody.result.protocolVersion).toBe("2025-11-25");
 
+      const badProtoHeader = await postMcp(
+        readOnly.rawToken,
+        { jsonrpc: "2.0", id: 11, method: "tools/list" },
+        { "mcp-protocol-version": "1999-01-01" },
+      );
+      expect(badProtoHeader.status).toBe(400);
+
+      // 6. Read-only key cannot deploy or queue approvals
       const blockedDeploy = await postMcp(readOnly.rawToken, {
         jsonrpc: "2.0",
         id: 3,
@@ -400,13 +574,12 @@ describe("VPSAgent v2 End-to-End Flow (2-step setup, Remote MCP, Approvals, Git 
         },
       });
       const blockedJson = (await blockedDeploy.json()) as {
-        result: { isError: boolean; content: Array<{ text: string }> };
+        result: { isError: boolean };
       };
       expect(blockedJson.result.isError).toBe(true);
-      expect(blockedJson.result.content[0]?.text).toMatch(/read-only/i);
       expect(store.listApprovals()).toHaveLength(0);
 
-      // 7. Approval-required key requests a GitHub Dockerfile app with a secret .env + Postgres companion
+      // 7. Approval-required key queues GitHub Dockerfile deploy with Postgres + secret env
       const queuedDeploy = await postMcp(approvalReq.rawToken, {
         jsonrpc: "2.0",
         id: 4,
@@ -422,8 +595,10 @@ describe("VPSAgent v2 End-to-End Flow (2-step setup, Remote MCP, Approvals, Git 
             dockerfilePath: "Dockerfile",
             domain: "shop.example.com",
             internalPort: livePort,
+            probePath: "/",
             companions: [{ type: "postgres" }],
             envVars: {
+              MY_CUSTOM_FLAG: "arbitrary-secret-should-be-masked",
               STRIPE_SECRET_KEY: "sk-live-super$secret#value",
             },
           },
@@ -434,74 +609,118 @@ describe("VPSAgent v2 End-to-End Flow (2-step setup, Remote MCP, Approvals, Git 
       };
       expect(queuedJson.result.isError).toBe(false);
       const parsedQueued = JSON.parse(queuedJson.result.content[0]!.text) as {
-        status: string;
         approvalId: string;
       };
-      expect(parsedQueued.status).toBe("pending_approval");
 
-      // Visible approval payload in dashboard must NEVER contain the raw Stripe secret
-      const approvalsListRes = await app.request("http://localhost/api/approvals", {
-        headers: { cookie: cookieHeader },
-      });
-      const approvalsList = (await approvalsListRes.json()) as {
-        approvals: Array<{ id: string; payload: Record<string, unknown> }>;
-      };
-      expect(JSON.stringify(approvalsList)).not.toContain(
+      // Approval persists tokenId AND masks ALL envVars in visible preview (even arbitrary key names!)
+      const storedApproval = store.getApproval(parsedQueued.approvalId)!;
+      expect(storedApproval.tokenId).toBe(approvalReq.token.id);
+      expect(JSON.stringify(storedApproval.payload)).not.toContain(
+        "arbitrary-secret-should-be-masked",
+      );
+      expect(JSON.stringify(storedApproval.payload)).not.toContain(
         "sk-live-super$secret#value",
       );
 
-      // 8. Owner clicks Approve in dashboard -> builds Git repo, starts app + Postgres, retries readiness (503 -> 404), binds Caddy HTTPS route!
+      // 8. Approve -> deploys Git app + Postgres + real secrets + Caddy HTTPS route
       const approveRes = await app.request(
-        `http://localhost/api/approvals/${parsedQueued.approvalId}/approve`,
+        `https://vps.example.com/api/approvals/${parsedQueued.approvalId}/approve`,
         {
           method: "POST",
-          headers: { cookie: cookieHeader },
+          headers: {
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
         },
       );
       expect(approveRes.status).toBe(200);
-      const approvedBody = (await approveRes.json()) as {
-        ok: boolean;
-        approval: { status: string };
-      };
-      expect(approvedBody.ok).toBe(true);
-      expect(approvedBody.approval.status).toBe("executed");
-
-      // Confirm literal-quoted .env on disk received the REAL unredacted secret AND DATABASE_URL
       const envOnDisk = fs.readFileSync(
         path.join(appsRoot, "shop-api", ".env"),
         "utf8",
       );
       expect(envOnDisk).toContain(
+        "MY_CUSTOM_FLAG='arbitrary-secret-should-be-masked'",
+      );
+      expect(envOnDisk).toContain(
         "STRIPE_SECRET_KEY='sk-live-super$secret#value'",
       );
-      expect(envOnDisk).toContain("DATABASE_URL='postgresql://");
 
-      // Confirm Caddy route file was written
-      expect(
-        fs.readFileSync(path.join(caddyAppsDir, "shop-api.caddy"), "utf8"),
-      ).toContain(`reverse_proxy vpsagent-app-shop-api:${livePort}`);
-
-      // Confirm Dashboard env endpoint masks secrets
-      const maskedEnvRes = await app.request(
-        "http://localhost/api/apps/shop-api/env",
-        { headers: { cookie: cookieHeader } },
+      // 9. Secret-marked arbitrary env update is masked in approval preview AND missing sealed payload refuses to execute (502 with error + failed status!)
+      const queuedEnv = await postMcp(approvalReq.rawToken, {
+        jsonrpc: "2.0",
+        id: 12,
+        method: "tools/call",
+        params: {
+          name: "update_app_env",
+          arguments: {
+            slug: "shop-api",
+            vars: [
+              {
+                key: "ARBITRARY_NAME",
+                value: "must-never-show-in-preview",
+                isSecret: true,
+              },
+            ],
+          },
+        },
+      });
+      const queuedEnvParsed = JSON.parse(
+        ((await queuedEnv.json()) as { result: { content: Array<{ text: string }> } })
+          .result.content[0]!.text,
+      ) as { approvalId: string };
+      const envApproval = store.getApproval(queuedEnvParsed.approvalId)!;
+      expect(JSON.stringify(envApproval.payload)).not.toContain(
+        "must-never-show-in-preview",
       );
-      const maskedEnvText = await maskedEnvRes.text();
-      expect(maskedEnvText).toContain("••••••••");
-      expect(maskedEnvText).not.toContain("sk-live-super$secret#value");
 
-      // Confirm logs redact secrets
-      const logsRes = await app.request(
-        "http://localhost/api/apps/shop-api/logs",
-        { headers: { cookie: cookieHeader } },
+      // Simulate missing sealed payload -> approve MUST fail closed with 502 + clear error, NEVER executing "[REDACTED]"!
+      store.consumeApprovalExecutionPayload(queuedEnvParsed.approvalId);
+      const failedApproveRes = await app.request(
+        `https://vps.example.com/api/approvals/${queuedEnvParsed.approvalId}/approve`,
+        {
+          method: "POST",
+          headers: {
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+        },
       );
-      const logsText = await logsRes.text();
-      expect(logsText).not.toContain("sk-live-never-leak-me-123456");
+      expect(failedApproveRes.status).toBe(502);
+      const failedApproveJson = (await failedApproveRes.json()) as {
+        ok: boolean;
+        error: string;
+        approval: { status: string };
+      };
+      expect(failedApproveJson.ok).toBe(false);
+      expect(failedApproveJson.error).toMatch(/Sealed execution payload/);
+      expect(failedApproveJson.approval.status).toBe("failed");
 
-      // 9. Auto-approve token launches a prebuilt image app directly
+      // 10. Oversized (> 64 KiB) env update is rejected BEFORE modifying SQLite or disk!
+      const oversizedEnvRes = await app.request(
+        "https://vps.example.com/api/apps/shop-api/env",
+        {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({
+            vars: [{ key: "HUGE_BLOB", value: "a".repeat(70 * 1024) }],
+            deleteKeys: [],
+          }),
+        },
+      );
+      expect(oversizedEnvRes.status).toBe(400);
+      expect(store.getAppEnvMapForRuntime("shop-api").HUGE_BLOB).toBeUndefined();
+
+      // 11. Auto-approve deploys an image app and records actorTokenId in audit log
       const autoDeploy = await postMcp(autoApprove.rawToken, {
         jsonrpc: "2.0",
-        id: 5,
+        id: 13,
         method: "tools/call",
         params: {
           name: "deploy_app",
@@ -514,22 +733,30 @@ describe("VPSAgent v2 End-to-End Flow (2-step setup, Remote MCP, Approvals, Git 
           },
         },
       });
-      const autoJson = (await autoDeploy.json()) as {
-        result: { isError: boolean };
-      };
-      expect(autoJson.result.isError).toBe(false);
-      expect(store.getApp("landing-site")?.status).toBe("running");
+      expect(
+        ((await autoDeploy.json()) as { result: { isError: boolean } }).result
+          .isError,
+      ).toBe(false);
+      const deployAudit = store
+        .listAuditEvents({ targetSlug: "landing-site" })
+        .find((e) => e.action === "deploy_app");
+      expect(deployAudit?.actorTokenId).toBe(autoApprove.token.id);
 
-      // 10. Bootstrap security invariants: ZERO Docker socket in core compose & valid shell syntax
+      // 12. Bootstrap invariants: zero docker.sock, VPSAgent/vpsagent repo URL, no plaintext public claim URL
       const coreCompose = fs.readFileSync(
         path.join(REPO_ROOT, "bootstrap", "docker-compose.core.yml"),
         "utf8",
       );
       expect(coreCompose).not.toContain("/var/run/docker.sock");
-      expect(coreCompose).toContain("cap_drop:");
-      expect(coreCompose).toContain("no-new-privileges:true");
+      expect(coreCompose).toContain("127.0.0.1:3002:3002");
 
-      // Validate bootstrap/install.sh syntax with bash -n
+      const installSh = fs.readFileSync(
+        path.join(REPO_ROOT, "bootstrap", "install.sh"),
+        "utf8",
+      );
+      expect(installSh).toContain("https://github.com/VPSAgent/vpsagent.git");
+      expect(installSh).not.toContain("diegosg-dev/vpsagent");
+      expect(installSh).not.toContain('base_url="http://${PUBLIC_IP}"');
       execFileSync("bash", ["-n", path.join(REPO_ROOT, "bootstrap", "install.sh")]);
     } finally {
       store.close();

@@ -1,20 +1,6 @@
-{
-	email {$VPSAGENT_ACME_EMAIL:admin@example.com}
-}
+# VPSAgent v2 Caddy Configuration
+# Core dashboard + Remote MCP site block is managed in /etc/caddy/core.d/*.caddy
+# Per-app HTTPS routes are managed automatically in /etc/caddy/apps.d/*.caddy
 
-{$VPSAGENT_SITE_ADDRESS::80} {
-	encode zstd gzip
-
-	# Remote Streamable HTTP MCP Gateway
-	handle /mcp {
-		reverse_proxy vpsagent-core:3001
-	}
-
-	# Control API & 4-Tab Dashboard
-	handle {
-		reverse_proxy vpsagent-core:3001
-	}
-}
-
-# Per-app HTTPS routes managed automatically by the Host Runtime Bridge
+import /etc/caddy/core.d/*.caddy
 import /etc/caddy/apps.d/*.caddy

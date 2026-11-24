@@ -40,6 +40,7 @@ export type RuntimeLifecycleResult = z.infer<
 export const RuntimeLogsResultSchema = z.object({
   slug: z.string(),
   lines: z.array(z.string()),
+  truncated: z.boolean().optional(),
 });
 export type RuntimeLogsResult = z.infer<typeof RuntimeLogsResultSchema>;
 
@@ -51,6 +52,16 @@ export const RuntimeRouteCaddyResultSchema = z.object({
 });
 export type RuntimeRouteCaddyResult = z.infer<
   typeof RuntimeRouteCaddyResultSchema
+>;
+
+export const RuntimeCoreDomainResultSchema = z.object({
+  ok: z.boolean(),
+  domain: z.string().nullable(),
+  acmeEmail: z.string().nullable(),
+  httpsActive: z.boolean(),
+});
+export type RuntimeCoreDomainResult = z.infer<
+  typeof RuntimeCoreDomainResultSchema
 >;
 
 export const RuntimeRemoveResultSchema = z.object({
@@ -171,6 +182,7 @@ export interface RuntimeBuildGitInput {
 
 export interface RuntimeReadinessOptions {
   internalPort: number;
+  probeHttp?: boolean | undefined;
   probePath?: string | undefined;
   timeoutSeconds?: number | undefined;
   pollIntervalMs?: number | undefined;
@@ -186,11 +198,16 @@ export interface RuntimeBridge {
   ): Promise<RuntimeLifecycleResult>;
   buildGitImage(input: RuntimeBuildGitInput): Promise<RuntimeBuildGitResult>;
   getLogs(slug: string, tail: number): Promise<string[]>;
+  getLogsDetailed?(slug: string, tail: number): Promise<RuntimeLogsResult>;
   routeCaddy(input: {
     slug: string;
     domain: string | null;
     internalPort: number;
   }): Promise<RuntimeRouteCaddyResult>;
+  routeCoreDomain(input: {
+    domain: string | null;
+    acmeEmail?: string | null | undefined;
+  }): Promise<RuntimeCoreDomainResult>;
   removeWorkload(
     slug: string,
     options?: { removeFiles?: boolean | undefined },
@@ -355,7 +372,7 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
     };
   }
 
-  async getLogs(slug: string, tail: number): Promise<string[]> {
+  async getLogsDetailed(slug: string, tail: number): Promise<RuntimeLogsResult> {
     const safeSlug = validateAppSlug(slug);
     const safeTail = z.number().int().min(1).max(500).parse(tail);
     const raw = await this.requestJson(
@@ -366,7 +383,19 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
     );
     const parsed = RuntimeLogsResultSchema.parse(raw);
     const joined = redactSecrets(parsed.lines.join("\n"));
-    return joined ? joined.split(/\r?\n/).slice(-safeTail) : [];
+    const lines = joined ? joined.split(/\r?\n/).slice(-safeTail) : [];
+    return {
+      slug: parsed.slug,
+      lines,
+      ...(parsed.truncated !== undefined
+        ? { truncated: parsed.truncated }
+        : {}),
+    };
+  }
+
+  async getLogs(slug: string, tail: number): Promise<string[]> {
+    const detailed = await this.getLogsDetailed(slug, tail);
+    return detailed.lines;
   }
 
   async routeCaddy(input: {
@@ -393,6 +422,24 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       this.defaultTimeoutMs,
     );
     return RuntimeRouteCaddyResultSchema.parse(raw);
+  }
+
+  async routeCoreDomain(input: {
+    domain: string | null;
+    acmeEmail?: string | null | undefined;
+  }): Promise<RuntimeCoreDomainResult> {
+    const safeDomain = input.domain ? validateDomain(input.domain) : null;
+    const safeEmail = input.acmeEmail?.trim() || null;
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/core/route-domain",
+      {
+        domain: safeDomain,
+        acmeEmail: safeEmail,
+      },
+      this.defaultTimeoutMs,
+    );
+    return RuntimeCoreDomainResultSchema.parse(raw);
   }
 
   async removeWorkload(
@@ -491,6 +538,9 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       {
         slug: safeSlug,
         internalPort: safePort,
+        ...(options.probeHttp !== undefined
+          ? { probeHttp: options.probeHttp }
+          : {}),
         ...(options.probePath !== undefined
           ? { probePath: options.probePath }
           : {}),

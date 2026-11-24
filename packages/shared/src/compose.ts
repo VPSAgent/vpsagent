@@ -426,7 +426,11 @@ export function writeApartmentBlueprint(
   for (const relDir of blueprint.requiredDataDirs) {
     const fullDir = path.join(appDir, relDir);
     assertNotSymlink(fullDir);
-    fs.mkdirSync(fullDir, { recursive: true, mode: 0o750 });
+    const isCompanionSubdir =
+      relDir === "data/postgres" || relDir === "data/redis";
+    const mode = relDir === "data" ? 0o755 : isCompanionSubdir ? 0o700 : 0o750;
+    fs.mkdirSync(fullDir, { recursive: true, mode });
+    fs.chmodSync(fullDir, mode);
   }
 
   const composePath = path.join(appDir, "docker-compose.yml");

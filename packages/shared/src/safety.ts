@@ -237,9 +237,11 @@ export function quoteEnvValue(value: string): string {
   return `"${escaped}"`;
 }
 
+export const MAX_APP_ENV_BYTES = 64 * 1024;
+
 /**
  * Serializes a map of environment variables into a deterministic, literally-quoted
- * `.env` file string.
+ * `.env` file string, enforcing the 64 KiB size limit before anything is written.
  */
 export function formatEnvFile(vars: Record<string, string>): string {
   const keys = Object.keys(vars).sort();
@@ -251,7 +253,13 @@ export function formatEnvFile(vars: Record<string, string>): string {
     const rawValue = vars[key] ?? "";
     return `${safeKey}=${quoteEnvValue(rawValue)}`;
   });
-  return `${lines.join("\n")}\n`;
+  const encoded = `${lines.join("\n")}\n`;
+  if (Buffer.byteLength(encoded, "utf8") > MAX_APP_ENV_BYTES) {
+    throw new Error(
+      `Environment file exceeds maximum allowed size of ${MAX_APP_ENV_BYTES} bytes.`,
+    );
+  }
+  return encoded;
 }
 
 /**
