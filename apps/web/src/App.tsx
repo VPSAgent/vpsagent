@@ -11,11 +11,13 @@ import {
   api,
   type ApprovalRequest,
   type AuditEvent,
+  type InspectResult,
   type McpSnippets,
   type McpTokenRecord,
   type OverviewResponse,
   type SessionInfo,
 } from "./api";
+import { applyInspectStatusToApps } from "./health-display";
 import { ApprovalsTab } from "./components/ApprovalsTab";
 import { AppsTab } from "./components/AppsTab";
 import { KeysSettingsTab } from "./components/KeysSettingsTab";
@@ -61,6 +63,14 @@ export function App() {
   useEffect(() => {
     void loadAll();
   }, [loadAll]);
+
+  const handleInspectSync = useCallback((inspect: InspectResult) => {
+    setOverview((prev) =>
+      prev
+        ? { ...prev, apps: applyInspectStatusToApps(prev.apps, inspect) }
+        : prev,
+    );
+  }, []);
 
   const handleLogout = async () => {
     await api.logout();
@@ -165,7 +175,11 @@ export function App() {
           />
         )}
         {tab === "apps" && (
-          <AppsTab apps={overview?.apps ?? []} onRefresh={() => loadAll()} />
+          <AppsTab
+            apps={overview?.apps ?? []}
+            onRefresh={() => loadAll()}
+            onInspectSync={handleInspectSync}
+          />
         )}
         {tab === "approvals" && (
           <ApprovalsTab

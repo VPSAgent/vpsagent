@@ -124,7 +124,7 @@ export interface McpSnippets {
 
 export interface InspectResult {
   slug: string;
-  status: string;
+  status: AppRecord["status"];
   lockedApartmentCompliant: boolean;
   caddyRouteConfigured: boolean;
   caddyDomains: string[];

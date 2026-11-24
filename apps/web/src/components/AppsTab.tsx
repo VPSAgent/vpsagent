@@ -20,15 +20,24 @@ import {
   type CompanionService,
   type InspectResult,
 } from "../api";
+import { formatSafetyCheckHealth, type HealthBadge } from "../health-display";
+
+function healthToneClass(tone: HealthBadge["tone"]): string {
+  if (tone === "healthy") return "text-emerald-300";
+  if (tone === "unhealthy") return "text-rose-300";
+  if (tone === "warning") return "text-amber-300";
+  return "text-slate-200";
+}
 
 interface AppsTabProps {
   apps: AppRecord[];
   onRefresh: () => Promise<void>;
+  onInspectSync?: (inspect: InspectResult) => void;
 }
 
 type DrawerSection = "logs" | "domain" | "env" | "security";
 
-export function AppsTab({ apps, onRefresh }: AppsTabProps) {
+export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
   const [showCreate, setShowCreate] = useState(false);
   const [busySlug, setBusySlug] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -76,6 +85,7 @@ export function AppsTab({ apps, onRefresh }: AppsTabProps) {
       } else if (sec === "security") {
         const res = await api.inspectApp(app.slug);
         setInspectData(res.inspect);
+        onInspectSync?.(res.inspect);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not load details.");
@@ -741,46 +751,38 @@ export function AppsTab({ apps, onRefresh }: AppsTabProps) {
                                 </span>
                               </span>
                             </div>
-                            <div className="flex flex-wrap items-center gap-4 text-slate-400">
-                              <span>
-                                Docker Liveness:{" "}
-                                <span className="font-mono text-slate-200">
-                                  {inspectData.containers[0]?.healthStatus ??
-                                    "none"}
-                                </span>
-                              </span>
-                              <span>
-                                Host HTTP Check:{" "}
-                                <span
-                                  className={`font-mono ${
-                                    inspectData.hostHttpHealth?.status ===
-                                      "unhealthy" ||
-                                    (inspectData.httpProbe?.attempted &&
-                                      !inspectData.httpProbe.ok)
-                                      ? "text-rose-300"
-                                      : inspectData.hostHttpHealth?.status ===
-                                            "healthy" ||
-                                          inspectData.httpProbe?.ok
-                                        ? "text-emerald-300"
-                                        : "text-slate-200"
-                                  }`}
-                                >
-                                  {inspectData.hostHttpHealth?.status ??
-                                    (inspectData.httpProbe?.attempted
-                                      ? inspectData.httpProbe.ok
-                                        ? "healthy"
-                                        : "failing"
-                                      : "disabled")}
-                                  {inspectData.httpProbe?.attempted
-                                    ? inspectData.httpProbe.statusCode !== null
-                                      ? ` (HTTP ${inspectData.httpProbe.statusCode})`
-                                      : inspectData.httpProbe.error
-                                        ? ` (${inspectData.httpProbe.error})`
-                                        : ""
-                                    : ""}
-                                </span>
-                              </span>
-                            </div>
+                            {(() => {
+                              const health =
+                                formatSafetyCheckHealth(inspectData);
+                              return (
+                                <div className="flex flex-wrap items-center gap-4 text-slate-400">
+                                  <span>
+                                    Docker Liveness:{" "}
+                                    <span
+                                      className={`font-mono ${healthToneClass(health.dockerLiveness.tone)}`}
+                                    >
+                                      {health.dockerLiveness.label}
+                                    </span>
+                                  </span>
+                                  <span>
+                                    Monitored HTTP Health:{" "}
+                                    <span
+                                      className={`font-mono ${healthToneClass(health.monitoredHttp.tone)}`}
+                                    >
+                                      {health.monitoredHttp.label}
+                                    </span>
+                                  </span>
+                                  <span>
+                                    Live HTTP Probe:{" "}
+                                    <span
+                                      className={`font-mono ${healthToneClass(health.liveHttpProbe.tone)}`}
+                                    >
+                                      {health.liveHttpProbe.label}
+                                    </span>
+                                  </span>
+                                </div>
+                              );
+                            })()}
                           </div>
                         ) : (
                           <p className="text-slate-400">
