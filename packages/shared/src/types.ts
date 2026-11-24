@@ -111,11 +111,16 @@ export const ApprovalRequestSchema = z.object({
 });
 export type ApprovalRequest = z.infer<typeof ApprovalRequestSchema>;
 
+export const TlsStatusSchema = z.enum(["inactive", "pending", "active", "failed"]);
+export type TlsStatus = z.infer<typeof TlsStatusSchema>;
+
 export const SetupStateSchema = z.object({
   claimed: z.boolean(),
   domain: z.string().nullable(),
   acmeEmail: z.string().nullable(),
   httpsActive: z.boolean().default(false),
+  tlsStatus: TlsStatusSchema.default("inactive"),
+  tlsError: z.string().nullable().default(null),
   claimedAt: z.string().nullable(),
 });
 export type SetupState = z.infer<typeof SetupStateSchema>;

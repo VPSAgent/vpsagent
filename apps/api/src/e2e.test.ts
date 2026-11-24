@@ -72,6 +72,10 @@ if args[:1] == ["compose"]:
             print(json.dumps({"Name": proj, "State": "running", "Health": "healthy", "ExitCode": 0}))
         sys.exit(0)
     if "logs" in args:
+        if proj == "vpsagent-escape-logs":
+            for i in range(120):
+                print(f'line-{i:03d} ' + ('"quoted\\\\slash" ' * 60))
+            sys.exit(0)
         print(f"Listening for {proj}")
         print("Loaded STRIPE_SECRET_KEY=sk-live-never-leak-me-123456")
         sys.exit(0)
@@ -398,7 +402,8 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       expect(store.getSetupState().domain).toBeNull();
       expect(store.getSetupState().httpsActive).toBe(false);
 
-      // Now Caddy succeeds -> writes caddy/core.d/dashboard.caddy and activates HTTPS!
+      // Now Caddy reloads dashboard.caddy, but because vps.example.com has no live TLS listener on :443,
+      // httpsActive MUST stay false (pending/failed) and snippets must NOT advertise HTTPS yet!
       fs.writeFileSync(
         stateFile,
         JSON.stringify({ projects: {}, networks: [], failValidate: false }),
@@ -416,7 +421,9 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
         },
       );
       expect(domainRes.status).toBe(200);
-      expect(store.getSetupState().httpsActive).toBe(true);
+      expect(store.getSetupState().domain).toBe("vps.example.com");
+      expect(store.getSetupState().httpsActive).toBe(false);
+      expect(["pending", "failed"]).toContain(store.getSetupState().tlsStatus);
       const coreCaddy = fs.readFileSync(
         path.join(caddyCoreDir, "dashboard.caddy"),
         "utf8",
@@ -424,7 +431,19 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       expect(coreCaddy).toContain("vps.example.com {");
       expect(coreCaddy).toContain("tls owner@example.com");
 
-      // Snippets now advertise https://vps.example.com/mcp
+      // While TLS is pending/failed, snippets must NOT advertise https://vps.example.com/mcp yet
+      const pendingSnippetsRes = await localSetupApp.request(
+        "http://localhost:3002/api/mcp/snippets",
+        { headers: { cookie: cookieHeader, host: "localhost:3002" } },
+      );
+      expect(((await pendingSnippetsRes.json()) as { httpsReady: boolean }).httpsReady).toBe(false);
+
+      // Simulate TLS certificate issuance succeeding -> now snippets advertise https://vps.example.com/mcp
+      store.updateSetupState({
+        httpsActive: true,
+        tlsStatus: "active",
+        tlsError: null,
+      });
       const snippetsRes = await app.request(
         "https://vps.example.com/api/mcp/snippets",
         {
@@ -717,6 +736,73 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       expect(oversizedEnvRes.status).toBe(400);
       expect(store.getAppEnvMapForRuntime("shop-api").HUGE_BLOB).toBeUndefined();
 
+      // 10b. Saving a regular env setting + rebuilding a running Postgres app succeeds without EPERM chmod
+      const editEnvRes = await app.request(
+        "https://vps.example.com/api/apps/shop-api/env",
+        {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({
+            vars: [{ key: "TRICKY_VAR", value: "it's ${APP_PORT}\nline2" }],
+            deleteKeys: [],
+          }),
+        },
+      );
+      expect(editEnvRes.status).toBe(200);
+      expect(store.getAppEnvMapForRuntime("shop-api").TRICKY_VAR).toBe(
+        "it's ${APP_PORT}\nline2",
+      );
+
+      // Generated compose includes recurring healthcheck for app service
+      const shopCompose = fs.readFileSync(
+        path.join(appsRoot, "shop-api", "docker-compose.yml"),
+        "utf8",
+      );
+      expect(shopCompose).toContain("healthcheck:");
+
+      // 10c. Wire byte budget on MCP get_app_logs stays strictly <= 48 KiB even with escape-heavy JSON lines!
+      const escapeLogsRes = await postMcp(autoApprove.rawToken, {
+        jsonrpc: "2.0",
+        id: 14,
+        method: "tools/call",
+        params: {
+          name: "deploy_app",
+          arguments: {
+            slug: "escape-logs",
+            name: "Escape Logs",
+            sourceType: "image",
+            image: "nginxinc/nginx-unprivileged:alpine",
+            internalPort: livePort,
+          },
+        },
+      });
+      expect(escapeLogsRes.status).toBe(200);
+      const wireLogsRes = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 15,
+        method: "tools/call",
+        params: {
+          name: "get_app_logs",
+          arguments: { slug: "escape-logs", tail: 200 },
+        },
+      });
+      const wireLogsText = await wireLogsRes.text();
+      expect(Buffer.byteLength(wireLogsText, "utf8")).toBeLessThanOrEqual(
+        48 * 1024,
+      );
+      const wireLogsJson = JSON.parse(wireLogsText) as {
+        result: { content: Array<{ text: string }> };
+      };
+      const innerLogs = JSON.parse(wireLogsJson.result.content[0]!.text) as {
+        truncated: boolean;
+      };
+      expect(innerLogs.truncated).toBe(true);
+
       // 11. Auto-approve deploys an image app and records actorTokenId in audit log
       const autoDeploy = await postMcp(autoApprove.rawToken, {
         jsonrpc: "2.0",
@@ -755,6 +841,8 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
         "utf8",
       );
       expect(installSh).toContain("https://github.com/VPSAgent/vpsagent.git");
+      expect(installSh).toContain("systemctl restart vpsagent-runtime.service");
+      expect(installSh).toContain("wait_for_runtime_bridge");
       expect(installSh).not.toContain("diegosg-dev/vpsagent");
       expect(installSh).not.toContain('base_url="http://${PUBLIC_IP}"');
       execFileSync("bash", ["-n", path.join(REPO_ROOT, "bootstrap", "install.sh")]);

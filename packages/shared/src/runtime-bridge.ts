@@ -16,6 +16,7 @@ import {
   AppStatusSchema,
   DiskMetricsSchema,
   SystemMetricsSchema,
+  TlsStatusSchema,
 } from "./types.js";
 
 export const RuntimeLifecycleActionSchema = z.enum([
@@ -59,10 +60,20 @@ export const RuntimeCoreDomainResultSchema = z.object({
   domain: z.string().nullable(),
   acmeEmail: z.string().nullable(),
   httpsActive: z.boolean(),
+  tlsStatus: TlsStatusSchema.default("inactive"),
+  tlsError: z.string().nullable().default(null),
 });
 export type RuntimeCoreDomainResult = z.infer<
   typeof RuntimeCoreDomainResultSchema
 >;
+
+export const RuntimeTlsCheckResultSchema = z.object({
+  domain: z.string(),
+  httpsActive: z.boolean(),
+  tlsStatus: TlsStatusSchema,
+  tlsError: z.string().nullable(),
+});
+export type RuntimeTlsCheckResult = z.infer<typeof RuntimeTlsCheckResultSchema>;
 
 export const RuntimeRemoveResultSchema = z.object({
   ok: z.boolean(),
@@ -208,6 +219,7 @@ export interface RuntimeBridge {
     domain: string | null;
     acmeEmail?: string | null | undefined;
   }): Promise<RuntimeCoreDomainResult>;
+  checkCoreTls?(domain: string): Promise<RuntimeTlsCheckResult>;
   removeWorkload(
     slug: string,
     options?: { removeFiles?: boolean | undefined },
@@ -440,6 +452,17 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       this.defaultTimeoutMs,
     );
     return RuntimeCoreDomainResultSchema.parse(raw);
+  }
+
+  async checkCoreTls(domain: string): Promise<RuntimeTlsCheckResult> {
+    const safeDomain = validateDomain(domain);
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/core/tls-check",
+      { domain: safeDomain },
+      SHORT_TIMEOUT_MS,
+    );
+    return RuntimeTlsCheckResultSchema.parse(raw);
   }
 
   async removeWorkload(

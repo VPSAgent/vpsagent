@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { z } from "zod";
 import {
   type Actor,
@@ -145,6 +147,8 @@ export class AppExecutor {
         gitBranch: safeBranch,
         dockerfilePath: safeDockerfile,
         internalPort: input.internalPort,
+        probeHttp: input.probeHttp,
+        probePath: input.probePath,
         cpuLimit: input.cpuLimit,
         memoryLimitMb: input.memoryLimitMb,
         companions: input.companions,
@@ -311,6 +315,8 @@ export class AppExecutor {
         gitBranch: existing.gitBranch,
         dockerfilePath: existing.dockerfilePath,
         internalPort: existing.internalPort,
+        probeHttp: existing.probeHttp,
+        probePath: existing.probePath,
         cpuLimit: existing.cpuLimit,
         memoryLimitMb: existing.memoryLimitMb,
         companions: existing.companions,
@@ -398,6 +404,8 @@ export class AppExecutor {
         gitBranch: existing.gitBranch,
         dockerfilePath: existing.dockerfilePath,
         internalPort: existing.internalPort,
+        probeHttp: existing.probeHttp,
+        probePath: existing.probePath,
         cpuLimit: existing.cpuLimit,
         memoryLimitMb: existing.memoryLimitMb,
         companions: existing.companions,
@@ -412,17 +420,49 @@ export class AppExecutor {
         },
       });
 
-      // Validation succeeded — now persist to SQLite & write blueprint
+      // Snapshot existing blueprint files so a failed write/apply rolls back cleanly
+      // and NEVER commits broken changes to SQLite.
+      const appDir = resolveScopedAppDir(this.appsRoot, slug);
+      const composePath = path.join(appDir, "docker-compose.yml");
+      const envPath = path.join(appDir, ".env");
+      const prevCompose = fs.existsSync(composePath)
+        ? fs.readFileSync(composePath, "utf8")
+        : null;
+      const prevEnv = fs.existsSync(envPath)
+        ? fs.readFileSync(envPath, "utf8")
+        : null;
+
+      try {
+        writeApartmentBlueprint(this.appsRoot, blueprint);
+        if (existing.status === "running") {
+          await this.bridge.lifecycle(slug, "start");
+        }
+      } catch (err) {
+        try {
+          if (prevCompose !== null) {
+            fs.writeFileSync(composePath, prevCompose, {
+              encoding: "utf8",
+              mode: 0o644,
+            });
+          }
+          if (prevEnv !== null) {
+            fs.writeFileSync(envPath, prevEnv, {
+              encoding: "utf8",
+              mode: 0o600,
+            });
+          }
+        } catch {
+          // Best-effort restore on failure
+        }
+        throw err;
+      }
+
+      // Apply succeeded — now commit env updates to SQLite.
       for (const delKey of validatedDeleteKeys) {
         this.store.deleteAppEnvVar(slug, delKey);
       }
       if (validatedVars.length > 0) {
         this.store.setAppEnvVars(slug, validatedVars);
-      }
-      writeApartmentBlueprint(this.appsRoot, blueprint);
-
-      if (existing.status === "running") {
-        await this.bridge.lifecycle(slug, "start");
       }
 
       const changedKeys = [

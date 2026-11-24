@@ -38,7 +38,7 @@ function startServerFromEnv(): void {
 
   const store = new RegistryStore(dbPath, { encryptionSecret });
 
-  // Sync initial HTTPS domain state if installer pre-configured a real domain in Caddy
+  // Record pre-configured installer domain as pending until a live TLS check confirms it
   const initialDomain = process.env.VPSAGENT_DOMAIN?.trim();
   const initialEmail = process.env.VPSAGENT_ACME_EMAIL?.trim() || null;
   if (
@@ -49,7 +49,9 @@ function startServerFromEnv(): void {
     store.updateSetupState({
       domain: initialDomain,
       acmeEmail: initialEmail,
-      httpsActive: true,
+      httpsActive: false,
+      tlsStatus: "pending",
+      tlsError: null,
     });
   }
 

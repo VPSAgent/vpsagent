@@ -217,6 +217,32 @@ export function KeysSettingsTab({
       {/* Setup Snippets */}
       {snippets && (
         <section className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6 space-y-4">
+          {!snippets.httpsReady && (
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
+              <span>
+                {setup.domain
+                  ? `HTTPS certificate for ${setup.domain} is currently ${setup.tlsStatus}${setup.tlsError ? `: ${setup.tlsError}` : ""}. Remote HTTPS MCP will be advertised once TLS succeeds.`
+                  : "No verified HTTPS domain yet — using local URL. Bind a domain below for remote HTTPS MCP access."}
+              </span>
+              {setup.domain && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setBusy(true);
+                    try {
+                      await api.recheckTls();
+                      await onRefresh();
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                  className="rounded-lg bg-amber-400 px-3 py-1 text-xs font-semibold text-slate-950 hover:bg-amber-300 cursor-pointer"
+                >
+                  Re-check HTTPS
+                </button>
+              )}
+            </div>
+          )}
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
               <h3 className="text-base font-semibold text-white">

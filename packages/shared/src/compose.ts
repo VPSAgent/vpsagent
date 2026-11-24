@@ -22,6 +22,7 @@ const DEFAULT_POSTGRES_VERSION = "16-alpine";
 const DEFAULT_REDIS_VERSION = "7-alpine";
 const SAFE_TAG_VERSION_PATTERN = /^[a-zA-Z0-9._-]{1,32}$/;
 const SAFE_CONTAINER_PATH_PATTERN = /^\/[A-Za-z0-9._/-]+$/;
+const SAFE_PROBE_PATH_PATTERN = /^\/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=-]{0,127}$/;
 
 export const ApartmentCompanionSecretsSchema = z.object({
   postgresPassword: z.string().min(8).max(128).optional(),
@@ -39,6 +40,8 @@ export const ApartmentBlueprintInputSchema = z.object({
   gitBranch: z.string().min(1).max(120).nullable().optional(),
   dockerfilePath: z.string().min(1).max(200).optional(),
   internalPort: z.number().int().min(1).max(65535).default(8080),
+  probeHttp: z.boolean().default(true),
+  probePath: z.string().min(1).max(128).default("/"),
   cpuLimit: z.string().min(1).max(16).default("0.5"),
   memoryLimitMb: z.number().int().min(64).max(131072).default(512),
   envVars: z.record(z.string(), z.string()).default({}),
@@ -274,6 +277,29 @@ export function generateApartmentBlueprint(
     "      - no-new-privileges:true",
   );
 
+  if (input.probeHttp) {
+    const safeProbePath = input.probePath.trim();
+    if (
+      !SAFE_PROBE_PATH_PATTERN.test(safeProbePath) ||
+      safeProbePath.includes("'") ||
+      safeProbePath.includes('"') ||
+      safeProbePath.includes("$") ||
+      /\s/.test(safeProbePath)
+    ) {
+      throw new Error(`Invalid probePath "${input.probePath}".`);
+    }
+    const probeUrl = `http://127.0.0.1:${input.internalPort}${safeProbePath}`;
+    const hcCmd = `if command -v curl >/dev/null 2>&1; then curl -s -i --max-time 3 ${probeUrl} | head -n 1 | grep -Eq 'HTTP/[0-9.]+ [1-4][0-9][0-9]'; elif command -v wget >/dev/null 2>&1; then wget -S -T 3 -O /dev/null ${probeUrl} 2>&1 | grep -Eq 'HTTP/[0-9.]+ [1-4][0-9][0-9]'; elif command -v nc >/dev/null 2>&1; then nc -z 127.0.0.1 ${input.internalPort}; else exit 0; fi`;
+    lines.push(
+      "    healthcheck:",
+      `      test: ${JSON.stringify(["CMD-SHELL", hcCmd])}`,
+      '      interval: "15s"',
+      '      timeout: "5s"',
+      "      retries: 3",
+      '      start_period: "5s"',
+    );
+  }
+
   if (companions.length > 0) {
     lines.push("    depends_on:");
     for (const comp of companions) {
@@ -426,11 +452,19 @@ export function writeApartmentBlueprint(
   for (const relDir of blueprint.requiredDataDirs) {
     const fullDir = path.join(appDir, relDir);
     assertNotSymlink(fullDir);
-    const isCompanionSubdir =
-      relDir === "data/postgres" || relDir === "data/redis";
-    const mode = relDir === "data" ? 0o755 : isCompanionSubdir ? 0o700 : 0o750;
-    fs.mkdirSync(fullDir, { recursive: true, mode });
-    fs.chmodSync(fullDir, mode);
+    // Leave existing companion/data directory ownership and permissions strictly to the
+    // host Runtime Bridge (e.g. Postgres 70:70 and Redis 999:999) so re-edits never EPERM.
+    if (!fs.existsSync(fullDir)) {
+      const isCompanionSubdir =
+        relDir === "data/postgres" || relDir === "data/redis";
+      const mode = relDir === "data" ? 0o755 : isCompanionSubdir ? 0o700 : 0o750;
+      fs.mkdirSync(fullDir, { recursive: true, mode });
+      try {
+        fs.chmodSync(fullDir, mode);
+      } catch {
+        // Ignore chmod errors when directory ownership is managed by host Runtime Bridge
+      }
+    }
   }
 
   const composePath = path.join(appDir, "docker-compose.yml");

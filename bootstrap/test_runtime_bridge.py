@@ -226,16 +226,22 @@ networks:
     driver: bridge
 """
         env_map = {
+            "APP_PORT": "8080",
+            "TRICKY_LITERAL": "it's ${APP_PORT}\nline2\\end",
             "POSTGRES_DB": "app_shop_api",
             "POSTGRES_USER": "vps_shop_api",
             "POSTGRES_PASSWORD": "p$ss#word_with_dollar",
             "REDIS_PASSWORD": "r$dis_pass",
         }
-        rendered = rb.validate_and_render_compose(compose, "shop-api", app_dir, env_map, "/tmp/safe.env")
-        # Literal `$` inside resolved passwords is escaped as `$$` so Docker Compose never re-interpolates
+        rendered = rb.validate_and_render_compose(compose, "shop-api", app_dir, env_map, None)
+        # Literal `$` inside resolved passwords & injected app env is escaped as `$$` so Docker Compose never expands `${APP_PORT}`!
         self.assertEqual(rendered["services"]["postgres"]["environment"]["POSTGRES_PASSWORD"], "p$$ss#word_with_dollar")
         self.assertEqual(rendered["services"]["redis"]["command"][-1], "r$$dis_pass")
-        self.assertEqual(rendered["services"]["app"]["env_file"], [{"path": "/tmp/safe.env", "required": True}])
+        self.assertNotIn("env_file", rendered["services"]["app"])
+        self.assertEqual(
+            rendered["services"]["app"]["environment"]["TRICKY_LITERAL"],
+            "it's $${APP_PORT}\nline2\\end",
+        )
 
         # Root user must be rejected
         root_compose = compose.replace('user: "70:70"', 'user: "0:0"')
@@ -397,6 +403,7 @@ sys.exit(0)
             fh.write(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n')
         os.chmod(docker_sh, 0o755)
 
+        tls_state = {"result": (True, "active", None)}
         svc = rb.RuntimeService(
             apps_root=self.apps_root,
             caddy_apps_dir=self.caddy_dir,
@@ -404,15 +411,28 @@ sys.exit(0)
             caddy_container="vpsagent-caddy",
             docker_bin=docker_sh,
             runtime_token="secret-token-for-unit-test-1234",
+            tls_checker=lambda domain, timeout: tls_state["result"],
         )
 
-        # Success writes dashboard.caddy with HTTPS domain & tls email
+        # Successful TLS verification reports httpsActive=True, tlsStatus="active"
         res = svc.route_core_domain({"domain": "vps.example.com", "acmeEmail": "ops@example.com"})
         self.assertTrue(res["httpsActive"])
+        self.assertEqual(res["tlsStatus"], "active")
         dash_caddy = os.path.join(core_dir, "dashboard.caddy")
         content = Path(dash_caddy).read_text(encoding="utf-8")
         self.assertIn("vps.example.com {", content)
         self.assertIn("tls ops@example.com", content)
+
+        # Failed TLS issuance reports httpsActive=False and tlsStatus="failed" even though Caddy reloaded
+        tls_state["result"] = (False, "failed", "TLS handshake failed: unknown ca")
+        res_failed_tls = svc.route_core_domain({"domain": "pending.example.com", "acmeEmail": None})
+        self.assertFalse(res_failed_tls["httpsActive"])
+        self.assertEqual(res_failed_tls["tlsStatus"], "failed")
+        self.assertIn("TLS handshake failed", res_failed_tls["tlsError"])
+
+        # Restore vps.example.com before testing rollback
+        tls_state["result"] = (True, "active", None)
+        svc.route_core_domain({"domain": "vps.example.com", "acmeEmail": "ops@example.com"})
 
         # Failed caddy validate restores prior working dashboard.caddy
         Path(fail_flag).write_text("1", encoding="utf-8")
@@ -486,7 +506,9 @@ sys.exit(0)
         with svc._validated_compose_context(app_dir, "iso-app") as (compose_path, project_dir):
             self.assertNotEqual(project_dir, app_dir)
             self.assertFalse(os.path.exists(os.path.join(project_dir, ".env")))
-            self.assertTrue(os.path.exists(os.path.join(project_dir, "app.env")))
+            self.assertFalse(os.path.exists(os.path.join(project_dir, "app.env")))
+            rendered = json.loads(Path(compose_path).read_text(encoding="utf-8"))
+            self.assertEqual(rendered["services"]["app"]["environment"]["SECRET"], "a$$b")
             cmd = svc._compose_cmd_base("iso-app", project_dir, compose_path)
             self.assertNotIn("--env-file", cmd)
             self.assertEqual(cmd[cmd.index("--project-directory") + 1], project_dir)
@@ -561,6 +583,26 @@ sys.exit(0)
         )
         self.assertTrue(healthy_worker["ready"])
         self.assertIsNone(healthy_worker["httpProbe"])
+
+        # 4. Delayed inspection that exceeds timeoutSeconds MUST return ready=False (never ready=True past deadline!)
+        from unittest import mock
+
+        def slow_inspect(payload: dict, *, timeout_budget_s: float | None = None) -> dict:
+            import time as _t
+            _t.sleep(0.16)
+            return {
+                "slug": "noisy-app",
+                "status": "running",
+                "containers": [{"healthStatus": "healthy"}],
+                "httpProbe": {"attempted": True, "ok": True, "statusCode": 200, "error": None},
+            }
+
+        with mock.patch.object(svc, "inspect_workload", side_effect=slow_inspect):
+            overdue = svc.check_readiness(
+                {"slug": "noisy-app", "internalPort": 8080, "probeHttp": True, "timeoutSeconds": 0.1, "pollIntervalMs": 20}
+            )
+            self.assertFalse(overdue["ready"])
+            self.assertIn("deadline", overdue["reason"])
 
 
 if __name__ == "__main__":

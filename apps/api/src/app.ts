@@ -337,6 +337,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   };
 
   app.use("/api/setup/domain", requireOwner);
+  app.use("/api/setup/tls-recheck", requireOwner);
   app.use("/api/overview", requireOwner);
   app.use("/api/apps/*", requireOwner);
   app.use("/api/apps", requireOwner);
@@ -362,14 +363,38 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         domain: applied.domain,
         acmeEmail: applied.acmeEmail,
         httpsActive: applied.httpsActive,
+        tlsStatus: applied.tlsStatus,
+        tlsError: applied.tlsError,
       });
       store.recordAudit({
         actor: "user",
         action: "setup.domain_updated",
         summary: applied.domain
-          ? `Enabled automatic HTTPS in Caddy for dashboard domain ${applied.domain}`
+          ? `Configured Caddy for ${applied.domain} (TLS status: ${applied.tlsStatus})`
           : "Cleared dashboard custom domain (reverted to local-only mode)",
         riskLevel: "medium",
+      });
+      return c.json({ ok: true, setup });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/setup/tls-recheck", async (c) => {
+    try {
+      const current = store.getSetupState();
+      if (!current.domain) {
+        return c.json({ ok: true, setup: current });
+      }
+      if (!bridge.checkCoreTls) {
+        return c.json({ ok: true, setup: current });
+      }
+      const checked = await bridge.checkCoreTls(current.domain);
+      const setup = store.updateSetupState({
+        httpsActive: checked.httpsActive,
+        tlsStatus: checked.tlsStatus,
+        tlsError: checked.tlsError,
       });
       return c.json({ ok: true, setup });
     } catch (err) {
@@ -521,9 +546,9 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       const appRecord = store.getApp(slug);
       const inspect = await bridge.inspectWorkload(slug, {
         probeHttp:
-          c.req.query("probe") === "true"
-            ? (appRecord?.probeHttp ?? true)
-            : false,
+          c.req.query("probe") === "false"
+            ? false
+            : (appRecord?.probeHttp ?? true),
         internalPort: appRecord?.internalPort ?? 8080,
         probePath: appRecord?.probePath ?? "/",
       });
@@ -742,7 +767,9 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
 
   app.get("/api/mcp/snippets", (c) => {
     const setup = store.getSetupState();
-    const httpsReady = Boolean(setup.domain && setup.httpsActive);
+    const httpsReady = Boolean(
+      setup.domain && setup.httpsActive && setup.tlsStatus === "active",
+    );
     const host = getRequestHost(c, trustProxy) || "localhost:3002";
     const mcpUrl = httpsReady
       ? `https://${setup.domain}/mcp`

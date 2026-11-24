@@ -302,31 +302,71 @@ export function buildSafeApprovalPreview(
   return redactStructuredValue(rawPayload) as Record<string, unknown>;
 }
 
-/** Applies a strict final UTF-8 JSON byte budget to log replies, keeping newest lines. */
-function budgetLogsReply(
+/**
+ * Budgets the ACTUAL FINAL WIRE JSON-RPC RESPONSE bytes (including double JSON
+ * escaping when `toolOk` serializes the text payload inside the JSON-RPC envelope),
+ * keeping the newest lines and setting `truncated: true` if anything was trimmed.
+ */
+function budgetWireLogsResponse(
+  rpcId: string | number | null,
   slug: string,
   lines: string[],
   alreadyTruncated: boolean,
-  maxBytes = MAX_MCP_LOG_REPLY_BYTES,
+  maxWireBytes = MAX_MCP_LOG_REPLY_BYTES,
 ): { slug: string; lines: string[]; truncated: boolean } {
-  let truncated = alreadyTruncated;
-  const keptReversed: string[] = [];
-  let usedBytes = Buffer.byteLength(
-    JSON.stringify({ slug, lines: [], truncated: true }),
-    "utf8",
-  );
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!;
-    const encodedLineBytes = Buffer.byteLength(JSON.stringify(line), "utf8") + 2;
-    if (usedBytes + encodedLineBytes > maxBytes) {
-      truncated = true;
-      break;
-    }
-    keptReversed.push(line);
-    usedBytes += encodedLineBytes;
+  const measureWireBytes = (
+    candidateLines: string[],
+    truncated: boolean,
+  ): number =>
+    Buffer.byteLength(
+      JSON.stringify(
+        jsonRpcResult(
+          rpcId,
+          toolOk({ slug, lines: candidateLines, truncated }),
+        ),
+      ),
+      "utf8",
+    );
+
+  if (measureWireBytes(lines, alreadyTruncated) <= maxWireBytes) {
+    return { slug, lines, truncated: alreadyTruncated };
   }
-  keptReversed.reverse();
-  return { slug, lines: keptReversed, truncated };
+
+  // Binary search for the largest suffix (newest lines) that fits within maxWireBytes
+  let lo = 0;
+  let hi = lines.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    const slice = lines.slice(lines.length - mid);
+    if (measureWireBytes(slice, true) <= maxWireBytes) {
+      lo = mid;
+    } else {
+      hi = mid - 1;
+    }
+  }
+
+  if (lo > 0) {
+    return { slug, lines: lines.slice(lines.length - lo), truncated: true };
+  }
+
+  // Even the single newest line exceeds the budget once JSON-escaped -> trim it safely
+  const newest = lines.at(-1) ?? "";
+  let charLo = 0;
+  let charHi = newest.length;
+  while (charLo < charHi) {
+    const mid = Math.ceil((charLo + charHi) / 2);
+    const trimmed = [`${newest.slice(0, mid)}...`];
+    if (measureWireBytes(trimmed, true) <= maxWireBytes) {
+      charLo = mid;
+    } else {
+      charHi = mid - 1;
+    }
+  }
+  return {
+    slug,
+    lines: charLo > 0 ? [`${newest.slice(0, charLo)}...`] : [],
+    truncated: true,
+  };
 }
 
 export interface McpSetupSnippets {
@@ -603,7 +643,8 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           const detailed = bridge.getLogsDetailed
             ? await bridge.getLogsDetailed(slug, tail)
             : { slug, lines: await bridge.getLogs(slug, tail), truncated: false };
-          const budgeted = budgetLogsReply(
+          const budgeted = budgetWireLogsResponse(
+            id,
             slug,
             detailed.lines,
             Boolean(detailed.truncated),

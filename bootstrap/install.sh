@@ -2,9 +2,11 @@
 set -euo pipefail
 
 # VPSAgent v2 — Lean One-Command Ubuntu LTS Installer
-# Usage:
+# Usage (from an authenticated clone — recommended for private repositories):
+#   git clone https://github.com/VPSAgent/vpsagent.git /opt/vpsagent
+#   sudo bash /opt/vpsagent/bootstrap/install.sh [--domain vps.yourdomain.com --email you@yourdomain.com]
+# Usage (when repository or release asset is public):
 #   curl -fsSL https://raw.githubusercontent.com/VPSAgent/vpsagent/main/bootstrap/install.sh | sudo bash
-#   curl -fsSL https://raw.githubusercontent.com/VPSAgent/vpsagent/main/bootstrap/install.sh | sudo bash -s -- --domain vps.yourdomain.com --email you@yourdomain.com
 
 VPSAGENT_ROOT="${VPSAGENT_ROOT:-/var/lib/vpsagent}"
 VPSAGENT_REPO_URL="${VPSAGENT_REPO_URL:-https://github.com/VPSAgent/vpsagent.git}"
@@ -220,7 +222,12 @@ VPSAGENT_CADDY_CONTAINER=vpsagent-caddy
 EOF
     chmod 600 "${ENV_FILE}"
   else
+    # Preserve existing secrets on upgrade and backfill any new required non-secret keys
     CLAIM_TOKEN="$(awk -F= '/^VPSAGENT_CLAIM_TOKEN=/{print $2; exit}' "${ENV_FILE}" || true)"
+    if ! grep -q '^VPSAGENT_CADDY_CORE_DIR=' "${ENV_FILE}"; then
+      printf 'VPSAGENT_CADDY_CORE_DIR=%s\n' "${VPSAGENT_ROOT}/caddy/core.d" >> "${ENV_FILE}"
+      chmod 600 "${ENV_FILE}"
+    fi
   fi
 
   cp "${SCRIPT_DIR}/Caddyfile" "${VPSAGENT_ROOT}/Caddyfile"
@@ -252,7 +259,25 @@ WantedBy=multi-user.target
 EOF
   chmod 644 "${unit_file}"
   systemctl daemon-reload
-  systemctl enable --now vpsagent-runtime.service
+  systemctl enable vpsagent-runtime.service
+  systemctl restart vpsagent-runtime.service
+  wait_for_runtime_bridge
+}
+
+wait_for_runtime_bridge() {
+  local sock="${VPSAGENT_ROOT}/run/runtime.sock"
+  log "Verifying restarted host Runtime Bridge health on ${sock}..."
+  local attempt
+  for attempt in $(seq 1 30); do
+    if [[ -S "${sock}" ]] && curl --unix-socket "${sock}" -fsS --max-time 2 http://localhost/health | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+      log "Host Runtime Bridge is healthy and accepting requests."
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "Error: host Runtime Bridge did not become healthy on ${sock} after restart." >&2
+  systemctl status vpsagent-runtime.service --no-pager >&2 || true
+  exit 1
 }
 
 start_core_stack() {

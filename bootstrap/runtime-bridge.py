@@ -37,6 +37,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import ssl
 import stat
 import subprocess
 import sys
@@ -176,6 +177,25 @@ KNOWN_TOKEN_RE = re.compile(
 )
 
 DnsResolver = Callable[[str, int], list[str]]
+TlsChecker = Callable[[str, float], tuple[bool, str, str | None]]
+
+
+def default_tls_checker(
+    domain: str, timeout_s: float = 4.0
+) -> tuple[bool, str, str | None]:
+    """
+    Verifies a live TLS certificate handshake against `(domain, 443)` with full
+    hostname verification. Returns `(https_active, tls_status, tls_error)`.
+    """
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((domain, 443), timeout=timeout_s) as raw_sock:
+            with ctx.wrap_socket(raw_sock, server_hostname=domain):
+                return True, "active", None
+    except ssl.SSLError as exc:
+        return False, "failed", redact_secrets(f"TLS handshake failed: {exc}")
+    except OSError as exc:
+        return False, "pending", redact_secrets(f"HTTPS not reachable yet: {exc}")
 
 
 class BridgeRequestError(Exception):
@@ -1398,21 +1418,18 @@ def validate_and_render_compose(
             else:
                 raise BridgeRequestError(400, "command must be a string or list.")
 
+        uses_app_env_file = False
         if "env_file" in svc_cfg:
             env_files = svc_cfg["env_file"]
             if not isinstance(env_files, list):
                 raise BridgeRequestError(400, "env_file must be a list.")
-            rewritten_env_files: list[Any] = []
             for entry in env_files:
                 if isinstance(entry, str):
                     if entry != ".env":
                         raise BridgeRequestError(
                             400, "env_file may only reference '.env'."
                         )
-                    if env_file_override:
-                        rewritten_env_files.append(
-                            {"path": env_file_override, "required": True}
-                        )
+                    uses_app_env_file = True
                 elif isinstance(entry, dict):
                     if (
                         set(entry.keys()) - {"path", "required"}
@@ -1426,21 +1443,19 @@ def validate_and_render_compose(
                         raise BridgeRequestError(
                             400, "env_file.required must be a boolean."
                         )
-                    if env_file_override:
-                        rewritten_env_files.append(
-                            {"path": env_file_override, "required": req_flag}
-                        )
+                    uses_app_env_file = True
                 else:
                     raise BridgeRequestError(400, "Invalid env_file entry.")
-            if env_file_override:
-                out_svc["env_file"] = rewritten_env_files
-            else:
-                out_svc.pop("env_file", None)
+            # Never pass `.env` to Docker Compose `env_file` (which expands `${VAR}` inside
+            # double quotes). Instead inject parsed literal `env_map` values directly into
+            # `environment` and escape `$` -> `$$` so every quote, newline, backslash, and
+            # `$` arrives verbatim in the container.
+            out_svc.pop("env_file", None)
 
+        explicit_env: dict[str, Any] = {}
         if "environment" in svc_cfg:
             env_section = svc_cfg["environment"]
             if isinstance(env_section, dict):
-                resolved_env: dict[str, Any] = {}
                 for ek, ev in env_section.items():
                     ek_str = str(ek)
                     if ek_str in DISALLOWED_ENV_EXACT or ek_str.startswith(
@@ -1450,39 +1465,46 @@ def validate_and_render_compose(
                             400, f'Forbidden Compose environment key "{ek_str}".'
                         )
                     if isinstance(ev, str):
-                        resolved_env[ek_str] = _resolve_allowed_vars(
+                        explicit_env[ek_str] = _resolve_allowed_vars(
                             ev,
                             vars_ctx,
                             ALLOWED_ENV_INTERPOLATION_VARS,
                             f"{svc_key}.environment.{ek_str}",
                         )
                     else:
-                        resolved_env[ek_str] = ev
-                out_svc["environment"] = resolved_env
+                        explicit_env[ek_str] = ev
             elif isinstance(env_section, list):
-                resolved_list: list[str] = []
                 for item in env_section:
                     item_str = str(item)
-                    k = item_str.split("=", 1)[0].strip()
+                    if "=" not in item_str:
+                        raise BridgeRequestError(
+                            400, f'Compose environment entry "{item_str}" must be KEY=VALUE.'
+                        )
+                    k, v = item_str.split("=", 1)
+                    k = k.strip()
                     if k in DISALLOWED_ENV_EXACT or k.startswith(
                         DISALLOWED_ENV_PREFIXES
                     ):
                         raise BridgeRequestError(
                             400, f'Forbidden Compose environment key "{k}".'
                         )
-                    resolved_list.append(
-                        _resolve_allowed_vars(
-                            item_str,
-                            vars_ctx,
-                            ALLOWED_ENV_INTERPOLATION_VARS,
-                            f"{svc_key}.environment",
-                        )
+                    explicit_env[k] = _resolve_allowed_vars(
+                        v,
+                        vars_ctx,
+                        ALLOWED_ENV_INTERPOLATION_VARS,
+                        f"{svc_key}.environment.{k}",
                     )
-                out_svc["environment"] = resolved_list
             else:
                 raise BridgeRequestError(
                     400, "environment must be a mapping or list."
                 )
+
+        if uses_app_env_file or explicit_env:
+            merged_env: dict[str, Any] = {}
+            if uses_app_env_file:
+                merged_env.update(env_map)
+            merged_env.update(explicit_env)
+            out_svc["environment"] = merged_env
 
         if "volumes" in svc_cfg:
             vols = svc_cfg["volumes"]
@@ -1741,6 +1763,7 @@ class RuntimeService:
         allow_unauthenticated: bool = False,
         status_deadline_s: float = DEFAULT_STATUS_DEADLINE_S,
         dns_resolver: DnsResolver | None = None,
+        tls_checker: TlsChecker | None = None,
     ) -> None:
         if not CONTAINER_NAME_PATTERN.match(caddy_container):
             raise ValueError(f"Invalid caddy container name: {caddy_container}")
@@ -1765,6 +1788,7 @@ class RuntimeService:
         self.allow_unauthenticated = allow_unauthenticated
         self.status_deadline_s = max(0.2, float(status_deadline_s))
         self.dns_resolver = dns_resolver
+        self.tls_checker = tls_checker or default_tls_checker
         self._locks_guard = threading.Lock()
         self._slug_locks: dict[str, _SlugLockEntry] = {}
         self._caddy_lock = threading.Lock()
@@ -1817,19 +1841,12 @@ class RuntimeService:
         tmp_dir = tempfile.mkdtemp(prefix=f"vpsagent-{slug}-")
         os.chmod(tmp_dir, 0o700)
         try:
-            tmp_env_path: str | None = None
-            if env_text is not None:
-                tmp_env_path = os.path.join(tmp_dir, "app.env")
-                with open(tmp_env_path, "w", encoding="utf-8") as fh:
-                    fh.write(env_text)
-                os.chmod(tmp_env_path, 0o600)
-
             rendered_doc = validate_and_render_compose(
                 compose_text,
                 slug,
                 app_dir,
                 env_map,
-                tmp_env_path,
+                None,
                 prepare_volumes=prepare_volumes,
             )
             tmp_compose_path = os.path.join(tmp_dir, "docker-compose.json")
@@ -2312,12 +2329,35 @@ class RuntimeService:
                     500, f"Failed updating core Caddy domain: {exc}"
                 ) from exc
 
+            if domain is None:
+                return {
+                    "ok": True,
+                    "domain": None,
+                    "acmeEmail": None,
+                    "httpsActive": False,
+                    "tlsStatus": "inactive",
+                    "tlsError": None,
+                }
+
+            https_active, tls_status, tls_error = self.tls_checker(domain, 4.0)
             return {
                 "ok": True,
                 "domain": domain,
                 "acmeEmail": acme_email,
-                "httpsActive": domain is not None,
+                "httpsActive": https_active,
+                "tlsStatus": tls_status,
+                "tlsError": tls_error,
             }
+
+    def check_core_tls(self, payload: dict[str, Any]) -> dict[str, Any]:
+        domain = validate_domain(payload.get("domain"))
+        https_active, tls_status, tls_error = self.tls_checker(domain, 4.0)
+        return {
+            "domain": domain,
+            "httpsActive": https_active,
+            "tlsStatus": tls_status,
+            "tlsError": tls_error,
+        }
 
     def route_caddy(self, payload: dict[str, Any]) -> dict[str, Any]:
         slug = validate_slug(payload.get("slug"))
@@ -2591,7 +2631,10 @@ class RuntimeService:
         def _budget(default_s: float) -> float:
             if deadline is None:
                 return default_s
-            return max(0.05, min(default_s, deadline - time.monotonic()))
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise BridgeRequestError(504, "Readiness timeout budget exhausted.")
+            return min(default_s, rem)
 
         app_dir = resolve_scoped_app_dir(self.apps_root, slug, require_exists=False)
         workspace_exists = os.path.isdir(app_dir)
@@ -2981,6 +3024,21 @@ class RuntimeService:
                 c.get("healthStatus") == "starting" for c in containers
             )
 
+            # Strictly check remaining deadline AFTER inspection and BEFORE any success return!
+            remaining_after = deadline - time.monotonic()
+            if remaining_after <= 0:
+                return {
+                    "ready": False,
+                    "slug": slug,
+                    "status": last_status,
+                    "attempts": attempts,
+                    "elapsedMs": round((time.monotonic() - t0) * 1000, 1),
+                    "httpProbe": last_probe,
+                    "reason": redact_secrets(
+                        f'Timed out waiting for "{slug}" on port {internal_port}: readiness deadline ({timeout_s}s) exceeded during inspection.'
+                    ),
+                }
+
             if last_status != "running" or any_unhealthy:
                 reason = (
                     f'Container for "{slug}" failed readiness check '
@@ -3150,6 +3208,8 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(200, service.route_caddy(payload))
                 elif self.path == "/v1/core/route-domain":
                     self._send_json(200, service.route_core_domain(payload))
+                elif self.path == "/v1/core/tls-check":
+                    self._send_json(200, service.check_core_tls(payload))
                 elif self.path == "/v1/apps/remove":
                     self._send_json(200, service.remove_workload(payload))
                 elif self.path == "/v1/apps/statuses":

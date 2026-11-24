@@ -3,6 +3,8 @@ export interface SetupState {
   domain: string | null;
   acmeEmail: string | null;
   httpsActive: boolean;
+  tlsStatus: "inactive" | "pending" | "active" | "failed";
+  tlsError: string | null;
   claimedAt: string | null;
 }
 
@@ -114,6 +116,7 @@ export interface McpTokenRecord {
 
 export interface McpSnippets {
   mcpUrl: string;
+  httpsReady: boolean;
   claudeCode: string;
   cursor: string;
   codex: string;
@@ -188,6 +191,10 @@ export const api = {
     apiFetch<{ ok: true; setup: SetupState }>("/api/setup/domain", {
       method: "POST",
       body: JSON.stringify({ domain, acmeEmail }),
+    }),
+  recheckTls: () =>
+    apiFetch<{ ok: true; setup: SetupState }>("/api/setup/tls-recheck", {
+      method: "POST",
     }),
   login: (passphrase: string) =>
     apiFetch<{ ok: true; setup: SetupState }>("/api/auth/login", {

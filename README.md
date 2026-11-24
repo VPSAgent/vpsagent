@@ -2,21 +2,37 @@
 
 **Give your AI agent a $5 VPS, safely.**
 
-VPSAgent is a lightweight, self-hosted control plane and **Remote MCP Gateway** for Ubuntu VPSs. Install it with one command, paste a scoped key into Claude Code, Cursor, Codex, or your personal AI agent, and let your AI deploy and manage isolated apps—without ever handing it root SSH keys or `/var/run/docker.sock`.
+VPSAgent is a lightweight, self-hosted control plane and **Remote MCP Gateway** for Ubuntu VPSs. Install it once, paste a scoped key into Claude Code, Cursor, Codex, or your personal AI agent, and let your AI deploy and manage isolated apps—without ever handing it root SSH keys or `/var/run/docker.sock`.
 
-## One-Command Ubuntu LTS Install
+## Ubuntu LTS Install
 
-With a domain pointed at your server's IP (automatic `https://` from boot):
+### Option A — Authenticated Checkout (Works for Private or Public Repos)
+
+Clone the repository onto your Ubuntu server (using your SSH deploy key or GitHub token) and run the local installer:
+
+```bash
+git clone git@github.com:VPSAgent/vpsagent.git /opt/vpsagent
+sudo bash /opt/vpsagent/bootstrap/install.sh --domain vps.yourdomain.com --email you@yourdomain.com
+```
+
+Or install without a domain yet (uses a private SSH tunnel on `127.0.0.1:3002` so passwords never travel over plaintext HTTP, then lets you bind your domain in Step 2):
+
+```bash
+git clone git@github.com:VPSAgent/vpsagent.git /opt/vpsagent
+sudo bash /opt/vpsagent/bootstrap/install.sh
+```
+
+### Option B — One-Line Public / Release Install (Public Repo Only)
+
+When installing from a public repository or release mirror:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/VPSAgent/vpsagent/main/bootstrap/install.sh | sudo bash -s -- --domain vps.yourdomain.com --email you@yourdomain.com
 ```
 
-Without a domain yet (uses a private SSH tunnel so passwords never travel over plaintext HTTP, then lets you bind your domain in Step 2):
+### Upgrading an Existing Install
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/VPSAgent/vpsagent/main/bootstrap/install.sh | sudo bash
-```
+Re-run `sudo bash /opt/vpsagent/bootstrap/install.sh` after pulling the latest code. Your existing secrets, database, apps, and sessions are preserved, and the installer automatically restarts and health-checks `vpsagent-runtime.service` before rebuilding `vpsagent-core`.
 
 ## Core Pillars
 

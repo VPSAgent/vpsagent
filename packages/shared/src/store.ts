@@ -115,6 +115,8 @@ const DEFAULT_SETUP_STATE: SetupState = {
   domain: null,
   acmeEmail: null,
   httpsActive: false,
+  tlsStatus: "inactive",
+  tlsError: null,
   claimedAt: null,
 };
 

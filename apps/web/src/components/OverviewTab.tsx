@@ -233,13 +233,23 @@ export function OverviewTab({
               active AI visitor pass{data.activeMcpTokens === 1 ? "" : "es"}.
             </p>
             <p className="text-xs text-slate-400 mt-2">
-              {data.setup.domain && data.setup.httpsActive ? (
+              {data.setup.domain &&
+              data.setup.httpsActive &&
+              data.setup.tlsStatus === "active" ? (
                 <>
-                  Protected with automatic HTTPS at{" "}
+                  Protected with verified automatic HTTPS at{" "}
                   <code className="text-emerald-300">
                     https://{data.setup.domain}/mcp
                   </code>
                 </>
+              ) : data.setup.domain ? (
+                <span className="text-amber-300">
+                  HTTPS certificate for{" "}
+                  <code className="text-amber-200">{data.setup.domain}</code> is{" "}
+                  <strong>{data.setup.tlsStatus}</strong>
+                  {data.setup.tlsError ? ` (${data.setup.tlsError})` : ""}. Keep
+                  using your local SSH tunnel until DNS and HTTPS verify.
+                </span>
               ) : (
                 "Connect a domain in AI Keys & Settings to turn on remote HTTPS access in Caddy for Claude Code, Cursor, or Codex."
               )}
