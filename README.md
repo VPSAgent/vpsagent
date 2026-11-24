@@ -6,20 +6,20 @@ VPSAgent is a lightweight, self-hosted control plane and **Remote MCP Gateway** 
 
 ## Ubuntu LTS Install
 
-### Option A — Authenticated Checkout (Works for Private or Public Repos)
+### Option A — Authenticated Checkout (Works for Private or Public Repos, Standard Ubuntu User)
 
-Clone the repository onto your Ubuntu server (using your SSH deploy key or GitHub token) and run the local installer:
+Clone the repository into your user home directory (using your existing SSH key or GitHub credentials), then run the local installer with `sudo`:
 
 ```bash
-git clone git@github.com:VPSAgent/vpsagent.git /opt/vpsagent
-sudo bash /opt/vpsagent/bootstrap/install.sh --domain vps.yourdomain.com --email you@yourdomain.com
+git clone git@github.com:VPSAgent/vpsagent.git "$HOME/vpsagent"
+sudo bash "$HOME/vpsagent/bootstrap/install.sh" --domain vps.yourdomain.com --email you@yourdomain.com
 ```
 
 Or install without a domain yet (uses a private SSH tunnel on `127.0.0.1:3002` so passwords never travel over plaintext HTTP, then lets you bind your domain in Step 2):
 
 ```bash
-git clone git@github.com:VPSAgent/vpsagent.git /opt/vpsagent
-sudo bash /opt/vpsagent/bootstrap/install.sh
+git clone git@github.com:VPSAgent/vpsagent.git "$HOME/vpsagent"
+sudo bash "$HOME/vpsagent/bootstrap/install.sh"
 ```
 
 ### Option B — One-Line Public / Release Install (Public Repo Only)
@@ -32,7 +32,14 @@ curl -fsSL https://raw.githubusercontent.com/VPSAgent/vpsagent/main/bootstrap/in
 
 ### Upgrading an Existing Install
 
-Re-run `sudo bash /opt/vpsagent/bootstrap/install.sh` after pulling the latest code. Your existing secrets, database, apps, and sessions are preserved, and the installer automatically restarts and health-checks `vpsagent-runtime.service` before rebuilding `vpsagent-core`.
+Pull the latest code in your checkout and re-run the installer:
+
+```bash
+git -C "$HOME/vpsagent" pull --ff-only
+sudo bash "$HOME/vpsagent/bootstrap/install.sh"
+```
+
+Your existing secrets, database, apps, and sessions are preserved, and the installer automatically restarts and health-checks `vpsagent-runtime.service` before rebuilding `vpsagent-core`.
 
 ## Core Pillars
 

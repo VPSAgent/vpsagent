@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # VPSAgent v2 — Lean One-Command Ubuntu LTS Installer
-# Usage (from an authenticated clone — recommended for private repositories):
-#   git clone https://github.com/VPSAgent/vpsagent.git /opt/vpsagent
-#   sudo bash /opt/vpsagent/bootstrap/install.sh [--domain vps.yourdomain.com --email you@yourdomain.com]
+# Usage (from an authenticated clone as a standard Ubuntu user — works for private repos):
+#   git clone git@github.com:VPSAgent/vpsagent.git "$HOME/vpsagent"
+#   sudo bash "$HOME/vpsagent/bootstrap/install.sh" [--domain vps.yourdomain.com --email you@yourdomain.com]
 # Usage (when repository or release asset is public):
 #   curl -fsSL https://raw.githubusercontent.com/VPSAgent/vpsagent/main/bootstrap/install.sh | sudo bash
 
@@ -267,12 +267,13 @@ EOF
 wait_for_runtime_bridge() {
   local sock="${VPSAGENT_ROOT}/run/runtime.sock"
   log "Verifying restarted host Runtime Bridge health on ${sock}..."
-  local attempt
-  for attempt in $(seq 1 30); do
+  local tries=0
+  while (( tries < 30 )); do
     if [[ -S "${sock}" ]] && curl --unix-socket "${sock}" -fsS --max-time 2 http://localhost/health | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
       log "Host Runtime Bridge is healthy and accepting requests."
       return 0
     fi
+    tries=$((tries + 1))
     sleep 0.5
   done
   echo "Error: host Runtime Bridge did not become healthy on ${sock} after restart." >&2

@@ -34,7 +34,7 @@ const MAX_MCP_LOG_REPLY_BYTES = 48 * 1024;
 
 const JsonRpcRequestSchema = z.object({
   jsonrpc: z.literal("2.0"),
-  id: z.union([z.string(), z.number(), z.null()]).optional(),
+  id: z.union([z.string().max(256), z.number().finite(), z.null()]).optional(),
   method: z.string().min(1),
   params: z.record(z.string(), z.unknown()).optional(),
 });
@@ -362,9 +362,15 @@ function budgetWireLogsResponse(
       charHi = mid - 1;
     }
   }
+  const finalLines = charLo > 0 ? [`${newest.slice(0, charLo)}...`] : [];
+  if (measureWireBytes(finalLines, true) > maxWireBytes) {
+    throw new Error(
+      `Log response envelope exceeds maximum allowed wire budget (${maxWireBytes} bytes).`,
+    );
+  }
   return {
     slug,
-    lines: charLo > 0 ? [`${newest.slice(0, charLo)}...`] : [],
+    lines: finalLines,
     truncated: true,
   };
 }

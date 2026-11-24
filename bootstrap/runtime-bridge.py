@@ -3024,21 +3024,6 @@ class RuntimeService:
                 c.get("healthStatus") == "starting" for c in containers
             )
 
-            # Strictly check remaining deadline AFTER inspection and BEFORE any success return!
-            remaining_after = deadline - time.monotonic()
-            if remaining_after <= 0:
-                return {
-                    "ready": False,
-                    "slug": slug,
-                    "status": last_status,
-                    "attempts": attempts,
-                    "elapsedMs": round((time.monotonic() - t0) * 1000, 1),
-                    "httpProbe": last_probe,
-                    "reason": redact_secrets(
-                        f'Timed out waiting for "{slug}" on port {internal_port}: readiness deadline ({timeout_s}s) exceeded during inspection.'
-                    ),
-                }
-
             if last_status != "running" or any_unhealthy:
                 reason = (
                     f'Container for "{slug}" failed readiness check '
@@ -3054,41 +3039,33 @@ class RuntimeService:
                     "reason": reason,
                 }
 
+            candidate_ready = False
             if any_starting:
                 last_reason = "Waiting for container health check to finish starting."
             elif not probe_http:
-                return {
-                    "ready": True,
-                    "slug": slug,
-                    "status": last_status,
-                    "attempts": attempts,
-                    "elapsedMs": round((time.monotonic() - t0) * 1000, 1),
-                    "httpProbe": None,
-                    "reason": None,
-                }
+                candidate_ready = True
             elif isinstance(last_probe, dict) and last_probe.get("attempted"):
                 code = last_probe.get("statusCode")
                 if last_probe.get("ok") or (
                     isinstance(code, int) and 100 <= code < 500
                 ):
-                    return {
-                        "ready": True,
-                        "slug": slug,
-                        "status": last_status,
-                        "attempts": attempts,
-                        "elapsedMs": round((time.monotonic() - t0) * 1000, 1),
-                        "httpProbe": last_probe,
-                        "reason": None,
-                    }
-                if last_probe.get("error"):
+                    candidate_ready = True
+                elif last_probe.get("error"):
                     last_reason = f"HTTP probe error: {last_probe['error']}"
                 else:
                     last_reason = f"HTTP probe returned status {code}."
             elif isinstance(last_probe, dict) and last_probe.get("error"):
                 last_reason = str(last_probe["error"])
 
+            # Strictly check remaining deadline AFTER inspection and BEFORE any success return,
+            # while preserving any more specific diagnostic (e.g. still starting / probe error).
             remaining_after = deadline - time.monotonic()
             if remaining_after <= 0:
+                timeout_detail = (
+                    f"readiness deadline ({timeout_s}s) exceeded during inspection."
+                    if candidate_ready
+                    else last_reason
+                )
                 return {
                     "ready": False,
                     "slug": slug,
@@ -3097,9 +3074,21 @@ class RuntimeService:
                     "elapsedMs": round((time.monotonic() - t0) * 1000, 1),
                     "httpProbe": last_probe,
                     "reason": redact_secrets(
-                        f'Timed out waiting for "{slug}" on port {internal_port}: {last_reason}'
+                        f'Timed out waiting for "{slug}" on port {internal_port}: {timeout_detail}'
                     ),
                 }
+
+            if candidate_ready:
+                return {
+                    "ready": True,
+                    "slug": slug,
+                    "status": last_status,
+                    "attempts": attempts,
+                    "elapsedMs": round((time.monotonic() - t0) * 1000, 1),
+                    "httpProbe": last_probe if probe_http else None,
+                    "reason": None,
+                }
+
             time.sleep(min(poll_s, remaining_after))
 
 

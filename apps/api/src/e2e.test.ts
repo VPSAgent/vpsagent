@@ -577,6 +577,15 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       );
       expect(badProtoHeader.status).toBe(400);
 
+      // Oversized JSON-RPC id is rejected with 400 so log envelope can never exceed 48 KiB
+      const hugeIdRes = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: "x".repeat(50_000),
+        method: "tools/call",
+        params: { name: "get_app_logs", arguments: { slug: "shop-api" } },
+      });
+      expect(hugeIdRes.status).toBe(400);
+
       // 6. Read-only key cannot deploy or queue approvals
       const blockedDeploy = await postMcp(readOnly.rawToken, {
         jsonrpc: "2.0",

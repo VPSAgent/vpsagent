@@ -584,17 +584,28 @@ sys.exit(0)
         self.assertTrue(healthy_worker["ready"])
         self.assertIsNone(healthy_worker["httpProbe"])
 
-        # 4. Delayed inspection that exceeds timeoutSeconds MUST return ready=False (never ready=True past deadline!)
+        # 4. Delayed inspection that exceeds timeoutSeconds MUST return ready=False (never ready=True past deadline!),
+        # AND a still-starting container preserves its "starting" diagnostic even when the deadline expires mid-inspect.
         from unittest import mock
 
         def slow_inspect(payload: dict, *, timeout_budget_s: float | None = None) -> dict:
             import time as _t
-            _t.sleep(0.16)
+            _t.sleep(0.14)
             return {
                 "slug": "noisy-app",
                 "status": "running",
                 "containers": [{"healthStatus": "healthy"}],
                 "httpProbe": {"attempted": True, "ok": True, "statusCode": 200, "error": None},
+            }
+
+        def slow_starting_inspect(payload: dict, *, timeout_budget_s: float | None = None) -> dict:
+            import time as _t
+            _t.sleep(0.14)
+            return {
+                "slug": "noisy-app",
+                "status": "running",
+                "containers": [{"healthStatus": "starting"}],
+                "httpProbe": None,
             }
 
         with mock.patch.object(svc, "inspect_workload", side_effect=slow_inspect):
@@ -603,6 +614,13 @@ sys.exit(0)
             )
             self.assertFalse(overdue["ready"])
             self.assertIn("deadline", overdue["reason"])
+
+        with mock.patch.object(svc, "inspect_workload", side_effect=slow_starting_inspect):
+            overdue_starting = svc.check_readiness(
+                {"slug": "noisy-app", "internalPort": 8080, "probeHttp": False, "timeoutSeconds": 0.1, "pollIntervalMs": 20}
+            )
+            self.assertFalse(overdue_starting["ready"])
+            self.assertIn("starting", overdue_starting["reason"])
 
 
 if __name__ == "__main__":

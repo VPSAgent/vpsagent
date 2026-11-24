@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -47,6 +48,33 @@ describe("Locked Apartment Blueprint generator", () => {
     expect(bp.envFile).toContain("APP_SLUG='hello-web'");
     expect(bp.envFile).toContain("APP_PORT='8080'");
     expect(bp.envFile).toContain("PORT='8080'");
+
+    // Recurring HTTP healthcheck safely quotes special path characters like `/health(v2)`
+    // and never fakes success via TCP-only `nc` or `exit 0`
+    const specialProbeBp = generateApartmentBlueprint({
+      slug: "probe-app",
+      sourceType: "image",
+      image: "nginxinc/nginx-unprivileged:alpine",
+      internalPort: 8080,
+      probeHttp: true,
+      probePath: "/health(v2)",
+    });
+    expect(specialProbeBp.composeYaml).toContain(
+      "'http://127.0.0.1:8080/health(v2)'",
+    );
+    expect(specialProbeBp.composeYaml).not.toContain("nc -z");
+    expect(specialProbeBp.composeYaml).not.toContain("else exit 0");
+    const testLine = specialProbeBp.composeYaml
+      .split("\n")
+      .find((l) => l.trim().startsWith("test:"));
+    expect(testLine).toBeDefined();
+    const parsedCmd = JSON.parse(testLine!.split("test:")[1]!.trim()) as [
+      string,
+      string,
+    ];
+    expect(parsedCmd[0]).toBe("CMD-SHELL");
+    // Validate POSIX /bin/sh syntax directly!
+    execFileSync("sh", ["-n", "-c", parsedCmd[1]]);
   });
 
   it("generates a Git Dockerfile blueprint with isolated Postgres and Redis companions", () => {
