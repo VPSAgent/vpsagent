@@ -712,22 +712,75 @@ export function AppsTab({ apps, onRefresh }: AppsTabProps) {
                     ) : (
                       <div className="space-y-2 text-xs">
                         {inspectData ? (
-                          <div className="flex flex-wrap items-center gap-3">
-                            <span
-                              className={`rounded-full px-3 py-1 font-semibold ${
-                                inspectData.lockedApartmentCompliant
-                                  ? "bg-emerald-500/15 text-emerald-300"
-                                  : "bg-rose-500/15 text-rose-300"
-                              }`}
-                            >
-                              {inspectData.lockedApartmentCompliant
-                                ? "Locked Apartment Verified"
-                                : "Safety Warning — Check Config"}
-                            </span>
-                            <span className="text-slate-400">
-                              Containers: {inspectData.containers.length} &middot;
-                              Status: {inspectData.status}
-                            </span>
+                          <div className="space-y-2">
+                            <div className="flex flex-wrap items-center gap-3">
+                              <span
+                                className={`rounded-full px-3 py-1 font-semibold ${
+                                  inspectData.lockedApartmentCompliant
+                                    ? "bg-emerald-500/15 text-emerald-300"
+                                    : "bg-rose-500/15 text-rose-300"
+                                }`}
+                              >
+                                {inspectData.lockedApartmentCompliant
+                                  ? "Locked Apartment Verified"
+                                  : "Safety Warning — Check Config"}
+                              </span>
+                              <span className="text-slate-400">
+                                Containers: {inspectData.containers.length}{" "}
+                                &middot; Overall Status:{" "}
+                                <span
+                                  className={
+                                    inspectData.status === "running"
+                                      ? "text-emerald-300 font-semibold"
+                                      : inspectData.status === "error"
+                                        ? "text-rose-300 font-semibold"
+                                        : "text-slate-200 font-semibold"
+                                  }
+                                >
+                                  {inspectData.status}
+                                </span>
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-4 text-slate-400">
+                              <span>
+                                Docker Liveness:{" "}
+                                <span className="font-mono text-slate-200">
+                                  {inspectData.containers[0]?.healthStatus ??
+                                    "none"}
+                                </span>
+                              </span>
+                              <span>
+                                Host HTTP Check:{" "}
+                                <span
+                                  className={`font-mono ${
+                                    inspectData.hostHttpHealth?.status ===
+                                      "unhealthy" ||
+                                    (inspectData.httpProbe?.attempted &&
+                                      !inspectData.httpProbe.ok)
+                                      ? "text-rose-300"
+                                      : inspectData.hostHttpHealth?.status ===
+                                            "healthy" ||
+                                          inspectData.httpProbe?.ok
+                                        ? "text-emerald-300"
+                                        : "text-slate-200"
+                                  }`}
+                                >
+                                  {inspectData.hostHttpHealth?.status ??
+                                    (inspectData.httpProbe?.attempted
+                                      ? inspectData.httpProbe.ok
+                                        ? "healthy"
+                                        : "failing"
+                                      : "disabled")}
+                                  {inspectData.httpProbe?.attempted
+                                    ? inspectData.httpProbe.statusCode !== null
+                                      ? ` (HTTP ${inspectData.httpProbe.statusCode})`
+                                      : inspectData.httpProbe.error
+                                        ? ` (${inspectData.httpProbe.error})`
+                                        : ""
+                                    : ""}
+                                </span>
+                              </span>
+                            </div>
                           </div>
                         ) : (
                           <p className="text-slate-400">

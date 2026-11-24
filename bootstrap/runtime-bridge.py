@@ -1837,6 +1837,17 @@ class RuntimeService:
             entry = self._host_health.get(slug)
             return dict(entry) if entry is not None else None
 
+    def _resolve_overall_status(self, slug: str, docker_status: str) -> str:
+        """
+        Single source of truth for overall app status shared by the Apps list
+        (`/v1/apps/statuses`), lifecycle status, and Safety Check (`/v1/apps/inspect`).
+        """
+        if docker_status == "running":
+            host_health = self._get_host_health(slug)
+            if host_health is not None and host_health.get("status") == "unhealthy":
+                return "error"
+        return docker_status
+
     def _record_host_health(
         self, slug: str, probe_path: str, probe_result: dict[str, Any]
     ) -> dict[str, Any]:
@@ -2174,10 +2185,8 @@ class RuntimeService:
                     self._run_docker([*base, "restart"], timeout=90)
 
                 status = self._compose_status(slug, project_dir, compose_path)
-                if action == "status" and status == "running":
-                    host_health = self._get_host_health(slug)
-                    if host_health is not None and host_health.get("status") == "unhealthy":
-                        status = "error"
+                if action == "status":
+                    status = self._resolve_overall_status(slug, status)
                 return {
                     "slug": slug,
                     "status": status,
@@ -2726,14 +2735,7 @@ class RuntimeService:
                 project_dir,
             ):
                 status = self._compose_status(slug, project_dir, validated_compose)
-                if status == "running":
-                    host_health = self._get_host_health(slug)
-                    if (
-                        host_health is not None
-                        and host_health.get("status") == "unhealthy"
-                    ):
-                        return slug, "error"
-                return slug, status
+                return slug, self._resolve_overall_status(slug, status)
         except BridgeRequestError:
             return slug, "error"
 
@@ -3095,50 +3097,45 @@ class RuntimeService:
                     "error": "Container is not running or has no bridge IP.",
                 }
 
-        # When the app image does not define an in-container Docker HEALTHCHECK,
-        # surface VPSAgent's host-driven HTTP probe / recurring monitor status so
-        # minimal/distroless/scratch images still report accurate health.
-        if (
-            _apply_host_health
-            and target_container is not None
-            and target_container["healthStatus"] == "none"
-        ):
-            host_health = self._get_host_health(slug)
-            live_ok = (
-                probe_http
-                and isinstance(http_probe, dict)
-                and bool(http_probe.get("attempted"))
-                and (
+        # Keep Docker container liveness (`containers[i].healthStatus`) separate from
+        # VPSAgent's host HTTP check (`hostHttpHealth` + `httpProbe`), while applying
+        # the exact same overall status rule used by `/v1/apps/statuses` so the Apps
+        # list and Safety Check never disagree.
+        host_http_health: dict[str, Any] | None = None
+        if _apply_host_health:
+            cached_host_health = self._get_host_health(slug)
+            if cached_host_health is not None:
+                host_http_health = {
+                    "status": str(cached_host_health.get("status") or "none"),
+                    "consecutiveFailures": int(
+                        cached_host_health.get("consecutiveFailures") or 0
+                    ),
+                    "lastOutput": cached_host_health.get("lastOutput"),
+                }
+            elif probe_http and isinstance(http_probe, dict):
+                code = http_probe.get("statusCode")
+                live_ok = bool(http_probe.get("attempted")) and (
                     bool(http_probe.get("ok"))
-                    or (
-                        isinstance(http_probe.get("statusCode"), int)
-                        and 100 <= http_probe["statusCode"] < 500
-                    )
+                    or (isinstance(code, int) and 100 <= code < 500)
                 )
-            )
-            if live_ok and http_probe is not None:
-                target_container["healthStatus"] = "healthy"
-                target_container["lastHealthOutput"] = redact_secrets(
-                    f"Host HTTP probe GET {probe_path} -> {http_probe.get('statusCode')}"
-                )[:300]
-            elif host_health is not None and host_health.get("status") in (
-                "healthy",
-                "unhealthy",
-            ):
-                target_container["healthStatus"] = str(host_health["status"])
-                target_container["lastHealthOutput"] = host_health.get("lastOutput")
-                status = derive_app_status(
-                    [
-                        {
-                            "State": c["state"],
-                            "Health": ""
-                            if c["healthStatus"] == "none"
-                            else c["healthStatus"],
-                            "ExitCode": c["exitCode"],
-                        }
-                        for c in containers
-                    ]
-                )
+                if live_ok:
+                    host_http_health = {
+                        "status": "healthy",
+                        "consecutiveFailures": 0,
+                        "lastOutput": redact_secrets(
+                            f"Host HTTP probe GET {probe_path} -> {code}"
+                        )[:300],
+                    }
+                else:
+                    detail = http_probe.get("error") or f"HTTP {code}"
+                    host_http_health = {
+                        "status": "starting",
+                        "consecutiveFailures": 1,
+                        "lastOutput": redact_secrets(
+                            f"Host HTTP probe GET {probe_path} failed: {detail}"
+                        )[:300],
+                    }
+            status = self._resolve_overall_status(slug, status)
 
         return {
             "slug": slug,
@@ -3150,6 +3147,7 @@ class RuntimeService:
             "containers": containers,
             "lockedApartmentCompliant": locked_apartment_compliant,
             "httpProbe": http_probe,
+            "hostHttpHealth": host_http_health,
         }
 
     def check_readiness(self, payload: dict[str, Any]) -> dict[str, Any]:

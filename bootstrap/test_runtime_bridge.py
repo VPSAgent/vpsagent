@@ -734,8 +734,9 @@ sys.exit(0)
                 }
             )
             self.assertEqual(inspected_ok["status"], "running")
-            self.assertEqual(inspected_ok["containers"][0]["healthStatus"], "healthy")
-            self.assertIn("/health(v2)", inspected_ok["containers"][0]["lastHealthOutput"])
+            self.assertEqual(inspected_ok["containers"][0]["healthStatus"], "none")
+            self.assertEqual(inspected_ok["hostHttpHealth"]["status"], "healthy")
+            self.assertIn("/health(v2)", inspected_ok["hostHttpHealth"]["lastOutput"])
 
             # 2. Recurring host health monitor detects 3 consecutive HTTP 500s -> marks unhealthy/error
             state["status"] = 500
@@ -758,7 +759,8 @@ sys.exit(0)
                 }
             )
             self.assertEqual(inspected_bad["status"], "error")
-            self.assertEqual(inspected_bad["containers"][0]["healthStatus"], "unhealthy")
+            self.assertEqual(inspected_bad["containers"][0]["healthStatus"], "none")
+            self.assertEqual(inspected_bad["hostHttpHealth"]["status"], "unhealthy")
 
             # 3. Initial deploy readiness of a broken minimal image returning 500 NEVER falsely succeeds
             broken_ready = svc.check_readiness(
@@ -780,6 +782,149 @@ sys.exit(0)
             self.assertEqual(r_ok["status"], "healthy")
             self.assertEqual(r_ok["consecutiveFailures"], 0)
             self.assertEqual(svc.statuses({"slugs": ["mini-http"]})["statuses"]["mini-http"], "running")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_docker_healthy_vs_host_http_three_failures_and_recovery(self) -> None:
+        """
+        When an image has its own Docker liveness check reporting 'healthy' while
+        VPSAgent's host HTTP check fails 3 times, both `/v1/apps/statuses` (Apps list)
+        and `/v1/apps/inspect` (Safety Check) must agree on overall status='error',
+        while reporting Docker liveness ('healthy') separately from host HTTP health
+        ('unhealthy'), and both must recover together when HTTP 200 returns.
+        """
+        app_dir = os.path.join(self.apps_root, "dual-check")
+        os.makedirs(app_dir, exist_ok=True)
+        Path(os.path.join(app_dir, "docker-compose.yml")).write_text(
+            'services:\n  app:\n    image: "nginx:alpine"\n    cpus: "0.5"\n    mem_limit: "128m"\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    networks:\n      - app_net\nnetworks:\n  app_net:\n    driver: bridge\n',
+            encoding="utf-8",
+        )
+
+        http_state = {"status": 200}
+
+        class _DualHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                code = http_state["status"]
+                body = b"ok" if code == 200 else b"fail"
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _DualHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            Path(os.path.join(app_dir, "probe.json")).write_text(
+                json.dumps(
+                    {
+                        "probeHttp": True,
+                        "internalPort": port,
+                        "probePath": "/health(v2)",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            docker_py = os.path.join(self.tmp, "dual_docker.py")
+            with open(docker_py, "w", encoding="utf-8") as fh:
+                fh.write(
+                    """import json, sys
+args = sys.argv[1:]
+if "ps" in args and "--format" in args and "json" in args:
+    print(json.dumps([{"State": "running", "Health": "healthy", "ExitCode": 0}]))
+    sys.exit(0)
+if args[:1] == ["ps"]:
+    print("cid-dual")
+    sys.exit(0)
+if args[:1] == ["inspect"]:
+    print(json.dumps([{
+        "Id": "fedcba0987654321",
+        "Name": "/vpsagent-app-dual-check",
+        "RestartCount": 0,
+        "Config": {"Image": "nginx:alpine"},
+        "State": {"Status": "running", "Running": True, "ExitCode": 0, "Health": {"Status": "healthy"}},
+        "HostConfig": {"CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges:true"], "Privileged": False, "Binds": []},
+        "Mounts": [],
+        "NetworkSettings": {"Networks": {"vpsagent-dual-check_app_net": {"IPAddress": "127.0.0.1"}}},
+    }]))
+    sys.exit(0)
+sys.exit(0)
+"""
+                )
+            docker_sh = os.path.join(self.tmp, "dual-docker")
+            with open(docker_sh, "w", encoding="utf-8") as fh:
+                fh.write(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n')
+            os.chmod(docker_sh, 0o755)
+
+            svc = rb.RuntimeService(
+                apps_root=self.apps_root,
+                caddy_apps_dir=self.caddy_dir,
+                caddy_container="vpsagent-caddy",
+                docker_bin=docker_sh,
+                runtime_token="secret-token-for-unit-test-1234",
+                health_retries=3,
+            )
+
+            # Healthy start: both Docker liveness and host HTTP agree on running/healthy
+            ready = svc.check_readiness(
+                {
+                    "slug": "dual-check",
+                    "internalPort": port,
+                    "probeHttp": True,
+                    "probePath": "/health(v2)",
+                    "timeoutSeconds": 2.0,
+                    "pollIntervalMs": 20,
+                }
+            )
+            self.assertTrue(ready["ready"])
+            self.assertEqual(svc.statuses({"slugs": ["dual-check"]})["statuses"]["dual-check"], "running")
+            ins_ok = svc.inspect_workload(
+                {"slug": "dual-check", "internalPort": port, "probeHttp": True, "probePath": "/health(v2)"}
+            )
+            self.assertEqual(ins_ok["status"], "running")
+            self.assertEqual(ins_ok["containers"][0]["healthStatus"], "healthy")
+            self.assertEqual(ins_ok["hostHttpHealth"]["status"], "healthy")
+            self.assertEqual(ins_ok["httpProbe"]["statusCode"], 200)
+
+            # Fail host HTTP 3 times while Docker liveness stays 'healthy'
+            http_state["status"] = 500
+            svc.run_recurring_health_check_once("dual-check")
+            svc.run_recurring_health_check_once("dual-check")
+            self.assertEqual(svc.statuses({"slugs": ["dual-check"]})["statuses"]["dual-check"], "running")
+            svc.run_recurring_health_check_once("dual-check")
+
+            # Both Apps list (`statuses`) and Safety Check (`inspect_workload`) MUST report 'error'
+            list_status = svc.statuses({"slugs": ["dual-check"]})["statuses"]["dual-check"]
+            ins_fail = svc.inspect_workload(
+                {"slug": "dual-check", "internalPort": port, "probeHttp": True, "probePath": "/health(v2)"}
+            )
+            self.assertEqual(list_status, "error")
+            self.assertEqual(ins_fail["status"], "error")
+            # Docker liveness and host HTTP health remain reported separately
+            self.assertEqual(ins_fail["containers"][0]["healthStatus"], "healthy")
+            self.assertEqual(ins_fail["hostHttpHealth"]["status"], "unhealthy")
+            self.assertEqual(ins_fail["hostHttpHealth"]["consecutiveFailures"], 3)
+            self.assertEqual(ins_fail["httpProbe"]["statusCode"], 500)
+
+            # Recover to HTTP 200: both Apps list and Safety Check recover together
+            http_state["status"] = 200
+            svc.run_recurring_health_check_once("dual-check")
+            list_recovered = svc.statuses({"slugs": ["dual-check"]})["statuses"]["dual-check"]
+            ins_recovered = svc.inspect_workload(
+                {"slug": "dual-check", "internalPort": port, "probeHttp": True, "probePath": "/health(v2)"}
+            )
+            self.assertEqual(list_recovered, "running")
+            self.assertEqual(ins_recovered["status"], "running")
+            self.assertEqual(ins_recovered["containers"][0]["healthStatus"], "healthy")
+            self.assertEqual(ins_recovered["hostHttpHealth"]["status"], "healthy")
+            self.assertEqual(ins_recovered["hostHttpHealth"]["consecutiveFailures"], 0)
+            self.assertEqual(ins_recovered["httpProbe"]["statusCode"], 200)
         finally:
             srv.shutdown()
             srv.server_close()

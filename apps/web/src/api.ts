@@ -128,6 +128,19 @@ export interface InspectResult {
   lockedApartmentCompliant: boolean;
   caddyRouteConfigured: boolean;
   caddyDomains: string[];
+  httpProbe?: {
+    attempted: boolean;
+    ok: boolean;
+    statusCode: number | null;
+    latencyMs: number | null;
+    contentType: string | null;
+    error: string | null;
+  } | null;
+  hostHttpHealth?: {
+    status: string;
+    consecutiveFailures: number;
+    lastOutput: string | null;
+  } | null;
   containers: Array<{
     id: string;
     name: string;
@@ -135,6 +148,7 @@ export interface InspectResult {
     state: string;
     running: boolean;
     healthStatus: string;
+    lastHealthOutput?: string | null;
     security: {
       capDropAll: boolean;
       noNewPrivileges: boolean;

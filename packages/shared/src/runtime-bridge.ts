@@ -151,6 +151,13 @@ export const HttpProbeResultSchema = z.object({
 });
 export type HttpProbeResult = z.infer<typeof HttpProbeResultSchema>;
 
+export const HostHttpHealthSchema = z.object({
+  status: z.enum(["healthy", "unhealthy", "starting", "none"]),
+  consecutiveFailures: z.number().int().nonnegative(),
+  lastOutput: z.string().nullable(),
+});
+export type HostHttpHealth = z.infer<typeof HostHttpHealthSchema>;
+
 export const RuntimeInspectResultSchema = z.object({
   slug: z.string(),
   status: AppStatusSchema,
@@ -161,6 +168,7 @@ export const RuntimeInspectResultSchema = z.object({
   containers: z.array(InspectedContainerSchema),
   lockedApartmentCompliant: z.boolean(),
   httpProbe: HttpProbeResultSchema.nullable(),
+  hostHttpHealth: HostHttpHealthSchema.nullable().optional(),
 });
 export type RuntimeInspectResult = z.infer<typeof RuntimeInspectResultSchema>;
 
