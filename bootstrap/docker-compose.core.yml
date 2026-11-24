@@ -1,0 +1,80 @@
+# VPSAgent v2 Core Stack (Control API + Remote MCP + 4-Tab Dashboard + Caddy Auto-TLS)
+# Zero Docker socket exposure: vpsagent-core mounts ONLY the permission-scoped Unix socket
+# served by the host `vpsagent-runtime` systemd daemon.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: vpsagent-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - VPSAGENT_SITE_ADDRESS=${VPSAGENT_SITE_ADDRESS:-:80}
+      - VPSAGENT_ACME_EMAIL=${VPSAGENT_ACME_EMAIL:-admin@example.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/apps.d:/etc/caddy/apps.d:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - vpsagent-core
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  vpsagent-core:
+    build:
+      context: ${VPSAGENT_REPO_DIR:-..}
+      dockerfile: bootstrap/Dockerfile
+      target: runtime
+    image: vpsagent/core:local
+    container_name: vpsagent-core
+    restart: unless-stopped
+    environment:
+      - PORT=3001
+      - VPSAGENT_DB_PATH=/var/lib/vpsagent/data/registry.db
+      - VPSAGENT_APPS_ROOT=/var/lib/vpsagent/apps
+      - VPSAGENT_WEB_DIST=/srv/vpsagent/apps/web/dist
+      - VPSAGENT_DOMAIN_CONFIG_FILE=/var/lib/vpsagent/config/domain.env
+      - VPSAGENT_RUNTIME_SOCKET=/run/vpsagent/runtime.sock
+      - VPSAGENT_RUNTIME_TOKEN=${VPSAGENT_RUNTIME_TOKEN:?VPSAGENT_RUNTIME_TOKEN must be set}
+      - VPSAGENT_SESSION_SECRET=${VPSAGENT_SESSION_SECRET:?VPSAGENT_SESSION_SECRET must be set}
+      - VPSAGENT_ENCRYPTION_SECRET=${VPSAGENT_ENCRYPTION_SECRET:?VPSAGENT_ENCRYPTION_SECRET must be set}
+      - VPSAGENT_CLAIM_TOKEN=${VPSAGENT_CLAIM_TOKEN:-}
+      - VPSAGENT_PUBLIC_IP=${VPSAGENT_PUBLIC_IP:-}
+      - VPSAGENT_TRUST_PROXY=true
+    volumes:
+      - ./data:/var/lib/vpsagent/data
+      - ./config:/var/lib/vpsagent/config
+      - ./apps:/var/lib/vpsagent/apps
+      - ./run:/run/vpsagent
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - vpsagent-core
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  vpsagent-core:
+    name: ${CORE_NETWORK:-vpsagent-core}
+    external: true

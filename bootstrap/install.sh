@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# VPSAgent v2 — Lean One-Command Ubuntu LTS Installer
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/diegosg-dev/vpsagent/main/bootstrap/install.sh | sudo bash
+#   sudo bash bootstrap/install.sh [--domain vps.yourdomain.com] [--email you@yourdomain.com] [--force]
+
+VPSAGENT_ROOT="${VPSAGENT_ROOT:-/var/lib/vpsagent}"
+VPSAGENT_REPO_URL="${VPSAGENT_REPO_URL:-https://github.com/diegosg-dev/vpsagent.git}"
+VPSAGENT_REPO_REF="${VPSAGENT_REPO_REF:-main}"
+VPSAGENT_REPO_DIR="${VPSAGENT_REPO_DIR:-/opt/vpsagent}"
+CORE_NETWORK="${CORE_NETWORK:-vpsagent-core}"
+
+export DEBIAN_FRONTEND="${DEBIAN_FRONTEND:-noninteractive}"
+export NEEDRESTART_MODE="${NEEDRESTART_MODE:-a}"
+
+FORCE_OVERWRITE="false"
+ARG_DOMAIN=""
+ARG_EMAIL=""
+
+SOURCE_PATH="${BASH_SOURCE[0]:-}"
+if [[ -n "${SOURCE_PATH}" && -f "${SOURCE_PATH}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "${SOURCE_PATH}")" && pwd)"
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+else
+  SCRIPT_DIR=""
+  REPO_ROOT=""
+fi
+
+log() {
+  printf '[vpsagent-install] %s\n' "$1"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --domain)
+        ARG_DOMAIN="${2:-}"
+        shift 2
+        ;;
+      --email)
+        ARG_EMAIL="${2:-}"
+        shift 2
+        ;;
+      --force)
+        FORCE_OVERWRITE="true"
+        shift
+        ;;
+      --help|-h)
+        cat <<'EOF'
+VPSAgent v2 — One-Command Ubuntu Installer
+
+Options:
+  --domain <host>   Optional dashboard domain for automatic HTTPS (e.g. vps.yourdomain.com)
+  --email <email>   Optional Let's Encrypt notice email
+  --force           Overwrite existing config and systemd unit files
+  --help, -h        Show this help text
+EOF
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Error: run this installer with sudo (as root)." >&2
+    exit 1
+  fi
+}
+
+require_ubuntu() {
+  if [[ ! -f /etc/os-release ]]; then
+    echo "Error: /etc/os-release not found." >&2
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  source /etc/os-release
+  if [[ "${ID:-}" != "ubuntu" ]]; then
+    echo "Error: Ubuntu LTS is required (detected: ${ID:-unknown})." >&2
+    exit 1
+  fi
+  log "Detected Ubuntu ${VERSION_ID:-unknown}"
+}
+
+ensure_packages() {
+  if ! command -v git >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+    log "Installing prerequisite packages (git, python3, curl, openssl, ufw)..."
+    apt-get update -y
+    apt-get install -y ca-certificates curl gnupg git python3 openssl ufw
+  fi
+}
+
+ensure_docker() {
+  if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+    log "Docker Engine and Compose v2 already installed."
+    return
+  fi
+  log "Installing Docker Engine and Docker Compose v2..."
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg
+  install -m 0755 -d /etc/apt/keyrings
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  chmod a+r /etc/apt/keyrings/docker.asc
+  # shellcheck source=/dev/null
+  source /etc/os-release
+  printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu %s stable\n' \
+    "$(dpkg --print-architecture)" "${VERSION_CODENAME}" > /etc/apt/sources.list.d/docker.list
+  apt-get update -y
+  apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  systemctl enable --now docker
+}
+
+ensure_repo_checkout() {
+  if [[ -n "${REPO_ROOT}" && -f "${REPO_ROOT}/bootstrap/docker-compose.core.yml" && -f "${REPO_ROOT}/bootstrap/runtime-bridge.py" ]]; then
+    return
+  fi
+  if [[ -d "${VPSAGENT_REPO_DIR}/.git" ]]; then
+    log "Updating VPSAgent repository in ${VPSAGENT_REPO_DIR}..."
+    git -C "${VPSAGENT_REPO_DIR}" fetch --depth 1 origin "${VPSAGENT_REPO_REF}"
+    git -C "${VPSAGENT_REPO_DIR}" checkout -B "${VPSAGENT_REPO_REF}" "origin/${VPSAGENT_REPO_REF}"
+  else
+    log "Cloning VPSAgent into ${VPSAGENT_REPO_DIR}..."
+    git clone --depth 1 --branch "${VPSAGENT_REPO_REF}" "${VPSAGENT_REPO_URL}" "${VPSAGENT_REPO_DIR}"
+  fi
+  REPO_ROOT="${VPSAGENT_REPO_DIR}"
+  SCRIPT_DIR="${REPO_ROOT}/bootstrap"
+}
+
+detect_public_ip() {
+  local ip=""
+  for probe in "https://api.ipify.org" "https://ipv4.icanhazip.com"; do
+    ip="$(curl -fsS --max-time 3 "${probe}" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "${ip}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      printf '%s' "${ip}"
+      return
+    fi
+  done
+}
+
+configure_firewall() {
+  local ssh_port="22"
+  if [[ -f /etc/ssh/sshd_config ]]; then
+    ssh_port="$(awk '/^[[:space:]]*Port[[:space:]]+[0-9]+/ {print $2; exit}' /etc/ssh/sshd_config || true)"
+    ssh_port="${ssh_port:-22}"
+  fi
+  log "Configuring UFW firewall (allowing SSH ${ssh_port}/tcp, 80/tcp, 443/tcp)..."
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow "${ssh_port}/tcp"
+  ufw allow 80/tcp
+  ufw allow 443/tcp
+  ufw --force enable
+}
+
+prepare_state_and_secrets() {
+  log "Preparing ${VPSAGENT_ROOT} directories and secrets..."
+  mkdir -p "${VPSAGENT_ROOT}/data" "${VPSAGENT_ROOT}/config" "${VPSAGENT_ROOT}/apps" \
+    "${VPSAGENT_ROOT}/run" "${VPSAGENT_ROOT}/caddy/apps.d"
+  chmod 750 "${VPSAGENT_ROOT}" "${VPSAGENT_ROOT}/config" "${VPSAGENT_ROOT}/run" "${VPSAGENT_ROOT}/apps"
+  chown 0:1000 "${VPSAGENT_ROOT}/run"
+  chown 1000:1000 "${VPSAGENT_ROOT}/data" "${VPSAGENT_ROOT}/config" "${VPSAGENT_ROOT}/apps"
+
+  PUBLIC_IP="$(detect_public_ip || true)"
+  ENV_FILE="${VPSAGENT_ROOT}/.env"
+
+  if [[ ! -f "${ENV_FILE}" || "${FORCE_OVERWRITE}" == "true" ]]; then
+    RUNTIME_TOKEN="$(openssl rand -hex 32)"
+    SESSION_SECRET="$(openssl rand -hex 32)"
+    ENCRYPTION_SECRET="$(openssl rand -hex 32)"
+    CLAIM_TOKEN="$(openssl rand -hex 18)"
+    SITE_ADDR="${ARG_DOMAIN:-:80}"
+    DOMAIN_VAL="${ARG_DOMAIN:-localhost}"
+    EMAIL_VAL="${ARG_EMAIL:-admin@example.com}"
+
+    cat > "${ENV_FILE}" <<EOF
+VPSAGENT_REPO_DIR=${REPO_ROOT}
+VPSAGENT_SITE_ADDRESS=${SITE_ADDR}
+VPSAGENT_DOMAIN=${DOMAIN_VAL}
+VPSAGENT_ACME_EMAIL=${EMAIL_VAL}
+VPSAGENT_PUBLIC_IP=${PUBLIC_IP}
+VPSAGENT_RUNTIME_TOKEN=${RUNTIME_TOKEN}
+VPSAGENT_SESSION_SECRET=${SESSION_SECRET}
+VPSAGENT_ENCRYPTION_SECRET=${ENCRYPTION_SECRET}
+VPSAGENT_CLAIM_TOKEN=${CLAIM_TOKEN}
+VPSAGENT_RUNTIME_SOCKET=${VPSAGENT_ROOT}/run/runtime.sock
+VPSAGENT_APPS_ROOT=${VPSAGENT_ROOT}/apps
+VPSAGENT_CADDY_APPS_DIR=${VPSAGENT_ROOT}/caddy/apps.d
+VPSAGENT_CADDY_CONTAINER=vpsagent-caddy
+EOF
+    chmod 600 "${ENV_FILE}"
+  else
+    CLAIM_TOKEN="$(awk -F= '/^VPSAGENT_CLAIM_TOKEN=/{print $2; exit}' "${ENV_FILE}" || true)"
+  fi
+
+  cp "${SCRIPT_DIR}/Caddyfile" "${VPSAGENT_ROOT}/Caddyfile"
+  cp "${SCRIPT_DIR}/docker-compose.core.yml" "${VPSAGENT_ROOT}/docker-compose.yml"
+  cp "${SCRIPT_DIR}/caddy/apps.d/00-default.caddy" "${VPSAGENT_ROOT}/caddy/apps.d/00-default.caddy"
+  install -m 0750 "${SCRIPT_DIR}/runtime-bridge.py" "${VPSAGENT_ROOT}/runtime-bridge.py"
+}
+
+configure_runtime_bridge_service() {
+  local unit_file="/etc/systemd/system/vpsagent-runtime.service"
+  log "Installing and starting host Runtime Bridge daemon (${unit_file})..."
+  cat > "${unit_file}" <<EOF
+[Unit]
+Description=VPSAgent v2 Host Runtime Bridge
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+EnvironmentFile=${VPSAGENT_ROOT}/.env
+ExecStart=/usr/bin/python3 ${VPSAGENT_ROOT}/runtime-bridge.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "${unit_file}"
+  systemctl daemon-reload
+  systemctl enable --now vpsagent-runtime.service
+}
+
+start_core_stack() {
+  if ! docker network inspect "${CORE_NETWORK}" >/dev/null 2>&1; then
+    docker network create "${CORE_NETWORK}"
+  fi
+  log "Building and starting VPSAgent core stack (vpsagent-core + Caddy Auto-TLS)..."
+  docker compose --project-directory "${VPSAGENT_ROOT}" -f "${VPSAGENT_ROOT}/docker-compose.yml" \
+    --env-file "${VPSAGENT_ROOT}/.env" up -d --build
+}
+
+print_ready_banner() {
+  local base_url
+  if [[ -n "${ARG_DOMAIN}" ]]; then
+    base_url="https://${ARG_DOMAIN}"
+  elif [[ -n "${PUBLIC_IP:-}" ]]; then
+    base_url="http://${PUBLIC_IP}"
+  else
+    base_url="http://localhost"
+  fi
+
+  printf '\n=================================================================\n'
+  printf '  VPSAgent v2 is installed and running!\n'
+  printf '=================================================================\n'
+  printf '  Open your private first-time setup link:\n'
+  printf '    %s/#claim=%s\n\n' "${base_url}" "${CLAIM_TOKEN:-<see /var/lib/vpsagent/.env>}"
+  printf '  Step 1: Choose your dashboard password\n'
+  printf '  Step 2: Connect your domain name for automatic HTTPS\n'
+  printf '=================================================================\n\n'
+}
+
+main() {
+  parse_args "$@"
+  require_root
+  require_ubuntu
+  ensure_packages
+  ensure_docker
+  ensure_repo_checkout
+  configure_firewall
+  prepare_state_and_secrets
+  configure_runtime_bridge_service
+  start_core_stack
+  print_ready_banner
+}
+
+main "$@"

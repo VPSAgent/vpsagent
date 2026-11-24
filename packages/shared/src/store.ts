@@ -241,6 +241,12 @@ export class RegistryStore {
         execution_owner TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS approval_execution_payloads (
+        approval_id TEXT PRIMARY KEY REFERENCES approval_requests(id) ON DELETE CASCADE,
+        payload_enc TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_approvals_status_created
         ON approval_requests (status, created_at DESC);
 
@@ -494,6 +500,8 @@ export class RegistryStore {
     targetSlug?: string | null;
     summary: string;
     payload: Record<string, unknown>;
+    /** Optional unredacted payload encrypted at rest strictly for post-approval execution (never returned in list/read views). */
+    executionPayload?: Record<string, unknown>;
     requestedBy: string;
     tokenScope: McpTokenScope;
     riskLevel?: RiskLevel;
@@ -533,7 +541,38 @@ export class RegistryStore {
         now,
       );
 
+    if (input.executionPayload) {
+      const encrypted = encryptValue(
+        JSON.stringify(input.executionPayload),
+        this.encryptionKey,
+      );
+      this.db
+        .prepare(
+          `INSERT INTO approval_execution_payloads (approval_id, payload_enc, created_at)
+           VALUES (?, ?, ?)`,
+        )
+        .run(id, encrypted, now);
+    }
+
     return this.getApproval(id)!;
+  }
+
+  /** Internal executor helper: retrieves and consumes the encrypted execution payload for an approved request. */
+  consumeApprovalExecutionPayload(id: string): Record<string, unknown> | null {
+    const row = this.db
+      .prepare(
+        "SELECT payload_enc FROM approval_execution_payloads WHERE approval_id = ?",
+      )
+      .get(id) as { payload_enc: string } | undefined;
+    if (!row) {
+      return null;
+    }
+    this.db
+      .prepare("DELETE FROM approval_execution_payloads WHERE approval_id = ?")
+      .run(id);
+    return JSON.parse(
+      decryptValue(row.payload_enc, this.encryptionKey),
+    ) as Record<string, unknown>;
   }
 
   getApproval(id: string): ApprovalRequest | null {
@@ -591,6 +630,11 @@ export class RegistryStore {
          WHERE id = ? AND status = 'pending'`,
       )
       .run(decision, decidedBy, safeNote, now, id);
+    if (decision === "rejected") {
+      this.db
+        .prepare("DELETE FROM approval_execution_payloads WHERE approval_id = ?")
+        .run(id);
+    }
     return this.getApproval(id);
   }
 
@@ -829,6 +873,27 @@ export class RegistryStore {
   // ---------------------------------------------------------------------------
   // 2-Step First-Boot Setup & Admin Passphrase
   // ---------------------------------------------------------------------------
+
+  getSetting<T>(key: string): T | null {
+    const row = this.db
+      .prepare("SELECT value_json FROM system_settings WHERE key = ?")
+      .get(key) as { value_json: string } | undefined;
+    if (!row) {
+      return null;
+    }
+    return JSON.parse(row.value_json) as T;
+  }
+
+  setSetting(key: string, value: unknown): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO system_settings (key, value_json, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+      )
+      .run(key, JSON.stringify(value), now);
+  }
 
   getSetupState(): SetupState {
     const row = this.db

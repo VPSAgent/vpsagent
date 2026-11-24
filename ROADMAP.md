@@ -26,12 +26,12 @@ We built the part that actually runs your apps safely:
 
 ---
 
-## Step 3 — The Front Desk & AI Doorway *(Next)*
-Next, we connect everything to a web server so both you and your AI can talk to it:
-- [ ] **2-step first-time setup:** Right after you install VPSAgent, you open one private link to:
+## Step 3 — The Front Desk & AI Doorway *(Done)*
+We connected everything to a web server so both you and your AI can talk to it:
+- [x] **2-step first-time setup:** Right after you install VPSAgent, you open one private link to:
   1. Choose your login password.
   2. Connect your domain name (for automatic `https://` padlock security).
-- [ ] **The AI doorway (Remote MCP):** Gives your AI (Claude Code, Cursor, or Codex) one secure web link and a visitor pass so it can:
+- [x] **The AI doorway (Remote MCP):** Gives your AI (Claude Code, Cursor, or Codex) one secure web link and a visitor pass so it can:
   - Check server health and read app logs.
   - Launch ready-made apps or build apps directly from a GitHub link.
   - Add a private database, update app settings, connect a domain, or restart/delete an app.
@@ -39,17 +39,17 @@ Next, we connect everything to a web server so both you and your AI can talk to 
 
 ---
 
-## Step 4 — Your 4-Tab Website (Dashboard)
+## Step 4 — Your 4-Tab Website (Dashboard) *(Done)*
 A clean, simple website with zero clutter — just 4 tabs:
-- [ ] **First-time setup screen:** The 2-step screen from Step 3.
-- [ ] **Tab 1 — Overview:** Shows how busy your server is (CPU, memory, storage) and which apps are running.
-- [ ] **Tab 2 — Apps:** Start, stop, restart, rebuild, view logs, connect a domain, see attached databases, and safely edit hidden settings.
-- [ ] **Tab 3 — Approvals & History:** One-click **Approve** or **Reject** for anything your AI asks to do, plus a searchable history of every action.
-- [ ] **Tab 4 — AI Keys & Settings:** Create or turn off AI visitor passes, with ready-to-paste setup snippets for Claude Code, Cursor, and Codex.
+- [x] **First-time setup screen:** The 2-step screen from Step 3.
+- [x] **Tab 1 — Overview:** Shows how busy your server is (CPU, memory, storage) and which apps are running.
+- [x] **Tab 2 — Apps:** Start, stop, restart, rebuild, view logs, connect a domain, see attached databases, and safely edit hidden settings.
+- [x] **Tab 3 — Approvals & History:** One-click **Approve** or **Reject** for anything your AI asks to do, plus a searchable history of every action.
+- [x] **Tab 4 — AI Keys & Settings:** Create or turn off AI visitor passes, with ready-to-paste setup snippets for Claude Code, Cursor, and Codex.
 
 ---
 
-## Step 5 — One-Command Install & Full Test
-Finally, we make it effortless to install on any fresh $5 Ubuntu server and test the whole thing:
-- [ ] **One-command installer:** One copy-paste command installs everything and turns on automatic `https://` security for your dashboard and every app.
-- [ ] **Real-world test run:** Launch a real app and a GitHub app with secret settings and a database using an AI pass, approve it in the dashboard, check the live website, and confirm every test passes.
+## Step 5 — One-Command Install & Full Test *(Done)*
+Finally, we made it effortless to install on any fresh $5 Ubuntu server and tested the whole thing:
+- [x] **One-command installer:** One copy-paste command installs everything and turns on automatic `https://` security for your dashboard and every app.
+- [x] **Real-world test run:** Launch a real app and a GitHub app with secret settings and a database using an AI pass, approve it in the dashboard, check the live website, and confirm every test passes.
