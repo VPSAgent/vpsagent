@@ -10,3 +10,9 @@
 - **Secrets:** Never read, print, hardcode, or commit `.env`, `.env.*`, SSH keys, TLS private keys, or bearer tokens (`vpsmcp_*`). Redact secrets in all logs, audit events, and MCP responses.
 - **Git Hygiene:** Work on `<type>/<short-kebab-description>` feature branches (`feat/`, `fix/`, `refactor/`, `chore/`, `docs/`). Never commit directly to `main` after initial bootstrap.
 - **Verification:** Always run build, typecheck, and tests after the final edit before reporting done.
+
+## Communication Style
+- The user is **not a developer** — always explain things in plain, everyday English.
+- Avoid heavy engineering jargon; if you must use a technical term, explain it in ~5 words.
+- Keep updates short and clear: what changed, why it matters, and what the user should click or approve next.
+- Make sensible engineering defaults yourself instead of asking low-level technical questions.
