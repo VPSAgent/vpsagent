@@ -925,6 +925,32 @@ sys.exit(0)
             self.assertEqual(ins_recovered["hostHttpHealth"]["status"], "healthy")
             self.assertEqual(ins_recovered["hostHttpHealth"]["consecutiveFailures"], 0)
             self.assertEqual(ins_recovered["httpProbe"]["statusCode"], 200)
+
+            # Before first monitor pass (e.g. right after bridge restart), a live HTTP 500
+            # must NOT be counted as a monitor failure: hostHttpHealth stays starting with 0 failures.
+            svc._clear_host_health("dual-check")
+            http_state["status"] = 500
+            ins_before_first_pass = svc.inspect_workload(
+                {"slug": "dual-check", "internalPort": port, "probeHttp": True, "probePath": "/health(v2)"}
+            )
+            self.assertEqual(ins_before_first_pass["status"], "running")
+            self.assertEqual(ins_before_first_pass["httpProbe"]["statusCode"], 500)
+            self.assertFalse(ins_before_first_pass["httpProbe"]["ok"])
+            self.assertEqual(ins_before_first_pass["hostHttpHealth"]["status"], "starting")
+            self.assertEqual(ins_before_first_pass["hostHttpHealth"]["consecutiveFailures"], 0)
+            self.assertIsNone(ins_before_first_pass["hostHttpHealth"]["lastOutput"])
+
+            # When monitoring is disabled in probe.json (`probeHttp: false`), hostHttpHealth is None.
+            Path(os.path.join(app_dir, "probe.json")).write_text(
+                json.dumps({"probeHttp": False, "internalPort": port, "probePath": "/health(v2)"}),
+                encoding="utf-8",
+            )
+            ins_disabled = svc.inspect_workload(
+                {"slug": "dual-check", "internalPort": port, "probeHttp": False}
+            )
+            self.assertEqual(ins_disabled["status"], "running")
+            self.assertIsNone(ins_disabled["hostHttpHealth"])
+            self.assertIsNone(ins_disabled["httpProbe"])
         finally:
             srv.shutdown()
             srv.server_close()

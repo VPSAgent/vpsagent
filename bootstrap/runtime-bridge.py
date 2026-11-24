@@ -3098,9 +3098,9 @@ class RuntimeService:
                 }
 
         # Keep Docker container liveness (`containers[i].healthStatus`) separate from
-        # VPSAgent's host HTTP check (`hostHttpHealth` + `httpProbe`), while applying
-        # the exact same overall status rule used by `/v1/apps/statuses` so the Apps
-        # list and Safety Check never disagree.
+        # VPSAgent's recurring host HTTP monitor (`hostHttpHealth`) and the live
+        # `httpProbe`, while applying the exact same overall status rule used by
+        # `/v1/apps/statuses` so the Apps list and Safety Check never disagree.
         host_http_health: dict[str, Any] | None = None
         if _apply_host_health:
             cached_host_health = self._get_host_health(slug)
@@ -3112,28 +3112,20 @@ class RuntimeService:
                     ),
                     "lastOutput": cached_host_health.get("lastOutput"),
                 }
-            elif probe_http and isinstance(http_probe, dict):
-                code = http_probe.get("statusCode")
-                live_ok = bool(http_probe.get("attempted")) and (
-                    bool(http_probe.get("ok"))
-                    or (isinstance(code, int) and 100 <= code < 500)
+            else:
+                probe_cfg = self._read_app_probe_config(app_dir, slug)
+                monitoring_enabled = (
+                    probe_cfg["probeHttp"]
+                    if probe_cfg is not None
+                    else bool(probe_http)
                 )
-                if live_ok:
-                    host_http_health = {
-                        "status": "healthy",
-                        "consecutiveFailures": 0,
-                        "lastOutput": redact_secrets(
-                            f"Host HTTP probe GET {probe_path} -> {code}"
-                        )[:300],
-                    }
-                else:
-                    detail = http_probe.get("error") or f"HTTP {code}"
+                if monitoring_enabled:
+                    # Recurring monitor is enabled but has not completed its first
+                    # pass yet — never synthesize a monitor failure from live `httpProbe`.
                     host_http_health = {
                         "status": "starting",
-                        "consecutiveFailures": 1,
-                        "lastOutput": redact_secrets(
-                            f"Host HTTP probe GET {probe_path} failed: {detail}"
-                        )[:300],
+                        "consecutiveFailures": 0,
+                        "lastOutput": None,
                     }
             status = self._resolve_overall_status(slug, status)
 

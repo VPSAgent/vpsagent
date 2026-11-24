@@ -171,4 +171,46 @@ describe("Dashboard Safety Check & Apps card sync", () => {
     assert.equal(afterThreshold.monitoredHttp.tone, "unhealthy");
     assert.equal(afterThreshold.liveHttpProbe.label, "HTTP 500 (failed)");
   });
+
+  it("shows 'waiting for first check' on a live HTTP 500 before the first monitor pass, and 'not monitored' when disabled", () => {
+    const beforeFirstMonitorPass = formatSafetyCheckHealth(
+      makeInspect({
+        status: "running",
+        hostHttpHealth: {
+          status: "starting",
+          consecutiveFailures: 0,
+          lastOutput: null,
+        },
+        httpProbe: {
+          attempted: true,
+          ok: false,
+          statusCode: 500,
+          latencyMs: 2.0,
+          contentType: "text/plain",
+          error: null,
+        },
+      }),
+    );
+
+    assert.equal(
+      beforeFirstMonitorPass.monitoredHttp.label,
+      "waiting for first check",
+    );
+    assert.equal(beforeFirstMonitorPass.monitoredHttp.tone, "neutral");
+    assert.equal(beforeFirstMonitorPass.liveHttpProbe.label, "HTTP 500 (failed)");
+    assert.equal(beforeFirstMonitorPass.liveHttpProbe.tone, "unhealthy");
+
+    const monitoringDisabled = formatSafetyCheckHealth(
+      makeInspect({
+        status: "running",
+        hostHttpHealth: null,
+        httpProbe: null,
+      }),
+    );
+
+    assert.equal(monitoringDisabled.monitoredHttp.label, "not monitored");
+    assert.equal(monitoringDisabled.monitoredHttp.tone, "neutral");
+    assert.equal(monitoringDisabled.liveHttpProbe.label, "not run");
+    assert.equal(monitoringDisabled.liveHttpProbe.tone, "neutral");
+  });
 });

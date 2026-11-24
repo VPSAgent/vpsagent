@@ -67,6 +67,8 @@ export function formatSafetyCheckHealth(
       };
     } else if (status === "healthy") {
       monitoredHttp = { label: "healthy", tone: "healthy" };
+    } else if (status === "starting" && consecutiveFailures === 0) {
+      monitoredHttp = { label: "waiting for first check", tone: "neutral" };
     } else {
       monitoredHttp = {
         label:
