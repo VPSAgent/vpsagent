@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -49,32 +48,22 @@ describe("Locked Apartment Blueprint generator", () => {
     expect(bp.envFile).toContain("APP_PORT='8080'");
     expect(bp.envFile).toContain("PORT='8080'");
 
-    // Recurring HTTP healthcheck safely quotes special path characters like `/health(v2)`
-    // and never fakes success via TCP-only `nc` or `exit 0`
+    // Recurring HTTP health checks are performed from the host Runtime Bridge via probe.json
+    // so minimal/distroless/scratch images with no curl/wget/sh work without failing Docker
+    // healthchecks, and special paths like `/health(v2)` never touch a shell.
     const specialProbeBp = generateApartmentBlueprint({
       slug: "probe-app",
       sourceType: "image",
-      image: "nginxinc/nginx-unprivileged:alpine",
+      image: "hashicorp/http-echo:latest",
       internalPort: 8080,
       probeHttp: true,
       probePath: "/health(v2)",
     });
-    expect(specialProbeBp.composeYaml).toContain(
-      "'http://127.0.0.1:8080/health(v2)'",
-    );
+    expect(specialProbeBp.probeHttp).toBe(true);
+    expect(specialProbeBp.probePath).toBe("/health(v2)");
+    expect(specialProbeBp.composeYaml).not.toMatch(/^\s*healthcheck:/m);
     expect(specialProbeBp.composeYaml).not.toContain("nc -z");
-    expect(specialProbeBp.composeYaml).not.toContain("else exit 0");
-    const testLine = specialProbeBp.composeYaml
-      .split("\n")
-      .find((l) => l.trim().startsWith("test:"));
-    expect(testLine).toBeDefined();
-    const parsedCmd = JSON.parse(testLine!.split("test:")[1]!.trim()) as [
-      string,
-      string,
-    ];
-    expect(parsedCmd[0]).toBe("CMD-SHELL");
-    // Validate POSIX /bin/sh syntax directly!
-    execFileSync("sh", ["-n", "-c", parsedCmd[1]]);
+    expect(specialProbeBp.composeYaml).not.toContain("No HTTP healthcheck client");
   });
 
   it("generates a Git Dockerfile blueprint with isolated Postgres and Redis companions", () => {
@@ -183,12 +172,21 @@ describe("Locked Apartment Blueprint generator", () => {
         slug: "notes-app",
         sourceType: "image",
         image: "nginxinc/nginx-unprivileged:alpine",
+        internalPort: 8080,
+        probeHttp: true,
+        probePath: "/health(v2)",
         companions: [{ type: "postgres" }],
       });
 
       const written = writeApartmentBlueprint(appsRoot, bp);
       expect(fs.existsSync(written.composePath)).toBe(true);
       expect(fs.existsSync(written.envPath)).toBe(true);
+      expect(fs.existsSync(written.probeConfigPath)).toBe(true);
+      expect(JSON.parse(fs.readFileSync(written.probeConfigPath, "utf8"))).toEqual({
+        probeHttp: true,
+        internalPort: 8080,
+        probePath: "/health(v2)",
+      });
       expect(fs.existsSync(path.join(written.appDir, "data", "postgres"))).toBe(true);
 
       const envMode = fs.statSync(written.envPath).mode & 0o777;

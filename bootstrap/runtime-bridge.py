@@ -57,7 +57,10 @@ MAX_TAIL_LINES = 500
 MAX_STATUS_SLUGS = 100
 DEFAULT_STATUS_DEADLINE_S = 25.0
 MAX_PROBE_BODY_BYTES = 4096
+MAX_PROBE_CONFIG_BYTES = 4 * 1024
 DEFAULT_PROBE_TIMEOUT_S = 3.0
+DEFAULT_HEALTH_INTERVAL_S = 15.0
+DEFAULT_HEALTH_RETRIES = 3
 DEFAULT_READINESS_TIMEOUT_S = 15.0
 DEFAULT_READINESS_POLL_MS = 500
 DEFAULT_BUILD_TIMEOUT_S = 300
@@ -1762,6 +1765,8 @@ class RuntimeService:
         runtime_token: str | None = None,
         allow_unauthenticated: bool = False,
         status_deadline_s: float = DEFAULT_STATUS_DEADLINE_S,
+        health_interval_s: float = DEFAULT_HEALTH_INTERVAL_S,
+        health_retries: int = DEFAULT_HEALTH_RETRIES,
         dns_resolver: DnsResolver | None = None,
         tls_checker: TlsChecker | None = None,
     ) -> None:
@@ -1787,11 +1792,173 @@ class RuntimeService:
         self.runtime_token = cleaned_token
         self.allow_unauthenticated = allow_unauthenticated
         self.status_deadline_s = max(0.2, float(status_deadline_s))
+        self.health_interval_s = max(0.2, float(health_interval_s))
+        self.health_retries = max(1, int(health_retries))
         self.dns_resolver = dns_resolver
         self.tls_checker = tls_checker or default_tls_checker
         self._locks_guard = threading.Lock()
         self._slug_locks: dict[str, _SlugLockEntry] = {}
         self._caddy_lock = threading.Lock()
+        self._host_health_lock = threading.Lock()
+        self._host_health: dict[str, dict[str, Any]] = {}
+        self._health_stop_event = threading.Event()
+        self._health_thread: threading.Thread | None = None
+
+    def _read_app_probe_config(self, app_dir: str, slug: str) -> dict[str, Any] | None:
+        probe_file = os.path.join(app_dir, "probe.json")
+        if not os.path.lexists(probe_file):
+            return None
+        try:
+            raw_text = _read_regular_file_nofollow(
+                probe_file, MAX_PROBE_CONFIG_BYTES, f'probe.json for "{slug}"'
+            )
+            data = json.loads(raw_text)
+            if not isinstance(data, dict):
+                return None
+            probe_http = data.get("probeHttp")
+            if not isinstance(probe_http, bool):
+                return None
+            internal_port = validate_port(data.get("internalPort"))
+            probe_path = validate_probe_path(data.get("probePath"))
+            return {
+                "probeHttp": probe_http,
+                "internalPort": internal_port,
+                "probePath": probe_path,
+            }
+        except (BridgeRequestError, json.JSONDecodeError, ValueError, TypeError):
+            return None
+
+    def _clear_host_health(self, slug: str) -> None:
+        with self._host_health_lock:
+            self._host_health.pop(slug, None)
+
+    def _get_host_health(self, slug: str) -> dict[str, Any] | None:
+        with self._host_health_lock:
+            entry = self._host_health.get(slug)
+            return dict(entry) if entry is not None else None
+
+    def _record_host_health(
+        self, slug: str, probe_path: str, probe_result: dict[str, Any]
+    ) -> dict[str, Any]:
+        code = probe_result.get("statusCode")
+        is_ok = bool(probe_result.get("ok")) or (
+            isinstance(code, int) and 100 <= code < 500
+        )
+        now = time.time()
+        with self._host_health_lock:
+            prev = self._host_health.get(slug) or {}
+            if is_ok:
+                entry = {
+                    "status": "healthy",
+                    "consecutiveFailures": 0,
+                    "lastCheckedAt": now,
+                    "lastOutput": redact_secrets(
+                        f"Host HTTP probe GET {probe_path} -> {code}"
+                    )[:300],
+                }
+            else:
+                failures = int(prev.get("consecutiveFailures", 0)) + 1
+                detail = probe_result.get("error") or f"HTTP {code}"
+                prev_status = str(prev.get("status") or "starting")
+                new_status = (
+                    "unhealthy" if failures >= self.health_retries else prev_status
+                )
+                entry = {
+                    "status": new_status,
+                    "consecutiveFailures": failures,
+                    "lastCheckedAt": now,
+                    "lastOutput": redact_secrets(
+                        f"Host HTTP probe GET {probe_path} failed "
+                        f"({failures}/{self.health_retries}): {detail}"
+                    )[:300],
+                }
+            self._host_health[slug] = entry
+            return dict(entry)
+
+    def run_recurring_health_check_once(self, slug: str) -> dict[str, Any] | None:
+        """
+        Runs one host-side HTTP health probe for an app configured via `probe.json`.
+        Works identically for minimal/distroless/scratch images with no in-container tools.
+        """
+        safe_slug = validate_slug(slug)
+        app_dir = resolve_scoped_app_dir(self.apps_root, safe_slug, require_exists=False)
+        if not os.path.isdir(app_dir):
+            self._clear_host_health(safe_slug)
+            return None
+        cfg = self._read_app_probe_config(app_dir, safe_slug)
+        if cfg is None or not cfg["probeHttp"]:
+            return None
+
+        inspected = self.inspect_workload(
+            {
+                "slug": safe_slug,
+                "probeHttp": True,
+                "internalPort": cfg["internalPort"],
+                "probePath": cfg["probePath"],
+            },
+            timeout_budget_s=min(10.0, self.status_deadline_s),
+            _apply_host_health=False,
+        )
+        containers = inspected.get("containers") or []
+        primary = self._select_primary_container(safe_slug, containers)
+        if primary is None or not primary.get("running"):
+            self._clear_host_health(safe_slug)
+            return None
+
+        probe_result = inspected.get("httpProbe") or {
+            "attempted": False,
+            "ok": False,
+            "statusCode": None,
+            "error": "No HTTP probe result.",
+        }
+        return self._record_host_health(safe_slug, cfg["probePath"], probe_result)
+
+    def run_recurring_health_sweep(self) -> dict[str, dict[str, Any]]:
+        results: dict[str, dict[str, Any]] = {}
+        if not os.path.isdir(self.apps_root):
+            return results
+        try:
+            entries = sorted(os.listdir(self.apps_root))
+        except OSError:
+            return results
+        for name in entries:
+            if not SLUG_PATTERN.match(name):
+                continue
+            app_dir = os.path.join(self.apps_root, name)
+            if os.path.islink(app_dir) or not os.path.isdir(app_dir):
+                continue
+            if not os.path.lexists(os.path.join(app_dir, "probe.json")):
+                continue
+            try:
+                res = self.run_recurring_health_check_once(name)
+                if res is not None:
+                    results[name] = res
+            except (BridgeRequestError, OSError):
+                continue
+        return results
+
+    def start_health_monitor(self) -> None:
+        if self._health_thread is not None and self._health_thread.is_alive():
+            return
+        self._health_stop_event.clear()
+
+        def _loop() -> None:
+            while not self._health_stop_event.wait(self.health_interval_s):
+                try:
+                    self.run_recurring_health_sweep()
+                except Exception:
+                    continue
+
+        self._health_thread = threading.Thread(
+            target=_loop, name="vpsagent-host-health-monitor", daemon=True
+        )
+        self._health_thread.start()
+
+    def stop_health_monitor(self) -> None:
+        self._health_stop_event.set()
+        if self._health_thread is not None and self._health_thread.is_alive():
+            self._health_thread.join(timeout=2.0)
+        self._health_thread = None
 
     @contextmanager
     def _lock_for(self, slug: str) -> Iterator[None]:
@@ -1995,15 +2162,22 @@ class RuntimeService:
             ):
                 base = self._compose_cmd_base(slug, project_dir, compose_path)
                 if action == "start":
+                    self._clear_host_health(slug)
                     self._run_docker(
                         [*base, "up", "-d", "--remove-orphans"], timeout=180
                     )
                 elif action == "stop":
+                    self._clear_host_health(slug)
                     self._run_docker([*base, "stop"], timeout=60)
                 elif action == "restart":
+                    self._clear_host_health(slug)
                     self._run_docker([*base, "restart"], timeout=90)
 
                 status = self._compose_status(slug, project_dir, compose_path)
+                if action == "status" and status == "running":
+                    host_health = self._get_host_health(slug)
+                    if host_health is not None and host_health.get("status") == "unhealthy":
+                        status = "error"
                 return {
                     "slug": slug,
                     "status": status,
@@ -2538,6 +2712,7 @@ class RuntimeService:
             if remove_files and os.path.exists(app_dir):
                 shutil.rmtree(app_dir)
 
+            self._clear_host_health(slug)
             return {"ok": True, "slug": slug}
 
     def _single_status(self, slug: str) -> tuple[str, str]:
@@ -2550,9 +2725,15 @@ class RuntimeService:
                 validated_compose,
                 project_dir,
             ):
-                return slug, self._compose_status(
-                    slug, project_dir, validated_compose
-                )
+                status = self._compose_status(slug, project_dir, validated_compose)
+                if status == "running":
+                    host_health = self._get_host_health(slug)
+                    if (
+                        host_health is not None
+                        and host_health.get("status") == "unhealthy"
+                    ):
+                        return slug, "error"
+                return slug, status
         except BridgeRequestError:
             return slug, "error"
 
@@ -2611,7 +2792,11 @@ class RuntimeService:
         return next((c for c in containers if c["running"] and c["ipAddress"]), None)
 
     def inspect_workload(
-        self, payload: dict[str, Any], *, timeout_budget_s: float | None = None
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout_budget_s: float | None = None,
+        _apply_host_health: bool = True,
     ) -> dict[str, Any]:
         slug = validate_slug(payload.get("slug"))
         raw_probe_http = payload.get("probeHttp", False)
@@ -2881,8 +3066,8 @@ class RuntimeService:
         )
 
         http_probe: dict[str, Any] | None = None
+        target_container = self._select_primary_container(slug, containers)
         if probe_http:
-            target_container = self._select_primary_container(slug, containers)
             if target_container is not None:
                 if deadline is not None and deadline - time.monotonic() <= 0:
                     http_probe = {
@@ -2909,6 +3094,51 @@ class RuntimeService:
                     "contentType": None,
                     "error": "Container is not running or has no bridge IP.",
                 }
+
+        # When the app image does not define an in-container Docker HEALTHCHECK,
+        # surface VPSAgent's host-driven HTTP probe / recurring monitor status so
+        # minimal/distroless/scratch images still report accurate health.
+        if (
+            _apply_host_health
+            and target_container is not None
+            and target_container["healthStatus"] == "none"
+        ):
+            host_health = self._get_host_health(slug)
+            live_ok = (
+                probe_http
+                and isinstance(http_probe, dict)
+                and bool(http_probe.get("attempted"))
+                and (
+                    bool(http_probe.get("ok"))
+                    or (
+                        isinstance(http_probe.get("statusCode"), int)
+                        and 100 <= http_probe["statusCode"] < 500
+                    )
+                )
+            )
+            if live_ok and http_probe is not None:
+                target_container["healthStatus"] = "healthy"
+                target_container["lastHealthOutput"] = redact_secrets(
+                    f"Host HTTP probe GET {probe_path} -> {http_probe.get('statusCode')}"
+                )[:300]
+            elif host_health is not None and host_health.get("status") in (
+                "healthy",
+                "unhealthy",
+            ):
+                target_container["healthStatus"] = str(host_health["status"])
+                target_container["lastHealthOutput"] = host_health.get("lastOutput")
+                status = derive_app_status(
+                    [
+                        {
+                            "State": c["state"],
+                            "Health": ""
+                            if c["healthStatus"] == "none"
+                            else c["healthStatus"],
+                            "ExitCode": c["exitCode"],
+                        }
+                        for c in containers
+                    ]
+                )
 
         return {
             "slug": slug,
@@ -2996,6 +3226,7 @@ class RuntimeService:
                         "probePath": probe_path,
                     },
                     timeout_budget_s=max(0.05, remaining_before),
+                    _apply_host_health=False,
                 )
             except BridgeRequestError as exc:
                 if exc.status_code == 504:
@@ -3079,6 +3310,8 @@ class RuntimeService:
                 }
 
             if candidate_ready:
+                if probe_http and isinstance(last_probe, dict):
+                    self._record_host_health(slug, probe_path, last_probe)
                 return {
                     "ready": True,
                     "slug": slug,
@@ -3304,6 +3537,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
         help="Overall deadline in seconds for batch /v1/apps/statuses queries.",
     )
+    parser.add_argument(
+        "--health-interval",
+        type=float,
+        default=float(
+            os.environ.get("VPSAGENT_HEALTH_INTERVAL_S", DEFAULT_HEALTH_INTERVAL_S)
+        ),
+        help="Interval in seconds for host-side recurring HTTP health probes.",
+    )
     return parser.parse_args(argv)
 
 
@@ -3328,6 +3569,7 @@ def main(argv: list[str] | None = None) -> int:
         runtime_token=token or None,
         allow_unauthenticated=bool(args.allow_unauthenticated),
         status_deadline_s=args.status_deadline,
+        health_interval_s=args.health_interval,
     )
     handler_cls = make_handler(service)
 
@@ -3366,9 +3608,11 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    service.start_health_monitor()
     try:
         server.serve_forever()
     finally:
+        service.stop_health_monitor()
         server.server_close()
     return 0
 

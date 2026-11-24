@@ -186,6 +186,35 @@ EOF
   fi
 }
 
+upsert_env_var() {
+  local file="$1"
+  local key="$2"
+  local val="$3"
+  local tmp_file
+  tmp_file="$(mktemp "${VPSAGENT_ROOT}/.env.tmp.XXXXXX")"
+  chmod 600 "${tmp_file}"
+  ENV_KEY="${key}" ENV_VAL="${val}" awk '
+    BEGIN {
+      k = ENVIRON["ENV_KEY"]
+      v = ENVIRON["ENV_VAL"]
+      updated = 0
+    }
+    index($0, k "=") == 1 {
+      print k "=" v
+      updated = 1
+      next
+    }
+    { print }
+    END {
+      if (!updated) {
+        print k "=" v
+      }
+    }
+  ' "${file}" > "${tmp_file}"
+  mv "${tmp_file}" "${file}"
+  chmod 600 "${file}"
+}
+
 prepare_state_and_secrets() {
   log "Preparing ${VPSAGENT_ROOT} directories and secrets..."
   mkdir -p "${VPSAGENT_ROOT}/data" "${VPSAGENT_ROOT}/config" "${VPSAGENT_ROOT}/apps" \
@@ -222,11 +251,13 @@ VPSAGENT_CADDY_CONTAINER=vpsagent-caddy
 EOF
     chmod 600 "${ENV_FILE}"
   else
-    # Preserve existing secrets on upgrade and backfill any new required non-secret keys
+    # Preserve existing secrets on upgrade, update VPSAGENT_REPO_DIR to the checkout
+    # launching this installer so vpsagent-core rebuilds from the current revision,
+    # and backfill any newly added non-secret keys.
     CLAIM_TOKEN="$(awk -F= '/^VPSAGENT_CLAIM_TOKEN=/{print $2; exit}' "${ENV_FILE}" || true)"
+    upsert_env_var "${ENV_FILE}" "VPSAGENT_REPO_DIR" "${REPO_ROOT}"
     if ! grep -q '^VPSAGENT_CADDY_CORE_DIR=' "${ENV_FILE}"; then
-      printf 'VPSAGENT_CADDY_CORE_DIR=%s\n' "${VPSAGENT_ROOT}/caddy/core.d" >> "${ENV_FILE}"
-      chmod 600 "${ENV_FILE}"
+      upsert_env_var "${ENV_FILE}" "VPSAGENT_CADDY_CORE_DIR" "${VPSAGENT_ROOT}/caddy/core.d"
     fi
   fi
 
@@ -285,8 +316,9 @@ start_core_stack() {
   if ! docker network inspect "${CORE_NETWORK}" >/dev/null 2>&1; then
     docker network create "${CORE_NETWORK}"
   fi
-  log "Building and starting VPSAgent core stack (vpsagent-core + Caddy Auto-TLS)..."
-  docker compose --project-directory "${VPSAGENT_ROOT}" -f "${VPSAGENT_ROOT}/docker-compose.yml" \
+  log "Building and starting VPSAgent core stack from ${REPO_ROOT} (vpsagent-core + Caddy Auto-TLS)..."
+  VPSAGENT_REPO_DIR="${REPO_ROOT}" docker compose --project-directory "${VPSAGENT_ROOT}" \
+    -f "${VPSAGENT_ROOT}/docker-compose.yml" \
     --env-file "${VPSAGENT_ROOT}/.env" up -d --build
 }
 
@@ -324,4 +356,6 @@ main() {
   print_ready_banner
 }
 
-main "$@"
+if [[ "${VPSAGENT_INSTALL_LIBRARY_ONLY:-false}" != "true" ]]; then
+  main "$@"
+fi

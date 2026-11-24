@@ -64,6 +64,8 @@ export interface ApartmentBlueprint {
   networkName: string;
   imageRef: string;
   internalPort: number;
+  probeHttp: boolean;
+  probePath: string;
   composeYaml: string;
   envFile: string;
   envVars: Record<string, string>;
@@ -277,37 +279,17 @@ export function generateApartmentBlueprint(
     "      - no-new-privileges:true",
   );
 
-  if (input.probeHttp) {
-    const safeProbePath = input.probePath.trim();
-    if (
-      !SAFE_PROBE_PATH_PATTERN.test(safeProbePath) ||
-      safeProbePath.includes("'") ||
-      safeProbePath.includes('"') ||
-      safeProbePath.includes("\\") ||
-      safeProbePath.includes("$") ||
-      /\s/.test(safeProbePath)
-    ) {
-      throw new Error(`Invalid probePath "${input.probePath}".`);
-    }
-    const probeUrl = `http://127.0.0.1:${input.internalPort}${safeProbePath}`;
-    // Single-quote the URL so special path chars like `/health(v2)` or `?a=1&b=2` are safe
-    // in /bin/sh, and always perform a real HTTP status check (accepting 1xx-4xx).
-    const hcCmd = [
-      `if command -v curl >/dev/null 2>&1; then curl -s -i --max-time 3 '${probeUrl}' | head -n 1 | grep -Eq 'HTTP/[0-9.]+ [1-4][0-9][0-9]';`,
-      `elif command -v wget >/dev/null 2>&1; then wget -S -T 3 -O /dev/null '${probeUrl}' 2>&1 | grep -Eq 'HTTP/[0-9.]+ [1-4][0-9][0-9]';`,
-      `elif command -v node >/dev/null 2>&1; then node -e "require('http').get('${probeUrl}',r=>process.exit(r.statusCode>=100&&r.statusCode<500?0:1)).on('error',()=>process.exit(1))";`,
-      `elif command -v python3 >/dev/null 2>&1; then python3 -c "import http.client,sys; c=http.client.HTTPConnection('127.0.0.1',${input.internalPort},timeout=3); c.request('GET','${safeProbePath}'); s=c.getresponse().status; sys.exit(0 if 100<=s<500 else 1)";`,
-      "else echo 'No HTTP healthcheck client installed' >&2; exit 1; fi",
-    ].join(" ");
-    lines.push(
-      "    healthcheck:",
-      `      test: ${JSON.stringify(["CMD-SHELL", hcCmd])}`,
-      '      interval: "15s"',
-      '      timeout: "5s"',
-      "      retries: 3",
-      '      start_period: "5s"',
-    );
+  const safeProbePath = input.probePath.trim();
+  if (
+    !SAFE_PROBE_PATH_PATTERN.test(safeProbePath) ||
+    /\s/.test(safeProbePath)
+  ) {
+    throw new Error(`Invalid probePath "${input.probePath}".`);
   }
+  // Recurring HTTP health checks are performed from the host Runtime Bridge directly
+  // against the container's private app_net IP (configured via `probe.json`), so minimal
+  // or distroless/scratch images with no in-container HTTP client work without failing
+  // Docker healthchecks, while special paths like `/health(v2)` never pass through /bin/sh.
 
   if (companions.length > 0) {
     lines.push("    depends_on:");
@@ -423,6 +405,8 @@ export function generateApartmentBlueprint(
     networkName,
     imageRef,
     internalPort: input.internalPort,
+    probeHttp: input.probeHttp,
+    probePath: safeProbePath,
     composeYaml: lines.join("\n"),
     envFile: formatEnvFile(envVars),
     envVars,
@@ -448,12 +432,13 @@ function assertNotSymlink(targetPath: string): void {
 
 /**
  * Safely writes a generated Locked Apartment blueprint (`docker-compose.yml` + `0600` `.env`
- * + required `./data` directories) into the app's scoped workspace directory.
+ * + `probe.json` host health-check config + required `./data` directories) into the app's
+ * scoped workspace directory.
  */
 export function writeApartmentBlueprint(
   appsRoot: string,
   blueprint: ApartmentBlueprint,
-): { appDir: string; composePath: string; envPath: string } {
+): { appDir: string; composePath: string; envPath: string; probeConfigPath: string } {
   const appDir = resolveScopedAppDir(appsRoot, blueprint.slug);
   fs.mkdirSync(appDir, { recursive: true, mode: 0o750 });
   assertNotSymlink(appDir);
@@ -478,8 +463,10 @@ export function writeApartmentBlueprint(
 
   const composePath = path.join(appDir, "docker-compose.yml");
   const envPath = path.join(appDir, ".env");
+  const probeConfigPath = path.join(appDir, "probe.json");
   assertNotSymlink(composePath);
   assertNotSymlink(envPath);
+  assertNotSymlink(probeConfigPath);
 
   fs.writeFileSync(composePath, blueprint.composeYaml, {
     encoding: "utf8",
@@ -493,5 +480,23 @@ export function writeApartmentBlueprint(
   });
   fs.chmodSync(envPath, 0o600);
 
-  return { appDir, composePath, envPath };
+  fs.writeFileSync(
+    probeConfigPath,
+    `${JSON.stringify(
+      {
+        probeHttp: blueprint.probeHttp,
+        internalPort: blueprint.internalPort,
+        probePath: blueprint.probePath,
+      },
+      null,
+      2,
+    )}\n`,
+    {
+      encoding: "utf8",
+      mode: 0o644,
+    },
+  );
+  fs.chmodSync(probeConfigPath, 0o644);
+
+  return { appDir, composePath, envPath, probeConfigPath };
 }

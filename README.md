@@ -39,7 +39,7 @@ git -C "$HOME/vpsagent" pull --ff-only
 sudo bash "$HOME/vpsagent/bootstrap/install.sh"
 ```
 
-Your existing secrets, database, apps, and sessions are preserved, and the installer automatically restarts and health-checks `vpsagent-runtime.service` before rebuilding `vpsagent-core`.
+Your existing secrets, database, apps, and sessions are preserved. Even if an older install originally built from `/opt/vpsagent`, running `install.sh` from `$HOME/vpsagent` automatically updates `VPSAGENT_REPO_DIR`, restarts and health-checks `vpsagent-runtime.service`, and rebuilds `vpsagent-core` from the checkout that launched the installer.
 
 ## Core Pillars
 

@@ -588,7 +588,7 @@ sys.exit(0)
         # AND a still-starting container preserves its "starting" diagnostic even when the deadline expires mid-inspect.
         from unittest import mock
 
-        def slow_inspect(payload: dict, *, timeout_budget_s: float | None = None) -> dict:
+        def slow_inspect(payload: dict, *, timeout_budget_s: float | None = None, **_kwargs: object) -> dict:
             import time as _t
             _t.sleep(0.14)
             return {
@@ -598,7 +598,7 @@ sys.exit(0)
                 "httpProbe": {"attempted": True, "ok": True, "statusCode": 200, "error": None},
             }
 
-        def slow_starting_inspect(payload: dict, *, timeout_budget_s: float | None = None) -> dict:
+        def slow_starting_inspect(payload: dict, *, timeout_budget_s: float | None = None, **_kwargs: object) -> dict:
             import time as _t
             _t.sleep(0.14)
             return {
@@ -621,6 +621,168 @@ sys.exit(0)
             )
             self.assertFalse(overdue_starting["ready"])
             self.assertIn("starting", overdue_starting["reason"])
+
+    def test_host_recurring_http_health_minimal_image_and_special_path(self) -> None:
+        """
+        Minimal/distroless/scratch images have no curl/wget/node/python3/sh inside the container
+        and therefore no in-container Docker HEALTHCHECK (`healthStatus == "none"`).
+        VPSAgent's host Runtime Bridge performs both startup readiness and recurring HTTP health
+        checks directly against the container's private IP (including special paths like `/health(v2)`).
+        """
+        app_dir = os.path.join(self.apps_root, "mini-http")
+        os.makedirs(app_dir, exist_ok=True)
+        Path(os.path.join(app_dir, "docker-compose.yml")).write_text(
+            'services:\n  app:\n    image: "hashicorp/http-echo:latest"\n    cpus: "0.5"\n    mem_limit: "128m"\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n    networks:\n      - app_net\nnetworks:\n  app_net:\n    driver: bridge\n',
+            encoding="utf-8",
+        )
+
+        # Live local HTTP server simulating a minimal container with NO in-container tools
+        state = {"status": 200, "paths": []}
+
+        class _MinimalAppHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                state["paths"].append(self.path)
+                code = state["status"]
+                body = b"ok" if code == 200 else b"broken"
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _MinimalAppHandler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            Path(os.path.join(app_dir, "probe.json")).write_text(
+                json.dumps(
+                    {
+                        "probeHttp": True,
+                        "internalPort": port,
+                        "probePath": "/health(v2)",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            docker_py = os.path.join(self.tmp, "mini_docker.py")
+            with open(docker_py, "w", encoding="utf-8") as fh:
+                fh.write(
+                    """import json, sys
+args = sys.argv[1:]
+if "ps" in args and "--format" in args and "json" in args:
+    print(json.dumps([{"State": "running", "Health": "", "ExitCode": 0}]))
+    sys.exit(0)
+if args[:1] == ["ps"]:
+    print("cid-mini")
+    sys.exit(0)
+if args[:1] == ["inspect"]:
+    # Note: NO State.Health block (container has no in-container HEALTHCHECK)
+    print(json.dumps([{
+        "Id": "abcdef1234567890",
+        "Name": "/vpsagent-app-mini-http",
+        "RestartCount": 0,
+        "Config": {"Image": "hashicorp/http-echo:latest"},
+        "State": {"Status": "running", "Running": True, "ExitCode": 0},
+        "HostConfig": {"CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges:true"], "Privileged": False, "Binds": []},
+        "Mounts": [],
+        "NetworkSettings": {"Networks": {"vpsagent-mini-http_app_net": {"IPAddress": "127.0.0.1"}}},
+    }]))
+    sys.exit(0)
+sys.exit(0)
+"""
+                )
+            docker_sh = os.path.join(self.tmp, "mini-docker")
+            with open(docker_sh, "w", encoding="utf-8") as fh:
+                fh.write(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n')
+            os.chmod(docker_sh, 0o755)
+
+            svc = rb.RuntimeService(
+                apps_root=self.apps_root,
+                caddy_apps_dir=self.caddy_dir,
+                caddy_container="vpsagent-caddy",
+                docker_bin=docker_sh,
+                runtime_token="secret-token-for-unit-test-1234",
+                health_retries=3,
+            )
+
+            # 1. Startup readiness succeeds for minimal image with special path `/health(v2)`
+            ready = svc.check_readiness(
+                {
+                    "slug": "mini-http",
+                    "internalPort": port,
+                    "probeHttp": True,
+                    "probePath": "/health(v2)",
+                    "timeoutSeconds": 2.0,
+                    "pollIntervalMs": 20,
+                }
+            )
+            self.assertTrue(ready["ready"])
+            self.assertEqual(ready["httpProbe"]["statusCode"], 200)
+            self.assertIn("/health(v2)", state["paths"])
+
+            inspected_ok = svc.inspect_workload(
+                {
+                    "slug": "mini-http",
+                    "internalPort": port,
+                    "probeHttp": True,
+                    "probePath": "/health(v2)",
+                }
+            )
+            self.assertEqual(inspected_ok["status"], "running")
+            self.assertEqual(inspected_ok["containers"][0]["healthStatus"], "healthy")
+            self.assertIn("/health(v2)", inspected_ok["containers"][0]["lastHealthOutput"])
+
+            # 2. Recurring host health monitor detects 3 consecutive HTTP 500s -> marks unhealthy/error
+            state["status"] = 500
+            r1 = svc.run_recurring_health_check_once("mini-http")
+            r2 = svc.run_recurring_health_check_once("mini-http")
+            self.assertEqual(r1["consecutiveFailures"], 1)
+            self.assertEqual(r2["consecutiveFailures"], 2)
+            self.assertEqual(svc.statuses({"slugs": ["mini-http"]})["statuses"]["mini-http"], "running")
+
+            r3 = svc.run_recurring_health_check_once("mini-http")
+            self.assertEqual(r3["status"], "unhealthy")
+            self.assertEqual(r3["consecutiveFailures"], 3)
+            self.assertEqual(svc.statuses({"slugs": ["mini-http"]})["statuses"]["mini-http"], "error")
+
+            inspected_bad = svc.inspect_workload(
+                {
+                    "slug": "mini-http",
+                    "internalPort": port,
+                    "probeHttp": False,
+                }
+            )
+            self.assertEqual(inspected_bad["status"], "error")
+            self.assertEqual(inspected_bad["containers"][0]["healthStatus"], "unhealthy")
+
+            # 3. Initial deploy readiness of a broken minimal image returning 500 NEVER falsely succeeds
+            broken_ready = svc.check_readiness(
+                {
+                    "slug": "mini-http",
+                    "internalPort": port,
+                    "probeHttp": True,
+                    "probePath": "/health(v2)",
+                    "timeoutSeconds": 0.2,
+                    "pollIntervalMs": 30,
+                }
+            )
+            self.assertFalse(broken_ready["ready"])
+            self.assertIn("500", broken_ready["reason"])
+
+            # 4. Once HTTP 200 returns, recurring host check recovers status to running/healthy
+            state["status"] = 200
+            r_ok = svc.run_recurring_health_check_once("mini-http")
+            self.assertEqual(r_ok["status"], "healthy")
+            self.assertEqual(r_ok["consecutiveFailures"], 0)
+            self.assertEqual(svc.statuses({"slugs": ["mini-http"]})["statuses"]["mini-http"], "running")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":
