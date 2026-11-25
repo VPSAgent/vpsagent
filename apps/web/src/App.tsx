@@ -4,6 +4,7 @@ import {
   Box,
   KeyRound,
   LogOut,
+  RefreshCw,
   ShieldCheck,
   ShieldQuestion,
 } from "lucide-react";
@@ -46,6 +47,7 @@ function parseAppDeepLink(hash: string): AppDeepLink | null {
 
 export function App() {
   const [session, setSession] = useState<SessionInfo | null>(null);
+  const [connectError, setConnectError] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>("overview");
   const [deepLink, setDeepLink] = useState<AppDeepLink | null>(() =>
     typeof window !== "undefined" ? parseAppDeepLink(window.location.hash) : null,
@@ -72,6 +74,7 @@ export function App() {
 
   const loadAll = useCallback(async (auditQuery?: string) => {
     setLoading(true);
+    setConnectError(null);
     try {
       const sess = await api.getSession();
       setSession(sess);
@@ -89,6 +92,10 @@ export function App() {
         setTokens(toks.tokens);
         setSnippets(snips);
       }
+    } catch (err) {
+      setConnectError(
+        err instanceof Error ? err.message : "Could not reach your server.",
+      );
     } finally {
       setLoading(false);
     }
@@ -113,8 +120,30 @@ export function App() {
 
   if (!session) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-slate-950 text-slate-400 text-sm">
-        Connecting to VPSAgent...
+      <div className="min-h-screen flex items-center justify-center bg-[#090A0C] px-4">
+        <div className="surface-panel rounded-xl px-6 py-5 max-w-sm w-full text-center space-y-3">
+          <div className="mx-auto h-9 w-9 rounded-lg bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-center">
+            <ShieldCheck className="h-4.5 w-4.5 text-emerald-400" />
+          </div>
+          {connectError ? (
+            <>
+              <p className="text-sm font-medium text-[#F4F5F7]">
+                Unable to reach VPSAgent
+              </p>
+              <p className="text-xs text-[#9CA3AF]">{connectError}</p>
+              <button
+                type="button"
+                onClick={() => void loadAll()}
+                className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-2 text-xs font-semibold text-[#042F1E] hover:bg-emerald-400 cursor-pointer"
+              >
+                <RefreshCw className="h-3.5 w-3.5" />
+                Try again
+              </button>
+            </>
+          ) : (
+            <p className="text-sm text-[#9CA3AF]">Connecting to VPSAgent...</p>
+          )}
+        </div>
       </div>
     );
   }
@@ -143,35 +172,79 @@ export function App() {
   ];
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100">
-      <header className="sticky top-0 z-20 border-b border-slate-800/80 bg-slate-950/90 backdrop-blur">
-        <div className="mx-auto max-w-6xl px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
-          <div className="flex items-center gap-2.5">
-            <div className="h-9 w-9 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center">
-              <ShieldCheck className="h-5 w-5 text-emerald-400" />
+    <div className="min-h-screen bg-[#090A0C] text-[#F4F5F7]">
+      <header className="sticky top-0 z-20 border-b border-white/[0.08] bg-[#090A0C]/90 backdrop-blur-md">
+        <div className="mx-auto max-w-6xl px-4 sm:px-6 h-15 flex items-center justify-between gap-4">
+          {/* Brand Wordmark */}
+          <div className="flex items-center gap-2.5 shrink-0">
+            <div className="h-8 w-8 rounded-lg bg-emerald-500/12 border border-emerald-500/30 flex items-center justify-center">
+              <ShieldCheck className="h-4.5 w-4.5 text-emerald-400" />
             </div>
-            <div>
-              <span className="font-semibold text-white tracking-tight">
-                VPSAgent
-              </span>
-              <span className="hidden sm:inline text-xs text-slate-500 ml-2">
-                Safe AI Server Panel
-              </span>
-            </div>
+            <span className="text-[15px] font-bold tracking-[-0.02em] text-white">
+              VPSAgent
+            </span>
           </div>
 
-          <button
-            type="button"
-            onClick={handleLogout}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-slate-800 px-3 py-1.5 text-xs font-medium text-slate-400 hover:text-white hover:bg-slate-900 transition cursor-pointer"
+          {/* Desktop Single-Line Navigation */}
+          <nav
+            aria-label="Primary"
+            className="hidden md:flex items-center gap-1"
           >
-            <LogOut className="h-3.5 w-3.5" />
-            Sign Out
-          </button>
+            {tabs.map((item) => {
+              const Icon = item.icon;
+              const active = tab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => setTab(item.id)}
+                  className={`btn-press relative inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-[13px] font-medium whitespace-nowrap cursor-pointer ${
+                    active
+                      ? "bg-white/[0.08] text-white"
+                      : "text-[#9CA3AF] hover:text-[#F4F5F7] hover:bg-white/[0.04]"
+                  }`}
+                >
+                  <Icon
+                    className={`h-3.5 w-3.5 ${active ? "text-emerald-400" : "text-[#6B7280]"}`}
+                  />
+                  <span>{item.label}</span>
+                  {item.badge !== undefined && (
+                    <span className="tabular-nums rounded-full bg-amber-400 px-1.5 py-0.5 text-[11px] leading-none font-bold text-[#1A1200]">
+                      {item.badge}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </nav>
+
+          {/* Right Utilities */}
+          <div className="flex items-center gap-3 min-w-0 shrink-0">
+            {overview?.metrics.hostname && (
+              <span
+                title={overview.metrics.hostname}
+                className="hidden lg:inline-flex items-center gap-1.5 max-w-[160px] xl:max-w-[220px] min-w-0 text-xs font-mono text-[#9CA3AF]"
+              >
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
+                <span className="truncate">{overview.metrics.hostname}</span>
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#111317] px-3 py-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white hover:border-white/[0.16] shrink-0 cursor-pointer"
+            >
+              <LogOut className="h-3.5 w-3.5" />
+              <span>Sign out</span>
+            </button>
+          </div>
         </div>
 
-        {/* 4-Tab Navigation Bar */}
-        <div className="mx-auto max-w-6xl px-4 sm:px-6 flex gap-1 overflow-x-auto">
+        {/* Mobile Tab Strip */}
+        <nav
+          aria-label="Mobile"
+          className="md:hidden border-t border-white/[0.06] px-2 flex gap-1 overflow-x-auto"
+        >
           {tabs.map((item) => {
             const Icon = item.icon;
             const active = tab === item.id;
@@ -180,26 +253,47 @@ export function App() {
                 key={item.id}
                 type="button"
                 onClick={() => setTab(item.id)}
-                className={`inline-flex items-center gap-2 border-b-2 px-4 py-3 text-sm font-medium whitespace-nowrap transition cursor-pointer ${
+                className={`btn-press inline-flex items-center gap-1.5 border-b-2 px-3 py-2.5 text-[13px] font-medium whitespace-nowrap cursor-pointer ${
                   active
                     ? "border-emerald-400 text-white"
-                    : "border-transparent text-slate-400 hover:text-slate-200"
+                    : "border-transparent text-[#9CA3AF] hover:text-[#F4F5F7]"
                 }`}
               >
-                <Icon className="h-4 w-4" />
-                {item.label}
+                <Icon className="h-3.5 w-3.5" />
+                <span>{item.label}</span>
                 {item.badge !== undefined && (
-                  <span className="rounded-full bg-amber-400 px-1.5 py-0.2 text-[11px] font-bold text-slate-950">
+                  <span className="tabular-nums rounded-full bg-amber-400 px-1.5 py-0.5 text-[11px] leading-none font-bold text-[#1A1200]">
                     {item.badge}
                   </span>
                 )}
               </button>
             );
           })}
-        </div>
+        </nav>
       </header>
 
-      <main className="mx-auto max-w-6xl px-4 sm:px-6 py-8">
+      <main className="mx-auto max-w-6xl px-4 sm:px-6 py-7">
+        {connectError && (
+          <div
+            role="alert"
+            className="mb-6 rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3"
+          >
+            <span>
+              <strong className="font-semibold">
+                Could not refresh server data:
+              </strong>{" "}
+              {connectError}
+            </span>
+            <button
+              type="button"
+              onClick={() => void loadAll()}
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-amber-400 px-3 py-1.5 text-xs font-semibold text-[#1A1200] hover:bg-amber-300 cursor-pointer"
+            >
+              <RefreshCw className="h-3 w-3" />
+              Retry
+            </button>
+          </div>
+        )}
         {tab === "overview" && (
           <OverviewTab
             data={overview}

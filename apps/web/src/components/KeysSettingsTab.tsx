@@ -1,12 +1,16 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Activity,
+  ArrowDownToLine,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
   Globe,
   KeyRound,
   Lock,
   Plus,
+  RefreshCw,
   Trash2,
 } from "lucide-react";
 import {
@@ -17,6 +21,7 @@ import {
   type McpTokenRecord,
   type McpTokenScope,
   type SetupState,
+  type SystemUpdateStatus,
 } from "../api";
 
 interface KeysSettingsTabProps {
@@ -30,32 +35,37 @@ interface KeysSettingsTabProps {
 
 const SCOPE_LABELS: Record<
   McpTokenScope,
-  { title: string; desc: string; badge: string }
+  { title: string; desc: string; dot: string; text: string }
 > = {
   "read-only": {
     title: "Look Only",
     desc: "Check server health, inspect GitHub repos, and read logs. Can never change or delete anything.",
-    badge: "bg-slate-700/80 text-slate-200",
+    dot: "bg-[#9CA3AF]",
+    text: "text-[#D1D5DB]",
   },
   "approval-required": {
     title: "Ask Me First",
-    desc: "Can check health & logs, and queues every deploy or change for your Approve click.",
-    badge: "bg-amber-500/15 text-amber-300",
+    desc: "Check health and logs, and queue every deploy or change for your Approve click.",
+    dot: "bg-amber-400",
+    text: "text-amber-300",
   },
   "safe-auto-deploy": {
-    title: "Safe Auto-Deploy (Recommended)",
-    desc: "Can launch, rebuild, restart, and update apps right away — but ALWAYS asks your approval before deleting an app.",
-    badge: "bg-sky-500/15 text-sky-300",
+    title: "Safe Auto-Deploy",
+    desc: "Launch, rebuild, restart, and update apps right away, while always asking your approval before deleting an app.",
+    dot: "bg-sky-400",
+    text: "text-sky-300",
   },
   "auto-approve": {
     title: "Trusted Auto-Pass",
-    desc: "Can launch, update, and delete isolated apps right away. Host-level commands, files, and services still ask for your Approve click.",
-    badge: "bg-emerald-500/15 text-emerald-300",
+    desc: "Launch, update, and delete isolated apps right away. Host-level commands, files, and services still ask for your Approve click.",
+    dot: "bg-emerald-400",
+    text: "text-emerald-300",
   },
   "host-admin": {
     title: "Full Server Admin (Root)",
     desc: "Full hands-free VPS administration: runs shell commands directly on the server as root, edits allowed files, and manages system services without waiting for approval.",
-    badge: "bg-rose-500/15 text-rose-300",
+    dot: "bg-rose-400",
+    text: "text-rose-300",
   },
 };
 
@@ -92,6 +102,115 @@ export function KeysSettingsTab({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<SystemUpdateStatus | null>(
+    null,
+  );
+  const [updateLoading, setUpdateLoading] = useState(true);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [startingUpdate, setStartingUpdate] = useState(false);
+  const [reconnectingUpdate, setReconnectingUpdate] = useState(false);
+  const [updateLoadError, setUpdateLoadError] = useState<string | null>(null);
+  const [showUpdateLogs, setShowUpdateLogs] = useState(false);
+
+  const loadUpdateStatus = useCallback(async () => {
+    try {
+      const res = await api.getSystemUpdateStatus();
+      setUpdateStatus(res.status);
+      setReconnectingUpdate(false);
+      setUpdateLoadError(null);
+    } catch (err) {
+      // Keep previous status if the server is restarting mid-update; otherwise surface why updates are unavailable
+      setUpdateLoadError(
+        err instanceof Error
+          ? err.message
+          : "Could not load VPSAgent update status from the server.",
+      );
+    } finally {
+      setUpdateLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadUpdateStatus();
+  }, [loadUpdateStatus]);
+
+  useEffect(() => {
+    if (updateStatus?.state !== "updating") {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await api.getSystemUpdateStatus();
+        if (cancelled) return;
+        setReconnectingUpdate(false);
+        setUpdateStatus(res.status);
+        if (res.status.state === "succeeded") {
+          setNotice(
+            res.status.message ||
+              "VPSAgent updated! Reloading the dashboard...",
+          );
+          window.setTimeout(() => {
+            window.location.reload();
+          }, 1800);
+        } else if (res.status.state === "failed") {
+          setError(res.status.error || "VPSAgent update failed.");
+        }
+      } catch {
+        if (!cancelled) {
+          setReconnectingUpdate(true);
+        }
+      }
+    }, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [updateStatus?.state]);
+
+  const handleCheckUpdates = async () => {
+    setCheckingUpdate(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.checkSystemUpdate();
+      setUpdateStatus(res.status);
+      if (res.status.updateAvailable) {
+        setNotice(
+          res.status.message ||
+            "A new version of VPSAgent is ready to install.",
+        );
+      } else if (res.status.canUpdate) {
+        setNotice("VPSAgent is already up to date.");
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not check for updates.",
+      );
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleApplyUpdate = async () => {
+    setStartingUpdate(true);
+    setError(null);
+    setNotice(null);
+    setShowUpdateLogs(true);
+    try {
+      const res = await api.applySystemUpdate();
+      setUpdateStatus(res.status);
+      setNotice(
+        "Update started. VPSAgent will rebuild and restart automatically in 1–2 minutes.",
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not start VPSAgent update.",
+      );
+    } finally {
+      setStartingUpdate(false);
+    }
+  };
 
   const copyText = async (id: string, text: string) => {
     await navigator.clipboard.writeText(text);
@@ -219,63 +338,63 @@ export function KeysSettingsTab({
       : rawActiveSnippet;
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-7 panel-enter">
       <div>
-        <h2 className="text-xl font-semibold text-white">
-          AI Keys &amp; Settings
-        </h2>
-        <p className="text-sm text-slate-400">
+        <h1 className="text-2xl font-semibold tracking-[-0.025em] text-white">
+          AI keys &amp; settings
+        </h1>
+        <p className="mt-1 text-sm text-[#9CA3AF]">
           Create scoped visitor passes for Claude Code, T3 Code, Antigravity
           (AGY), Cursor, or Codex, and configure automatic app web addresses.
         </p>
       </div>
 
       {error && (
-        <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+        <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
           {error}
         </div>
       )}
       {notice && (
-        <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300">
+        <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
           {notice}
         </div>
       )}
 
       {/* Create AI Visitor Pass */}
-      <section className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6 space-y-4">
+      <section className="surface-panel rounded-xl p-6 space-y-5">
         <div className="flex items-center gap-2">
           <KeyRound className="h-4 w-4 text-emerald-400" />
-          <h3 className="text-base font-semibold text-white">
-            Create an AI Visitor Pass
-          </h3>
+          <h2 className="text-sm font-semibold text-white">
+            Create an AI visitor pass
+          </h2>
         </div>
 
         <form onSubmit={handleCreateToken} className="space-y-4">
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">
-                Pass Label (e.g. Claude Code on Laptop)
+              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                Pass label
               </label>
               <input
                 type="text"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="Claude Code"
+                placeholder="Claude Code on MacBook"
                 required
-                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">
-                Permission Level
+              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                Permission level
               </label>
               <select
                 value={scope}
                 onChange={(e) => setScope(e.target.value as McpTokenScope)}
-                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
               >
                 <option value="safe-auto-deploy">
-                  Safe Auto-Deploy (Recommended — always asks before delete)
+                  Safe Auto-Deploy (Recommended, asks before delete)
                 </option>
                 <option value="approval-required">
                   Ask Me First (queues every change for approval)
@@ -285,22 +404,22 @@ export function KeysSettingsTab({
                   Trusted Auto-Pass (isolated apps auto, host commands ask)
                 </option>
                 <option value="host-admin">
-                  Full Server Admin (Root — unrestricted host commands, no wait)
+                  Full Server Admin (Root, unrestricted host commands)
                 </option>
               </select>
             </div>
           </div>
 
-          <p className="text-xs text-slate-400">{SCOPE_LABELS[scope].desc}</p>
+          <p className="text-xs text-[#9CA3AF]">{SCOPE_LABELS[scope].desc}</p>
 
           {/* Optional App Lock */}
-          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
-            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-200 cursor-pointer">
+          <div className="surface-well rounded-lg p-4 space-y-3">
+            <label className="inline-flex items-center gap-2 text-xs font-medium text-[#F4F5F7] cursor-pointer">
               <input
                 type="checkbox"
                 checked={restrictApps}
                 onChange={(e) => setRestrictApps(e.target.checked)}
-                className="rounded border-slate-600 bg-slate-950"
+                className="rounded border-white/20 bg-[#090A0C] accent-emerald-500"
               />
               <Lock className="h-3.5 w-3.5 text-sky-400" />
               Lock this pass to specific apps only (optional)
@@ -317,10 +436,10 @@ export function KeysSettingsTab({
                           key={app.slug}
                           type="button"
                           onClick={() => toggleAllowedSlug(app.slug)}
-                          className={`rounded-lg border px-2.5 py-1 text-xs font-mono transition cursor-pointer ${
+                          className={`btn-press rounded-lg border px-2.5 py-1 text-xs font-mono cursor-pointer ${
                             checked
-                              ? "border-sky-400 bg-sky-500/20 text-sky-200"
-                              : "border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200"
+                              ? "border-sky-400/60 bg-sky-500/15 text-sky-200"
+                              : "border-white/[0.1] bg-[#111317] text-[#9CA3AF] hover:text-white"
                           }`}
                         >
                           {checked ? "✓ " : "+ "}
@@ -331,16 +450,15 @@ export function KeysSettingsTab({
                   </div>
                 )}
                 <div>
-                  <label className="block text-xs text-slate-400 mb-1">
-                    Or type allowed app short IDs separated by commas (even for
-                    apps not launched yet)
+                  <label className="block text-xs text-[#9CA3AF] mb-1.5">
+                    Or type allowed app short IDs separated by commas
                   </label>
                   <input
                     type="text"
                     value={customSlugsText}
                     onChange={(e) => setCustomSlugsText(e.target.value)}
                     placeholder="my-blog, landing-page"
-                    className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-mono text-white"
+                    className="field-input w-full rounded-lg px-3 py-1.5 text-xs font-mono"
                   />
                 </div>
               </div>
@@ -350,26 +468,26 @@ export function KeysSettingsTab({
           <button
             type="submit"
             disabled={busy}
-            className="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+            className="btn-press inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
           >
             <Plus className="h-4 w-4" />
-            Create Visitor Pass
+            Create visitor pass
           </button>
         </form>
 
         {newRawToken && (
-          <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/10 p-4 space-y-2">
+          <div className="rounded-xl border border-emerald-500/40 bg-emerald-500/[0.08] p-4 space-y-2">
             <p className="text-xs font-semibold text-emerald-300">
-              Copy this key now — for your safety it will never be shown again:
+              Copy this key now. For your safety it will never be shown again:
             </p>
             <div className="flex items-center gap-2">
-              <code className="flex-1 overflow-x-auto rounded-lg bg-slate-950 px-3 py-2 text-xs font-mono text-emerald-200">
+              <code className="surface-well flex-1 overflow-x-auto rounded-lg px-3 py-2 text-xs font-mono text-emerald-200">
                 {newRawToken}
               </code>
               <button
                 type="button"
                 onClick={() => copyText("new-token", newRawToken)}
-                className="inline-flex items-center gap-1 rounded-lg bg-emerald-500 px-3 py-2 text-xs font-semibold text-slate-950 hover:bg-emerald-400 cursor-pointer"
+                className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-2 text-xs font-semibold text-[#042F1E] hover:bg-emerald-400 cursor-pointer"
               >
                 {copiedId === "new-token" ? (
                   <Check className="h-3.5 w-3.5" />
@@ -383,15 +501,15 @@ export function KeysSettingsTab({
         )}
       </section>
 
-      {/* Setup Snippets */}
+      {/* Connect Your AI Tool */}
       {snippets && (
-        <section className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6 space-y-4">
+        <section className="surface-panel rounded-xl p-6 space-y-4">
           {!snippets.httpsReady && (
-            <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
+            <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
               <span>
                 {setup.domain
                   ? `HTTPS certificate for ${setup.domain} is currently ${setup.tlsStatus}${setup.tlsError ? `: ${setup.tlsError}` : ""}. Remote HTTPS MCP will be advertised once TLS succeeds.`
-                  : "No verified HTTPS domain yet — using local URL. Bind a domain below for remote HTTPS MCP access."}
+                  : "No verified HTTPS domain yet. Using local URL until you bind a domain below."}
               </span>
               {setup.domain && (
                 <button
@@ -405,26 +523,27 @@ export function KeysSettingsTab({
                       setBusy(false);
                     }
                   }}
-                  className="rounded-lg bg-amber-400 px-3 py-1 text-xs font-semibold text-slate-950 hover:bg-amber-300 cursor-pointer"
+                  className="btn-press rounded-lg bg-amber-400 px-3 py-1 text-xs font-semibold text-[#1A1200] hover:bg-amber-300 cursor-pointer"
                 >
                   Re-check HTTPS
                 </button>
               )}
             </div>
           )}
-          <div className="flex flex-wrap items-center justify-between gap-2">
+
+          <div className="flex flex-wrap items-start justify-between gap-4">
             <div className="space-y-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <h3 className="text-base font-semibold text-white">
-                  Connect Your AI Tool
-                </h3>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <h2 className="text-sm font-semibold text-white">
+                  Connect your AI tool
+                </h2>
                 {newRawToken && (
-                  <span className="rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
-                    New key auto-filled — ready for 1-click copy
+                  <span className="text-xs font-medium text-emerald-400">
+                    New key auto-filled
                   </span>
                 )}
               </div>
-              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+              <div className="flex flex-wrap items-center gap-2.5 text-xs text-[#9CA3AF]">
                 <span>
                   Doorway URL:{" "}
                   <code className="text-emerald-300">{snippets.mcpUrl}</code>
@@ -433,32 +552,73 @@ export function KeysSettingsTab({
                   type="button"
                   disabled={testing}
                   onClick={handleCheckGatewayStatus}
-                  className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-0.5 text-[11px] font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
+                  className="btn-press inline-flex items-center gap-1 rounded-md border border-white/[0.1] bg-[#0C0E12] px-2 py-0.5 text-[11px] font-medium text-[#F4F5F7] hover:bg-[#161920] disabled:opacity-50 cursor-pointer"
                 >
                   <Activity className="h-3 w-3 text-emerald-400" />
-                  {testing ? "Checking..." : "Check Gateway Status"}
+                  {testing ? "Checking..." : "Check gateway"}
                 </button>
               </div>
             </div>
-            <div className="flex flex-wrap gap-1.5">
+
+            {/* Connected Segmented Client Selector */}
+            <div
+              role="tablist"
+              aria-label="AI client snippets"
+              className="inline-flex flex-wrap rounded-lg border border-white/[0.08] bg-[#0C0E12] p-1 gap-0.5"
+              onKeyDown={(e) => {
+                if (
+                  e.key !== "ArrowLeft" &&
+                  e.key !== "ArrowRight" &&
+                  e.key !== "Home" &&
+                  e.key !== "End"
+                ) {
+                  return;
+                }
+                e.preventDefault();
+                const order = [
+                  "claudeCode",
+                  "t3AndAgy",
+                  "cursor",
+                  "codex",
+                  "genericHttp",
+                  "curlTest",
+                ] as const;
+                const idx = order.indexOf(activeClient);
+                const next =
+                  e.key === "Home"
+                    ? order[0]
+                    : e.key === "End"
+                      ? order[order.length - 1]!
+                      : e.key === "ArrowRight"
+                        ? order[(idx + 1) % order.length]!
+                        : order[(idx - 1 + order.length) % order.length]!;
+                setActiveClient(next);
+                document.getElementById(`mcp-client-tab-${next}`)?.focus();
+              }}
+            >
               {(
                 [
                   ["claudeCode", "Claude Code"],
-                  ["t3AndAgy", "T3 Code / AGY"],
+                  ["t3AndAgy", "T3 / AGY"],
                   ["cursor", "Cursor"],
                   ["codex", "Codex"],
-                  ["genericHttp", "Generic HTTP"],
-                  ["curlTest", "Curl Test"],
+                  ["genericHttp", "HTTP"],
+                  ["curlTest", "Curl"],
                 ] as const
               ).map(([id, label]) => (
                 <button
                   key={id}
+                  id={`mcp-client-tab-${id}`}
+                  role="tab"
+                  aria-selected={activeClient === id}
+                  aria-controls="mcp-client-snippet-panel"
+                  tabIndex={activeClient === id ? 0 : -1}
                   type="button"
                   onClick={() => setActiveClient(id)}
-                  className={`rounded-lg px-3 py-1.5 text-xs font-medium transition cursor-pointer ${
+                  className={`btn-press rounded-md px-2.5 py-1 text-xs font-medium cursor-pointer ${
                     activeClient === id
-                      ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
-                      : "bg-slate-950 text-slate-400 border border-slate-800 hover:text-slate-200"
+                      ? "bg-white/[0.1] text-white"
+                      : "text-[#9CA3AF] hover:text-[#F4F5F7]"
                   }`}
                 >
                   {label}
@@ -469,10 +629,10 @@ export function KeysSettingsTab({
 
           {testResult && (
             <div
-              className={`rounded-xl border px-4 py-3 text-xs ${
+              className={`rounded-lg border px-4 py-3 text-xs ${
                 testResult.ok
-                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
-                  : "border-amber-500/30 bg-amber-500/10 text-amber-200"
+                  ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-200"
+                  : "border-amber-500/35 bg-amber-500/10 text-amber-200"
               }`}
             >
               <span className="font-semibold">
@@ -482,14 +642,19 @@ export function KeysSettingsTab({
             </div>
           )}
 
-          <div className="relative">
-            <pre className="rounded-xl border border-slate-800 bg-slate-950 p-4 text-xs font-mono text-slate-200 overflow-x-auto">
+          <div
+            id="mcp-client-snippet-panel"
+            role="tabpanel"
+            aria-labelledby={`mcp-client-tab-${activeClient}`}
+            className="relative"
+          >
+            <pre className="surface-well rounded-lg p-4 pr-24 text-xs font-mono text-[#E5E7EB] overflow-x-auto leading-relaxed">
               {activeSnippet}
             </pre>
             <button
               type="button"
               onClick={() => copyText("snippet", activeSnippet)}
-              className="absolute top-3 right-3 inline-flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1 text-xs text-slate-200 hover:bg-slate-800 cursor-pointer"
+              className="btn-press absolute top-3 right-3 inline-flex items-center gap-1.5 rounded-md border border-white/[0.1] bg-[#161920] px-2.5 py-1 text-xs font-medium text-[#F4F5F7] hover:bg-[#1E222B] cursor-pointer"
             >
               {copiedId === "snippet" ? (
                 <Check className="h-3.5 w-3.5 text-emerald-400" />
@@ -502,56 +667,60 @@ export function KeysSettingsTab({
         </section>
       )}
 
-      {/* Existing Tokens */}
-      <section className="rounded-2xl border border-slate-800 bg-slate-900/70 overflow-hidden">
-        <div className="px-6 py-4 border-b border-slate-800">
-          <h3 className="text-base font-semibold text-white">
-            Your AI Visitor Passes ({tokens.length})
-          </h3>
+      {/* Existing Visitor Passes */}
+      <section className="surface-panel rounded-xl overflow-hidden">
+        <div className="px-6 py-4 border-b border-white/[0.08] flex items-center justify-between">
+          <h2 className="text-sm font-semibold text-white">
+            Your AI visitor passes
+            <span className="ml-2 text-xs font-normal text-[#9CA3AF] tabular-nums">
+              ({tokens.length})
+            </span>
+          </h2>
         </div>
+
         {tokens.length === 0 ? (
-          <p className="p-6 text-sm text-slate-400">
-            No visitor passes created yet.
+          <p className="p-6 text-sm text-[#9CA3AF]">
+            No visitor passes created yet. Create one above to connect your AI
+            coding assistant.
           </p>
         ) : (
-          <div className="divide-y divide-slate-800/80">
+          <div className="divide-y divide-white/[0.06]">
             {tokens.map((tok) => {
               const info = SCOPE_LABELS[tok.scope];
               const isRevoked = Boolean(tok.revokedAt);
               return (
                 <div
                   key={tok.id}
-                  className="flex flex-wrap items-center justify-between gap-3 px-6 py-3.5"
+                  className="row-interactive flex flex-wrap items-center justify-between gap-4 px-6 py-4"
                 >
-                  <div className="space-y-0.5">
-                    <div className="flex flex-wrap items-center gap-2">
+                  <div className="space-y-1 min-w-0">
+                    <div className="flex flex-wrap items-center gap-2.5">
                       <span
                         className={`text-sm font-medium ${
                           isRevoked
-                            ? "line-through text-slate-500"
+                            ? "line-through text-[#6B7280]"
                             : "text-white"
                         }`}
                       >
                         {tok.name}
                       </span>
                       <span
-                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${info.badge}`}
+                        className={`inline-flex items-center gap-1.5 text-xs font-medium ${info.text}`}
                       >
+                        <span className={`h-1.5 w-1.5 rounded-full ${info.dot}`} />
                         {info.title}
                       </span>
                       {tok.allowedSlugs.length > 0 && (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-slate-800 px-2 py-0.5 text-xs font-mono text-sky-300">
+                        <span className="inline-flex items-center gap-1 text-xs font-mono text-sky-300">
                           <Lock className="h-3 w-3" />
                           {tok.allowedSlugs.join(", ")}
                         </span>
                       )}
                       {isRevoked && (
-                        <span className="rounded-full bg-rose-500/15 px-2 py-0.5 text-xs text-rose-300">
-                          Turned Off
-                        </span>
+                        <span className="text-xs text-rose-400">Turned off</span>
                       )}
                     </div>
-                    <p className="text-xs font-mono text-slate-500">
+                    <p className="text-xs font-mono text-[#6B7280] tabular-nums">
                       {tok.tokenPrefix}•••••••• &middot;{" "}
                       {tok.lastUsedAt
                         ? `Last used ${new Date(tok.lastUsedAt).toLocaleString()}`
@@ -562,9 +731,10 @@ export function KeysSettingsTab({
                     <button
                       type="button"
                       onClick={() => handleRevoke(tok.id)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-rose-500/30 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/10 cursor-pointer"
+                      className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-rose-500/30 bg-rose-500/[0.05] px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/15 cursor-pointer"
                     >
-                      <Trash2 className="h-3.5 w-3.5" /> Turn Off
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Turn off
                     </button>
                   )}
                 </div>
@@ -574,69 +744,69 @@ export function KeysSettingsTab({
         )}
       </section>
 
-      {/* Dashboard Domain & Default Apps Base Domain */}
-      <section className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6 space-y-6">
+      {/* Domains & Automatic HTTPS */}
+      <section className="surface-panel rounded-xl p-6 space-y-6">
         <div className="flex items-center gap-2">
           <Globe className="h-4 w-4 text-sky-400" />
-          <h3 className="text-base font-semibold text-white">
-            Domains &amp; Automatic HTTPS
-          </h3>
+          <h2 className="text-sm font-semibold text-white">
+            Domains &amp; automatic HTTPS
+          </h2>
         </div>
 
         <form
           onSubmit={handleUpdateDomain}
-          className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end"
+          className="grid grid-cols-1 md:grid-cols-3 gap-3.5 items-end"
         >
           <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1">
-              Dashboard Domain Name
+            <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              Dashboard domain name
             </label>
             <input
               type="text"
               value={domain}
               onChange={(e) => setDomain(e.target.value)}
               placeholder="vps.yourdomain.com"
-              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+              className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
             />
           </div>
           <div>
-            <label className="block text-xs font-medium text-slate-300 mb-1">
-              Certificate Notice Email (Optional)
+            <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              Certificate notice email (optional)
             </label>
             <input
               type="email"
               value={acmeEmail}
               onChange={(e) => setAcmeEmail(e.target.value)}
               placeholder="you@yourdomain.com"
-              className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+              className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
             />
           </div>
           <button
             type="submit"
             disabled={busy}
-            className="rounded-lg bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-white disabled:opacity-50 cursor-pointer"
+            className="btn-press rounded-lg bg-[#F4F5F7] px-4 py-2 text-[13px] font-semibold text-[#090A0C] hover:bg-white disabled:opacity-50 cursor-pointer"
           >
-            Save Dashboard Domain
+            Save dashboard domain
           </button>
         </form>
 
-        <div className="border-t border-slate-800 pt-5 space-y-3">
+        <div className="border-t border-white/[0.08] pt-5 space-y-3.5">
           <div>
-            <h4 className="text-sm font-semibold text-white">
-              Default Web Address for New Apps (Optional)
-            </h4>
-            <p className="text-xs text-slate-400 mt-0.5">
+            <h3 className="text-sm font-semibold text-white">
+              Default web address for new apps (optional)
+            </h3>
+            <p className="text-xs text-[#9CA3AF] mt-1 leading-relaxed">
               Set a base domain once so every new app automatically gets{" "}
               <code className="text-emerald-300">
                 https://app-name.{appsBaseDomain || "yourdomain.com"}
               </code>{" "}
               with automatic HTTPS. Add one wildcard DNS{" "}
-              <code className="text-slate-200">A</code> record:{" "}
-              <code className="text-slate-200">
+              <code className="text-[#F4F5F7]">A</code> record:{" "}
+              <code className="text-[#F4F5F7]">
                 *.{appsBaseDomain || "yourdomain.com"}
               </code>{" "}
               &rarr;{" "}
-              <code className="text-slate-200">
+              <code className="text-[#F4F5F7]">
                 {publicIp || "YOUR_SERVER_IP"}
               </code>
               .
@@ -644,29 +814,212 @@ export function KeysSettingsTab({
           </div>
           <form
             onSubmit={handleUpdateAppsBaseDomain}
-            className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end"
+            className="grid grid-cols-1 md:grid-cols-3 gap-3.5 items-end"
           >
             <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-slate-300 mb-1">
-                Default Apps Base Domain
+              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                Default apps base domain
               </label>
               <input
                 type="text"
                 value={appsBaseDomain}
                 onChange={(e) => setAppsBaseDomain(e.target.value)}
                 placeholder="apps.yourdomain.com (leave empty to disable)"
-                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
               />
             </div>
             <button
               type="submit"
               disabled={busy}
-              className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+              className="btn-press rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
             >
-              Save Default Domain
+              Save default domain
             </button>
           </form>
         </div>
+      </section>
+
+      {/* VPSAgent Updates */}
+      <section className="surface-panel rounded-xl p-6 space-y-5">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <ArrowDownToLine className="h-4 w-4 text-emerald-400" />
+              <h2 className="text-sm font-semibold text-white">
+                VPSAgent updates
+              </h2>
+              {updateStatus?.state === "updating" && (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  {reconnectingUpdate ? "Restarting..." : "Updating..."}
+                </span>
+              )}
+              {updateStatus?.state !== "updating" &&
+                updateStatus?.updateAvailable && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                    {updateStatus.commitsBehind} new{" "}
+                    {updateStatus.commitsBehind === 1 ? "update" : "updates"}
+                  </span>
+                )}
+              {updateStatus?.state !== "updating" &&
+                updateStatus?.state !== "failed" &&
+                updateStatus?.checkedAt &&
+                !updateStatus.updateAvailable &&
+                updateStatus.canUpdate && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.1] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-[#D1D5DB]">
+                    Up to date
+                  </span>
+                )}
+            </div>
+            <p className="text-xs text-[#9CA3AF]">
+              Pull the latest VPSAgent version and rebuild the dashboard
+              automatically without touching your running apps or secrets.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={
+                updateLoading ||
+                checkingUpdate ||
+                startingUpdate ||
+                updateStatus?.state === "updating"
+              }
+              onClick={handleCheckUpdates}
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0C0E12] px-3 py-2 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${checkingUpdate ? "animate-spin" : ""}`}
+              />
+              {checkingUpdate ? "Checking..." : "Check for updates"}
+            </button>
+            <button
+              type="button"
+              disabled={
+                updateLoading ||
+                startingUpdate ||
+                checkingUpdate ||
+                !updateStatus?.canUpdate ||
+                updateStatus.state === "updating"
+              }
+              onClick={handleApplyUpdate}
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+            >
+              <ArrowDownToLine className="h-4 w-4" />
+              {updateStatus?.state === "updating"
+                ? "Updating..."
+                : startingUpdate
+                  ? "Starting..."
+                  : "Update VPSAgent"}
+            </button>
+          </div>
+        </div>
+
+        <div className="surface-well rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[#9CA3AF]">
+            <span>
+              Version:{" "}
+              <code className="font-mono text-[#F4F5F7]">
+                {updateStatus?.currentVersion
+                  ? `v${updateStatus.currentVersion}`
+                  : "Unknown"}
+              </code>
+            </span>
+            {updateStatus?.currentCommit && (
+              <span>
+                Build:{" "}
+                <code className="font-mono text-[#F4F5F7]">
+                  {updateStatus.currentCommit.slice(0, 7)}
+                </code>
+              </span>
+            )}
+            {updateStatus?.branch && (
+              <span>
+                Branch:{" "}
+                <code className="font-mono text-[#F4F5F7]">
+                  {updateStatus.branch}
+                </code>
+              </span>
+            )}
+          </div>
+          {updateStatus?.checkedAt && (
+            <span className="text-[11px] text-[#6B7280] tabular-nums">
+              Last checked {new Date(updateStatus.checkedAt).toLocaleString()}
+            </span>
+          )}
+        </div>
+
+        {updateStatus?.latestCommitSubject && updateStatus.updateAvailable && (
+          <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/[0.06] px-4 py-3 text-xs text-emerald-200">
+            <span className="font-semibold">Latest change: </span>
+            {updateStatus.latestCommitSubject}
+            {updateStatus.latestCommit && (
+              <code className="ml-2 font-mono text-emerald-300/80">
+                ({updateStatus.latestCommit.slice(0, 7)})
+              </code>
+            )}
+          </div>
+        )}
+
+        {updateStatus?.state === "updating" && (
+          <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+            <span className="font-semibold">
+              {reconnectingUpdate
+                ? "Restarting VPSAgent: "
+                : "Update in progress: "}
+            </span>
+            {reconnectingUpdate
+              ? "Reconnecting to your server automatically. This page will refresh as soon as it is back."
+              : updateStatus.message ||
+                "Downloading and rebuilding VPSAgent..."}
+          </div>
+        )}
+
+        {updateStatus?.state === "failed" && updateStatus.error && (
+          <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+            <span className="font-semibold">Last update failed: </span>
+            {updateStatus.error}
+          </div>
+        )}
+
+        {!updateLoading &&
+          updateStatus &&
+          !updateStatus.canUpdate &&
+          updateStatus.unavailableReason && (
+            <p className="text-xs text-[#9CA3AF]">
+              {updateStatus.unavailableReason}
+            </p>
+          )}
+
+        {!updateLoading && !updateStatus && updateLoadError && (
+          <p className="text-xs text-amber-300">
+            Could not check update availability: {updateLoadError}
+          </p>
+        )}
+
+        {updateStatus && updateStatus.logs.length > 0 && (
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={() => setShowUpdateLogs((prev) => !prev)}
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
+            >
+              {showUpdateLogs ? (
+                <ChevronUp className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5" />
+              )}
+              {showUpdateLogs ? "Hide update log" : "View update log"}
+            </button>
+            {showUpdateLogs && (
+              <pre className="surface-well max-h-56 overflow-auto rounded-lg p-3 text-[11px] font-mono text-[#D1D5DB] leading-relaxed">
+                {updateStatus.logs.join("\n")}
+              </pre>
+            )}
+          </div>
+        )}
       </section>
     </div>
   );

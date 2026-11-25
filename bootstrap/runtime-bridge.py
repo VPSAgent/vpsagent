@@ -31,6 +31,10 @@ import ipaddress
 import json
 import os
 import platform
+try:
+    import pwd
+except ImportError:  # pragma: no cover - non-POSIX
+    pwd = None  # type: ignore[assignment]
 import re
 import select
 import shutil
@@ -2332,6 +2336,9 @@ class RuntimeService:
         caddy_container: str,
         docker_bin: str = "docker",
         git_bin: str = "git",
+        systemctl_bin: str = "systemctl",
+        vpsagent_root: str | None = None,
+        repo_dir: str | None = None,
         runtime_token: str | None = None,
         allow_unauthenticated: bool = False,
         status_deadline_s: float = DEFAULT_STATUS_DEADLINE_S,
@@ -2347,6 +2354,8 @@ class RuntimeService:
             raise ValueError("Invalid docker binary path.")
         if not git_bin or any(ch.isspace() for ch in git_bin):
             raise ValueError("Invalid git binary path.")
+        if not systemctl_bin or any(ch.isspace() for ch in systemctl_bin):
+            raise ValueError("Invalid systemctl binary path.")
         cleaned_token = (runtime_token or "").strip() or None
         if not cleaned_token and not allow_unauthenticated:
             raise ValueError(
@@ -2360,6 +2369,25 @@ class RuntimeService:
         self.caddy_container = caddy_container
         self.docker_bin = docker_bin
         self.git_bin = git_bin
+        self.systemctl_bin = systemctl_bin
+        if vpsagent_root:
+            self.vpsagent_root = os.path.abspath(vpsagent_root)
+        else:
+            env_root = os.environ.get("VPSAGENT_ROOT", "").strip()
+            if env_root:
+                self.vpsagent_root = os.path.abspath(env_root)
+            elif os.path.basename(os.path.abspath(apps_root)) == "apps":
+                self.vpsagent_root = os.path.dirname(os.path.abspath(apps_root))
+            else:
+                self.vpsagent_root = "/var/lib/vpsagent"
+        resolved_repo = (
+            repo_dir.strip()
+            if isinstance(repo_dir, str) and repo_dir.strip()
+            else os.environ.get("VPSAGENT_REPO_DIR", "").strip()
+        )
+        if not resolved_repo and os.path.isdir("/opt/vpsagent/.git"):
+            resolved_repo = "/opt/vpsagent"
+        self.repo_dir = os.path.abspath(resolved_repo) if resolved_repo else None
         self.runtime_token = cleaned_token
         self.allow_unauthenticated = allow_unauthenticated
         self.status_deadline_s = max(0.2, float(status_deadline_s))
@@ -2386,6 +2414,11 @@ class RuntimeService:
         self._host_health: dict[str, dict[str, Any]] = {}
         self._health_stop_event = threading.Event()
         self._health_thread: threading.Thread | None = None
+        self._update_lock = threading.Lock()
+        self._update_status_file = os.path.join(
+            self.vpsagent_root, "run", "update-status.json"
+        )
+        self._update_state: dict[str, Any] = self._load_persisted_update_state()
 
     def _read_app_probe_config(self, app_dir: str, slug: str) -> dict[str, Any] | None:
         probe_file = os.path.join(app_dir, "probe.json")
@@ -4643,6 +4676,740 @@ class RuntimeService:
             "reclaimedSummary": redact_secrets(reclaimed_summary),
         }
 
+    # ------------------------------------------------------------------
+    # VPSAgent Self-Update (Check + Safe Detached Rebuild)
+    # ------------------------------------------------------------------
+
+    def _default_update_state(self) -> dict[str, Any]:
+        return {
+            "state": "idle",
+            "phase": None,
+            "checkedAt": None,
+            "startedAt": None,
+            "finishedAt": None,
+            "latestCommit": None,
+            "latestCommitSubject": None,
+            "latestCommitDate": None,
+            "commitsBehind": 0,
+            "updateAvailable": False,
+            "message": None,
+            "error": None,
+            "logs": [],
+        }
+
+    def _load_persisted_update_state(self) -> dict[str, Any]:
+        base = self._default_update_state()
+        try:
+            if not os.path.isfile(self._update_status_file):
+                return base
+            with open(self._update_status_file, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if not isinstance(loaded, dict):
+                return base
+            for key in base:
+                if key in loaded:
+                    base[key] = loaded[key]
+            # If the bridge restarted while an update was marked in-progress, don't stay stuck forever.
+            if base.get("state") == "updating":
+                base["state"] = "idle"
+                base["phase"] = None
+                base["message"] = "Previous update session was interrupted by a service restart."
+            if not isinstance(base.get("logs"), list):
+                base["logs"] = []
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return base
+        return base
+
+    def _persist_update_state(self, state: dict[str, Any]) -> None:
+        try:
+            parent = os.path.dirname(self._update_status_file)
+            os.makedirs(parent, exist_ok=True)
+            tmp_path = f"{self._update_status_file}.tmp.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2)
+            os.chmod(tmp_path, 0o640)
+            os.replace(tmp_path, self._update_status_file)
+        except OSError:
+            pass
+
+    def _read_repo_package_version(self, repo_dir: str) -> str | None:
+        pkg_path = os.path.join(repo_dir, "package.json")
+        if not os.path.isfile(pkg_path):
+            return None
+        try:
+            with open(pkg_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            version = data.get("version")
+            if isinstance(version, str) and version.strip():
+                return version.strip()
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        return None
+
+    def _run_repo_git(
+        self,
+        repo_dir: str,
+        git_args: list[str],
+        *,
+        timeout: float = 30,
+    ) -> subprocess.CompletedProcess[str]:
+        """
+        Runs Git inside `repo_dir`. When the bridge runs as root on a user-owned
+        checkout (e.g. `/home/ubuntu/vpsagent`), drops privileges to the checkout
+        owner so Git trusts the repository, uses the owner's SSH/Git credentials,
+        and never parses user-controlled `.git/config` as root.
+        """
+        extra_env: dict[str, str] = {"GIT_TERMINAL_PROMPT": "0"}
+        run_kwargs: dict[str, Any] = {}
+        try:
+            st = os.stat(repo_dir)
+            if (
+                pwd is not None
+                and hasattr(os, "geteuid")
+                and os.geteuid() == 0
+                and st.st_uid != 0
+            ):
+                pw = pwd.getpwuid(st.st_uid)
+                extra_env["HOME"] = pw.pw_dir
+                extra_env["USER"] = pw.pw_name
+                extra_env["LOGNAME"] = pw.pw_name
+                run_kwargs["user"] = st.st_uid
+                run_kwargs["group"] = st.st_gid
+        except (OSError, KeyError):
+            pass
+
+        cmd = [self.git_bin, "-C", repo_dir, *git_args]
+        try:
+            return subprocess.run(
+                cmd,
+                shell=False,
+                env=_sanitized_subprocess_env(extra_env),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                **run_kwargs,
+            )
+        except FileNotFoundError as exc:
+            raise BridgeRequestError(
+                503, f"git CLI binary not found ({self.git_bin})."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise BridgeRequestError(
+                504, f"git command timed out after {int(timeout)}s."
+            ) from exc
+
+    def _inspect_core_repo(self) -> dict[str, Any]:
+        repo_dir = self.repo_dir
+        if not repo_dir or not os.path.isdir(repo_dir):
+            return {
+                "canUpdate": False,
+                "unavailableReason": "VPSAgent source folder is not configured on this server.",
+                "repoDir": repo_dir,
+                "branch": None,
+                "currentVersion": None,
+                "currentCommit": None,
+                "dirtyWorkingTree": False,
+                "divergedBranch": False,
+            }
+        git_dir = os.path.join(repo_dir, ".git")
+        if not os.path.exists(git_dir):
+            return {
+                "canUpdate": False,
+                "unavailableReason": "VPSAgent source folder is not a Git repository.",
+                "repoDir": repo_dir,
+                "branch": None,
+                "currentVersion": self._read_repo_package_version(repo_dir),
+                "currentCommit": None,
+                "dirtyWorkingTree": False,
+                "divergedBranch": False,
+            }
+
+        version = self._read_repo_package_version(repo_dir)
+        head_proc = self._run_repo_git(repo_dir, ["rev-parse", "HEAD"], timeout=10)
+        head_err = (head_proc.stderr or "").strip()
+        if head_proc.returncode != 0 and "dubious ownership" in head_err.lower():
+            return {
+                "canUpdate": False,
+                "unavailableReason": "Git refused access to the VPSAgent folder due to directory ownership mismatch.",
+                "repoDir": repo_dir,
+                "branch": None,
+                "currentVersion": version,
+                "currentCommit": None,
+                "dirtyWorkingTree": False,
+                "divergedBranch": False,
+            }
+        current_commit = (
+            (head_proc.stdout or "").strip() if head_proc.returncode == 0 else None
+        ) or None
+
+        branch_proc = self._run_repo_git(
+            repo_dir, ["rev-parse", "--abbrev-ref", "HEAD"], timeout=10
+        )
+        raw_branch = (
+            (branch_proc.stdout or "").strip() if branch_proc.returncode == 0 else ""
+        )
+        if not raw_branch or raw_branch == "HEAD":
+            branch = os.environ.get("VPSAGENT_REPO_REF", "main").strip() or "main"
+        else:
+            branch = raw_branch
+
+        status_proc = self._run_repo_git(
+            repo_dir, ["status", "--porcelain"], timeout=10
+        )
+        dirty = (
+            bool((status_proc.stdout or "").strip())
+            if status_proc.returncode == 0
+            else False
+        )
+
+        remote_proc = self._run_repo_git(
+            repo_dir, ["remote", "get-url", "origin"], timeout=10
+        )
+        if remote_proc.returncode != 0 or not (remote_proc.stdout or "").strip():
+            remote_err = (remote_proc.stderr or "").strip()
+            if "dubious ownership" in remote_err.lower():
+                reason = "Git refused access to the VPSAgent folder due to directory ownership mismatch."
+            elif "permission denied" in remote_err.lower():
+                reason = "Permission denied while inspecting the VPSAgent Git repository."
+            else:
+                reason = "No 'origin' Git remote is configured for VPSAgent."
+            return {
+                "canUpdate": False,
+                "unavailableReason": reason,
+                "repoDir": repo_dir,
+                "branch": branch,
+                "currentVersion": version,
+                "currentCommit": current_commit,
+                "dirtyWorkingTree": dirty,
+                "divergedBranch": False,
+            }
+
+        diverged = False
+        if current_commit:
+            remote_ref = f"origin/{branch}"
+            ref_exists = self._run_repo_git(
+                repo_dir, ["rev-parse", "--verify", remote_ref], timeout=10
+            )
+            if ref_exists.returncode == 0:
+                anc_proc = self._run_repo_git(
+                    repo_dir,
+                    ["merge-base", "--is-ancestor", "HEAD", remote_ref],
+                    timeout=10,
+                )
+                if anc_proc.returncode == 1:
+                    diverged = True
+
+        if dirty:
+            unavailable_reason: str | None = (
+                "Local edits exist in the VPSAgent source folder. Clean or commit them before updating."
+            )
+        elif diverged:
+            unavailable_reason = (
+                f"Local commits on '{branch}' have diverged from origin/{branch}. "
+                "Reconcile the branch before using one-click updates."
+            )
+        else:
+            unavailable_reason = None
+
+        return {
+            "canUpdate": not dirty and not diverged,
+            "unavailableReason": unavailable_reason,
+            "repoDir": repo_dir,
+            "branch": branch,
+            "currentVersion": version,
+            "currentCommit": current_commit,
+            "dirtyWorkingTree": dirty,
+            "divergedBranch": diverged,
+        }
+
+    def _build_update_status_response(
+        self, repo_info: dict[str, Any], state: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "state": state.get("state", "idle"),
+            "phase": state.get("phase"),
+            "canUpdate": bool(repo_info["canUpdate"]),
+            "unavailableReason": repo_info["unavailableReason"],
+            "repoDir": repo_info["repoDir"],
+            "branch": repo_info["branch"],
+            "currentVersion": repo_info["currentVersion"],
+            "currentCommit": repo_info["currentCommit"],
+            "latestCommit": state.get("latestCommit"),
+            "latestCommitSubject": state.get("latestCommitSubject"),
+            "latestCommitDate": state.get("latestCommitDate"),
+            "commitsBehind": int(state.get("commitsBehind") or 0),
+            "updateAvailable": bool(state.get("updateAvailable")),
+            "dirtyWorkingTree": bool(repo_info["dirtyWorkingTree"]),
+            "checkedAt": state.get("checkedAt"),
+            "startedAt": state.get("startedAt"),
+            "finishedAt": state.get("finishedAt"),
+            "message": redact_secrets(state["message"])
+            if isinstance(state.get("message"), str)
+            else None,
+            "error": redact_secrets(state["error"])
+            if isinstance(state.get("error"), str)
+            else None,
+            "logs": [
+                redact_secrets(str(line))[:MAX_LOG_LINE_CHARS]
+                for line in (state.get("logs") or [])
+            ][-MAX_BUILD_LOG_LINES:],
+        }
+
+    def core_update_status(self, *, check_remote: bool = False) -> dict[str, Any]:
+        with self._update_lock:
+            is_updating = self._update_state.get("state") == "updating"
+            snapshot = dict(self._update_state)
+        repo_info = self._inspect_core_repo()
+
+        if check_remote and not is_updating and repo_info["repoDir"] and repo_info["branch"]:
+            repo_dir = repo_info["repoDir"]
+            branch = repo_info["branch"]
+            fetch_proc = self._run_repo_git(
+                repo_dir, ["fetch", "--prune", "origin", branch], timeout=45
+            )
+            if fetch_proc.returncode != 0:
+                detail = (
+                    (fetch_proc.stderr or fetch_proc.stdout or "git fetch failed").strip()
+                )
+                raise BridgeRequestError(
+                    502,
+                    f"Could not check for updates: {redact_secrets(detail)}",
+                )
+
+            # Re-inspect after fetch so diverged-branch status reflects the latest origin/<branch>
+            repo_info = self._inspect_core_repo()
+
+            remote_ref = f"origin/{branch}"
+            latest_proc = self._run_repo_git(
+                repo_dir, ["rev-parse", remote_ref], timeout=10
+            )
+            latest_commit = (
+                (latest_proc.stdout or "").strip()
+                if latest_proc.returncode == 0
+                else None
+            ) or None
+
+            meta_proc = self._run_repo_git(
+                repo_dir, ["show", "-s", "--format=%s%n%cI", remote_ref], timeout=10
+            )
+            latest_subject: str | None = None
+            latest_date: str | None = None
+            if meta_proc.returncode == 0:
+                meta_lines = (meta_proc.stdout or "").splitlines()
+                if len(meta_lines) >= 1 and meta_lines[0].strip():
+                    latest_subject = redact_secrets(meta_lines[0].strip())[:200]
+                if len(meta_lines) >= 2 and meta_lines[1].strip():
+                    latest_date = meta_lines[1].strip()
+
+            commits_behind = 0
+            if repo_info["currentCommit"] and latest_commit:
+                count_proc = self._run_repo_git(
+                    repo_dir,
+                    ["rev-list", "--count", f"HEAD..{remote_ref}"],
+                    timeout=10,
+                )
+                if count_proc.returncode == 0:
+                    try:
+                        commits_behind = max(
+                            0, int((count_proc.stdout or "0").strip())
+                        )
+                    except ValueError:
+                        commits_behind = 0
+
+            can_fast_forward = not repo_info.get("divergedBranch", False)
+            update_available = bool(
+                can_fast_forward
+                and latest_commit
+                and repo_info["currentCommit"]
+                and latest_commit != repo_info["currentCommit"]
+                and commits_behind > 0
+            )
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with self._update_lock:
+                if self._update_state.get("state") != "updating":
+                    self._update_state["checkedAt"] = now_iso
+                    self._update_state["latestCommit"] = latest_commit
+                    self._update_state["latestCommitSubject"] = latest_subject
+                    self._update_state["latestCommitDate"] = latest_date
+                    self._update_state["commitsBehind"] = commits_behind
+                    self._update_state["updateAvailable"] = update_available
+                    if self._update_state.get("state") in ("idle", "succeeded", "failed"):
+                        if not can_fast_forward:
+                            self._update_state["message"] = repo_info["unavailableReason"]
+                        elif update_available:
+                            self._update_state["message"] = (
+                                f"{commits_behind} new update{'s' if commits_behind != 1 else ''} ready to install."
+                            )
+                        else:
+                            self._update_state["message"] = "VPSAgent is up to date."
+                    self._persist_update_state(self._update_state)
+                snapshot = dict(self._update_state)
+
+        return self._build_update_status_response(repo_info, snapshot)
+
+    def _append_update_log(self, line: str, *, phase: str | None = None, message: str | None = None) -> None:
+        cleaned = redact_secrets(line).strip()
+        with self._update_lock:
+            if phase is not None:
+                self._update_state["phase"] = phase
+            if message is not None:
+                self._update_state["message"] = redact_secrets(message)
+            if cleaned:
+                logs = list(self._update_state.get("logs") or [])
+                logs.append(cleaned[:MAX_LOG_LINE_CHARS])
+                self._update_state["logs"] = logs[-MAX_BUILD_LOG_LINES:]
+            self._persist_update_state(self._update_state)
+
+    def start_core_update(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        repo_info = self._inspect_core_repo()
+        if not repo_info["canUpdate"] or not repo_info["repoDir"] or not repo_info["branch"]:
+            raise BridgeRequestError(
+                400,
+                repo_info["unavailableReason"]
+                or "Automatic updates are not available on this server.",
+            )
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._update_lock:
+            if self._update_state.get("state") == "updating":
+                raise BridgeRequestError(
+                    409, "A VPSAgent update is already in progress."
+                )
+            self._update_state = {
+                **self._update_state,
+                "state": "updating",
+                "phase": "fetching",
+                "startedAt": now_iso,
+                "finishedAt": None,
+                "error": None,
+                "message": "Downloading the latest VPSAgent version...",
+                "logs": [f"Starting VPSAgent update on branch {repo_info['branch']}..."],
+            }
+            self._persist_update_state(self._update_state)
+            snapshot = dict(self._update_state)
+
+        worker = threading.Thread(
+            target=self._run_core_update_worker,
+            args=(repo_info["repoDir"], repo_info["branch"]),
+            name="vpsagent-self-update",
+            daemon=False,
+        )
+        worker.start()
+
+        return {
+            "ok": True,
+            "started": True,
+            "status": self._build_update_status_response(repo_info, snapshot),
+        }
+
+    def _run_core_update_worker(self, repo_dir: str, branch: str) -> None:
+        bridge_changed = False
+        prev_commit: str | None = None
+        after_commit: str | None = None
+        merged_new_commit = False
+        config_snapshots: list[tuple[str, bytes | None, bytes]] = []
+        try:
+            # Record current HEAD so we can roll back cleanly if Docker build fails
+            prev_proc = self._run_repo_git(repo_dir, ["rev-parse", "HEAD"], timeout=10)
+            if prev_proc.returncode == 0 and (prev_proc.stdout or "").strip():
+                prev_commit = (prev_proc.stdout or "").strip()
+
+            # Step 1: Fetch and fast-forward checkout
+            self._append_update_log(
+                f"Fetching origin/{branch}...",
+                phase="fetching",
+                message="Downloading the latest VPSAgent code...",
+            )
+            fetch_proc = self._run_repo_git(
+                repo_dir, ["fetch", "--prune", "origin", branch], timeout=60
+            )
+            if fetch_proc.returncode != 0:
+                detail = (fetch_proc.stderr or fetch_proc.stdout or "git fetch failed").strip()
+                raise RuntimeError(f"Could not download updates from Git: {detail}")
+
+            status_proc = self._run_repo_git(
+                repo_dir, ["status", "--porcelain"], timeout=10
+            )
+            if status_proc.returncode == 0 and (status_proc.stdout or "").strip():
+                raise RuntimeError(
+                    "Local edits exist in the VPSAgent source folder. Clean or commit them before updating."
+                )
+
+            merge_proc = self._run_repo_git(
+                repo_dir, ["merge", "--ff-only", f"origin/{branch}"], timeout=30
+            )
+            if merge_proc.returncode != 0:
+                detail = (merge_proc.stderr or merge_proc.stdout or "git merge failed").strip()
+                raise RuntimeError(
+                    f"Could not fast-forward VPSAgent cleanly: {detail}"
+                )
+            after_merge_proc = self._run_repo_git(
+                repo_dir, ["rev-parse", "HEAD"], timeout=10
+            )
+            after_commit = (
+                (after_merge_proc.stdout or "").strip()
+                if after_merge_proc.returncode == 0
+                else None
+            )
+            merged_new_commit = bool(
+                prev_commit and after_commit and after_commit != prev_commit
+            )
+            for line in ((merge_proc.stdout or "") + "\n" + (merge_proc.stderr or "")).splitlines():
+                if line.strip():
+                    self._append_update_log(line)
+
+            # Step 2: Snapshot existing core configs before syncing updated files into VPSAGENT_ROOT
+            # Note: Never overwrite caddy/apps.d/00-default.caddy during updates so an app
+            # with slug "00-default" never loses its live HTTPS route.
+            self._append_update_log(
+                "Syncing VPSAgent configuration files...",
+                phase="syncing",
+                message="Preparing updated server configuration...",
+            )
+            bootstrap_dir = os.path.join(repo_dir, "bootstrap")
+            compose_src = os.path.join(bootstrap_dir, "docker-compose.core.yml")
+            compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
+            caddyfile_src = os.path.join(bootstrap_dir, "Caddyfile")
+            caddyfile_dst = os.path.join(self.vpsagent_root, "Caddyfile")
+
+            for src_path, dst_path in (
+                (caddyfile_src, caddyfile_dst),
+                (compose_src, compose_dst),
+            ):
+                if os.path.isfile(src_path) and os.path.isdir(self.vpsagent_root):
+                    old_content: bytes | None = None
+                    if os.path.isfile(dst_path):
+                        with open(dst_path, "rb") as fh:
+                            old_content = fh.read()
+                    with open(src_path, "rb") as fh:
+                        written_content = fh.read()
+                    try:
+                        with open(dst_path, "wb") as fh:
+                            fh.write(written_content)
+                    except OSError:
+                        # Immediately restore original file if write/close failed after truncation
+                        try:
+                            if old_content is None:
+                                if os.path.isfile(dst_path):
+                                    os.unlink(dst_path)
+                            else:
+                                with open(dst_path, "wb") as rfh:
+                                    rfh.write(old_content)
+                        except OSError:
+                            pass
+                        raise
+                    config_snapshots.append((dst_path, old_content, written_content))
+
+            # Step 3: Rebuild and restart vpsagent-core stack
+            env_file = os.path.join(self.vpsagent_root, ".env")
+            if not os.path.isfile(compose_dst) or not os.path.isfile(env_file):
+                raise RuntimeError(
+                    f"Core stack files not found in {self.vpsagent_root} (expected docker-compose.yml and .env)."
+                )
+
+            self._append_update_log(
+                "Rebuilding and restarting VPSAgent core container...",
+                phase="building",
+                message="Rebuilding VPSAgent (this usually takes 1-2 minutes)...",
+            )
+            compose_env = {**os.environ, "VPSAGENT_REPO_DIR": repo_dir}
+            compose_proc = subprocess.run(
+                [
+                    self.docker_bin,
+                    "compose",
+                    "--project-directory",
+                    self.vpsagent_root,
+                    "-f",
+                    compose_dst,
+                    "--env-file",
+                    env_file,
+                    "up",
+                    "-d",
+                    "--build",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+                env=compose_env,
+            )
+            combined_out = (
+                (compose_proc.stdout or "") + "\n" + (compose_proc.stderr or "")
+            ).splitlines()
+            for line in combined_out[-40:]:
+                if line.strip():
+                    self._append_update_log(line)
+            if compose_proc.returncode != 0:
+                raise RuntimeError(
+                    f"Docker rebuild failed (exit {compose_proc.returncode})."
+                )
+
+            # Step 4: Install updated runtime-bridge.py if changed
+            bridge_src = os.path.join(bootstrap_dir, "runtime-bridge.py")
+            bridge_dst = os.path.join(self.vpsagent_root, "runtime-bridge.py")
+            if os.path.isfile(bridge_src) and os.path.isdir(self.vpsagent_root):
+                with open(bridge_src, "rb") as fh:
+                    new_bytes = fh.read()
+                old_bytes: bytes | None = None
+                if os.path.isfile(bridge_dst):
+                    with open(bridge_dst, "rb") as fh:
+                        old_bytes = fh.read()
+                if old_bytes != new_bytes:
+                    tmp_bridge = f"{bridge_dst}.tmp.{os.getpid()}"
+                    with open(tmp_bridge, "wb") as fh:
+                        fh.write(new_bytes)
+                    os.chmod(tmp_bridge, 0o750)
+                    os.replace(tmp_bridge, bridge_dst)
+                    bridge_changed = True
+                    self._append_update_log(
+                        "Updated host Runtime Bridge script; scheduling seamless restart...",
+                        phase="restarting",
+                        message="Finishing update and restarting background bridge...",
+                    )
+
+            # Record success BEFORE restarting runtime-bridge.service so status survives restart
+            new_info = self._inspect_core_repo()
+            finished_iso = datetime.now(timezone.utc).isoformat()
+            short_sha = (new_info["currentCommit"] or "")[:7]
+            ver_label = (
+                f"v{new_info['currentVersion']}"
+                if new_info["currentVersion"]
+                else "latest version"
+            )
+            done_msg = (
+                f"Updated VPSAgent to {ver_label} ({short_sha})."
+                if short_sha
+                else f"Updated VPSAgent to {ver_label}."
+            )
+            with self._update_lock:
+                self._update_state = {
+                    **self._update_state,
+                    "state": "succeeded",
+                    "phase": "completed",
+                    "checkedAt": finished_iso,
+                    "finishedAt": finished_iso,
+                    "latestCommit": new_info["currentCommit"],
+                    "commitsBehind": 0,
+                    "updateAvailable": False,
+                    "error": None,
+                    "message": done_msg,
+                    "logs": (list(self._update_state.get("logs") or []) + [done_msg])[
+                        -MAX_BUILD_LOG_LINES:
+                    ],
+                }
+                self._persist_update_state(self._update_state)
+
+            if bridge_changed:
+                time.sleep(0.25)
+                try:
+                    is_active = self._run_cmd(
+                        [self.systemctl_bin, "is-active", "vpsagent-runtime.service"],
+                        label="systemd",
+                        timeout=5,
+                        check=False,
+                    )
+                    if is_active.returncode == 0:
+                        self._run_cmd(
+                            [
+                                self.systemctl_bin,
+                                "restart",
+                                "--no-block",
+                                "vpsagent-runtime.service",
+                            ],
+                            label="systemd",
+                            timeout=10,
+                            check=False,
+                        )
+                except Exception:
+                    pass
+        except Exception as exc:
+            err_text = redact_secrets(str(exc))
+            rollback_notes: list[str] = []
+            # Restore snapshotted Compose & Caddy config files ONLY if they still match what we wrote
+            # (never overwrite edits the owner made to active server config during the build).
+            restored_files: list[str] = []
+            for dst_path, old_content, written_content in reversed(config_snapshots):
+                fname = os.path.basename(dst_path)
+                try:
+                    if not os.path.isfile(dst_path):
+                        rollback_notes.append(
+                            f"Preserved {fname} because it was modified during the build."
+                        )
+                        continue
+                    with open(dst_path, "r+b") as fh:
+                        current_content = fh.read()
+                        if current_content != written_content:
+                            rollback_notes.append(
+                                f"Preserved {fname} because it was modified during the build."
+                            )
+                            continue
+                        if old_content is not None:
+                            fh.seek(0)
+                            fh.write(old_content)
+                            fh.truncate()
+                    if old_content is None:
+                        os.unlink(dst_path)
+                    restored_files.append(fname)
+                except OSError as restore_exc:
+                    rollback_notes.append(
+                        f"Failed to restore {fname}: {redact_secrets(str(restore_exc))}"
+                    )
+            if restored_files:
+                rollback_notes.append(
+                    f"Restored previous configuration files: {', '.join(restored_files)}."
+                )
+
+            # Only roll back Git checkout if it is still clean and at the exact merged commit
+            # (never discard local edits the owner made while Docker was building).
+            if merged_new_commit and prev_commit:
+                try:
+                    cur_head_proc = self._run_repo_git(
+                        repo_dir, ["rev-parse", "HEAD"], timeout=10
+                    )
+                    cur_head = (
+                        (cur_head_proc.stdout or "").strip()
+                        if cur_head_proc.returncode == 0
+                        else None
+                    )
+                    cur_status_proc = self._run_repo_git(
+                        repo_dir, ["status", "--porcelain"], timeout=10
+                    )
+                    is_still_clean = (
+                        cur_status_proc.returncode == 0
+                        and not (cur_status_proc.stdout or "").strip()
+                    )
+                    if is_still_clean and cur_head == after_commit:
+                        rb_proc = self._run_repo_git(
+                            repo_dir, ["reset", "--hard", prev_commit], timeout=20
+                        )
+                        if rb_proc.returncode == 0:
+                            rollback_notes.append(
+                                f"Rolled source checkout back to running commit {prev_commit[:7]}."
+                            )
+                    else:
+                        rollback_notes.append(
+                            "Skipped automatic Git rollback because local changes were detected in the checkout during the build."
+                        )
+                except Exception:
+                    pass
+            finished_iso = datetime.now(timezone.utc).isoformat()
+            with self._update_lock:
+                extra_logs = [f"ERROR: {err_text}", *rollback_notes]
+                self._update_state = {
+                    **self._update_state,
+                    "state": "failed",
+                    "phase": "failed",
+                    "finishedAt": finished_iso,
+                    "error": err_text,
+                    "message": "VPSAgent update failed.",
+                    "logs": (
+                        list(self._update_state.get("logs") or []) + extra_logs
+                    )[-MAX_BUILD_LOG_LINES:],
+                }
+                self._persist_update_state(self._update_state)
+
 
 def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
     class RuntimeBridgeHandler(BaseHTTPRequestHandler):
@@ -4732,6 +5499,16 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                 except Exception as exc:  # pragma: no cover
                     self._send_json(500, {"error": redact_secrets(str(exc))})
                 return
+            if self.path == "/v1/core/update/status":
+                if not self._require_auth():
+                    return
+                try:
+                    self._send_json(200, service.core_update_status(check_remote=False))
+                except BridgeRequestError as exc:
+                    self._send_json(exc.status_code, {"error": str(exc)})
+                except Exception as exc:  # pragma: no cover
+                    self._send_json(500, {"error": redact_secrets(str(exc))})
+                return
             self._send_json(404, {"error": "Not found."})
 
         def do_POST(self) -> None:
@@ -4753,6 +5530,10 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(200, service.route_core_domain(payload))
                 elif self.path == "/v1/core/tls-check":
                     self._send_json(200, service.check_core_tls(payload))
+                elif self.path == "/v1/core/update/check":
+                    self._send_json(200, service.core_update_status(check_remote=True))
+                elif self.path == "/v1/core/update/apply":
+                    self._send_json(200, service.start_core_update(payload))
                 elif self.path == "/v1/apps/remove":
                     self._send_json(200, service.remove_workload(payload))
                 elif self.path == "/v1/apps/statuses":
@@ -4863,6 +5644,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("VPSAGENT_GIT_BIN", "git"),
     )
     parser.add_argument(
+        "--systemctl-bin",
+        default=os.environ.get("VPSAGENT_SYSTEMCTL_BIN", "systemctl"),
+    )
+    parser.add_argument(
+        "--vpsagent-root",
+        default=os.environ.get("VPSAGENT_ROOT", ""),
+    )
+    parser.add_argument(
+        "--repo-dir",
+        default=os.environ.get("VPSAGENT_REPO_DIR", ""),
+    )
+    parser.add_argument(
         "--runtime-token",
         default=os.environ.get("VPSAGENT_RUNTIME_TOKEN", ""),
     )
@@ -4908,6 +5701,9 @@ def main(argv: list[str] | None = None) -> int:
         caddy_container=args.caddy_container,
         docker_bin=args.docker_bin,
         git_bin=args.git_bin,
+        systemctl_bin=args.systemctl_bin,
+        vpsagent_root=args.vpsagent_root or None,
+        repo_dir=args.repo_dir or None,
         runtime_token=token or None,
         allow_unauthenticated=bool(args.allow_unauthenticated),
         status_deadline_s=args.status_deadline,

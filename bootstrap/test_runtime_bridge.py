@@ -1277,6 +1277,464 @@ sys.exit(0)
         self.assertFalse(os.path.exists(parent_marker))
         self.assertFalse(os.path.exists(child_marker))
 
+    def test_core_update_check_and_apply_and_dirty_guard(self) -> None:
+        import subprocess
+
+        remote_dir = os.path.join(self.tmp, "remote.git")
+        work_dir = os.path.join(self.tmp, "upstream-work")
+        clone_dir = os.path.join(self.tmp, "vpsagent-clone")
+        vpsagent_root = os.path.join(self.tmp, "vpsagent-root")
+        os.makedirs(os.path.join(vpsagent_root, "apps"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "caddy", "apps.d"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "run"), exist_ok=True)
+        Path(os.path.join(vpsagent_root, ".env")).write_text(
+            "VPSAGENT_RUNTIME_TOKEN=test-secret-token-value-123456\n",
+            encoding="utf-8",
+        )
+
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        subprocess.run(["git", "init", "--bare", remote_dir], check=True, env=git_env)
+        subprocess.run(["git", "clone", remote_dir, work_dir], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "checkout", "-b", "main"], check=True, env=git_env)
+        os.makedirs(os.path.join(work_dir, "bootstrap", "caddy", "apps.d"), exist_ok=True)
+        Path(os.path.join(work_dir, "package.json")).write_text(
+            json.dumps({"name": "vpsagent", "version": "2.0.0-alpha.1"}),
+            encoding="utf-8",
+        )
+        Path(os.path.join(work_dir, "bootstrap", "docker-compose.core.yml")).write_text(
+            "services:\n  vpsagent-core:\n    image: vpsagent/core:local\n",
+            encoding="utf-8",
+        )
+        Path(os.path.join(work_dir, "bootstrap", "Caddyfile")).write_text(
+            "# v1\n", encoding="utf-8"
+        )
+        Path(os.path.join(work_dir, "bootstrap", "caddy", "apps.d", "00-default.caddy")).write_text(
+            "# default\n", encoding="utf-8"
+        )
+        Path(os.path.join(work_dir, "bootstrap", "runtime-bridge.py")).write_text(
+            "# bridge v1\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "commit", "-m", "initial release"], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "push", "-u", "origin", "main"], check=True, env=git_env)
+        subprocess.run(
+            ["git", "--git-dir", remote_dir, "symbolic-ref", "HEAD", "refs/heads/main"],
+            check=True,
+            env=git_env,
+        )
+
+        # Clone initial revision as server's VPSAGENT_REPO_DIR
+        subprocess.run(["git", "clone", "--branch", "main", remote_dir, clone_dir], check=True, env=git_env)
+        Path(os.path.join(vpsagent_root, "runtime-bridge.py")).write_text(
+            "# bridge v1\n", encoding="utf-8"
+        )
+        Path(os.path.join(vpsagent_root, "Caddyfile")).write_text(
+            "# v1\n", encoding="utf-8"
+        )
+        Path(os.path.join(vpsagent_root, "docker-compose.yml")).write_text(
+            "services:\n  vpsagent-core:\n    image: vpsagent/core:local\n",
+            encoding="utf-8",
+        )
+        # Seed a live per-app route for slug "00-default" to ensure updates never overwrite it
+        app_default_route = os.path.join(vpsagent_root, "caddy", "apps.d", "00-default.caddy")
+        Path(app_default_route).write_text(
+            "default.example.com {\n  reverse_proxy vpsagent-app-00-default:8080\n}\n",
+            encoding="utf-8",
+        )
+
+        # Push a newer commit to remote (changing Caddyfile & docker-compose.core.yml too)
+        Path(os.path.join(work_dir, "package.json")).write_text(
+            json.dumps({"name": "vpsagent", "version": "2.0.0-alpha.2"}),
+            encoding="utf-8",
+        )
+        Path(os.path.join(work_dir, "bootstrap", "Caddyfile")).write_text(
+            "# v2\n", encoding="utf-8"
+        )
+        Path(os.path.join(work_dir, "bootstrap", "docker-compose.core.yml")).write_text(
+            "services:\n  vpsagent-core:\n    image: vpsagent/core:v2\n",
+            encoding="utf-8",
+        )
+        Path(os.path.join(work_dir, "bootstrap", "runtime-bridge.py")).write_text(
+            "# bridge v2\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(
+            ["git", "-C", work_dir, "commit", "-m", "feat: add self-update v2"],
+            check=True,
+            env=git_env,
+        )
+        subprocess.run(["git", "-C", work_dir, "push", "origin", "main"], check=True, env=git_env)
+
+        docker_log = os.path.join(self.tmp, "docker-calls.log")
+        docker_fail_flag = os.path.join(self.tmp, "docker-fail.flag")
+        docker_dirty_edit_flag = os.path.join(self.tmp, "docker-dirty-edit.flag")
+        docker_installed_cfg_edit_flag = os.path.join(self.tmp, "docker-installed-cfg-edit.flag")
+        systemctl_log = os.path.join(self.tmp, "systemctl-calls.log")
+
+        fake_docker_py = os.path.join(self.tmp, "update_fake_docker.py")
+        Path(fake_docker_py).write_text(
+            f"""import os, sys
+with open({docker_log!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\\n")
+if os.path.exists({docker_installed_cfg_edit_flag!r}):
+    with open({os.path.join(vpsagent_root, "Caddyfile")!r}, "w", encoding="utf-8") as ef:
+        ef.write("# owner live caddy edit\\n")
+    sys.stderr.write("simulated build fail after live caddy edit\\n")
+    sys.exit(1)
+if os.path.exists({docker_dirty_edit_flag!r}):
+    with open({os.path.join(clone_dir, "bootstrap", "Caddyfile")!r}, "w", encoding="utf-8") as ef:
+        ef.write("# owner mid-build edit\\n")
+    sys.stderr.write("simulated build fail after mid-build edit\\n")
+    sys.exit(1)
+if os.path.exists({docker_fail_flag!r}):
+    sys.stderr.write("simulated docker build failure\\n")
+    sys.exit(1)
+print("Rebuilt vpsagent-core ok")
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        fake_docker_sh = os.path.join(self.tmp, "update-fake-docker")
+        Path(fake_docker_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{fake_docker_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(fake_docker_sh, 0o755)
+
+        fake_sys_py = os.path.join(self.tmp, "update_fake_systemctl.py")
+        Path(fake_sys_py).write_text(
+            f"""import sys
+with open({systemctl_log!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1:2] == ["is-active"]:
+    print("active")
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        fake_sys_sh = os.path.join(self.tmp, "update-fake-systemctl")
+        Path(fake_sys_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{fake_sys_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(fake_sys_sh, 0o755)
+
+        svc = rb.RuntimeService(
+            apps_root=os.path.join(vpsagent_root, "apps"),
+            caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+            caddy_container="vpsagent-caddy",
+            docker_bin=fake_docker_sh,
+            systemctl_bin=fake_sys_sh,
+            vpsagent_root=vpsagent_root,
+            repo_dir=clone_dir,
+            allow_unauthenticated=True,
+        )
+
+        # 1. Check for updates sees 1 new commit
+        checked = svc.core_update_status(check_remote=True)
+        self.assertTrue(checked["canUpdate"])
+        self.assertTrue(checked["updateAvailable"])
+        self.assertEqual(checked["commitsBehind"], 1)
+        self.assertEqual(checked["currentVersion"], "2.0.0-alpha.1")
+        self.assertEqual(checked["latestCommitSubject"], "feat: add self-update v2")
+
+        # 1b. Failed Docker build rolls back checkout AND restores installed Caddyfile & docker-compose.yml
+        Path(docker_fail_flag).write_text("fail", encoding="utf-8")
+        failed_start = svc.start_core_update({})
+        self.assertTrue(failed_start["ok"])
+        deadline = time.monotonic() + 10.0
+        failed_status = failed_start["status"]
+        while time.monotonic() < deadline:
+            failed_status = svc.core_update_status(check_remote=False)
+            if failed_status["state"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(failed_status["state"], "failed")
+        self.assertEqual(failed_status["currentVersion"], "2.0.0-alpha.1")
+        self.assertEqual(
+            Path(os.path.join(vpsagent_root, "Caddyfile")).read_text(encoding="utf-8"),
+            "# v1\n",
+        )
+        self.assertIn(
+            "vpsagent/core:local",
+            Path(os.path.join(vpsagent_root, "docker-compose.yml")).read_text(encoding="utf-8"),
+        )
+        rechecked_after_fail = svc.core_update_status(check_remote=True)
+        self.assertTrue(rechecked_after_fail["updateAvailable"])
+        self.assertEqual(rechecked_after_fail["commitsBehind"], 1)
+        os.unlink(docker_fail_flag)
+
+        # 1c. If owner edits a tracked file mid-build and Docker fails, rollback must NOT discard their edit
+        Path(docker_dirty_edit_flag).write_text("dirty", encoding="utf-8")
+        dirty_fail_start = svc.start_core_update({})
+        self.assertTrue(dirty_fail_start["ok"])
+        deadline = time.monotonic() + 10.0
+        dirty_fail_status = dirty_fail_start["status"]
+        while time.monotonic() < deadline:
+            dirty_fail_status = svc.core_update_status(check_remote=False)
+            if dirty_fail_status["state"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(dirty_fail_status["state"], "failed")
+        self.assertEqual(
+            Path(os.path.join(clone_dir, "bootstrap", "Caddyfile")).read_text(encoding="utf-8"),
+            "# owner mid-build edit\n",
+        )
+        self.assertEqual(
+            Path(os.path.join(vpsagent_root, "Caddyfile")).read_text(encoding="utf-8"),
+            "# v1\n",
+        )
+        os.unlink(docker_dirty_edit_flag)
+        # Clean up simulated owner edit and reset back to v1 before testing installed-config protection
+        subprocess.run(["git", "-C", clone_dir, "reset", "--hard", "HEAD~1"], check=True, env=git_env)
+
+        # 1d. If owner edits an installed config file (Caddyfile) mid-build and Docker fails, preserve that edit
+        Path(docker_installed_cfg_edit_flag).write_text("cfg-edit", encoding="utf-8")
+        cfg_edit_start = svc.start_core_update({})
+        self.assertTrue(cfg_edit_start["ok"])
+        deadline = time.monotonic() + 10.0
+        cfg_edit_status = cfg_edit_start["status"]
+        while time.monotonic() < deadline:
+            cfg_edit_status = svc.core_update_status(check_remote=False)
+            if cfg_edit_status["state"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(cfg_edit_status["state"], "failed")
+        self.assertEqual(
+            Path(os.path.join(vpsagent_root, "Caddyfile")).read_text(encoding="utf-8"),
+            "# owner live caddy edit\n",
+        )
+        # Unmodified docker-compose.yml was still restored to v1
+        self.assertIn(
+            "vpsagent/core:local",
+            Path(os.path.join(vpsagent_root, "docker-compose.yml")).read_text(encoding="utf-8"),
+        )
+        self.assertTrue(
+            any("Preserved Caddyfile" in line for line in cfg_edit_status["logs"]),
+            cfg_edit_status["logs"],
+        )
+        os.unlink(docker_installed_cfg_edit_flag)
+        Path(os.path.join(vpsagent_root, "Caddyfile")).write_text("# v1\n", encoding="utf-8")
+
+        # 2. Apply update succeeds, preserves 00-default.caddy, and survives bridge restart recovery
+        started = svc.start_core_update({})
+        self.assertTrue(started["ok"])
+        self.assertTrue(started["started"])
+
+        deadline = time.monotonic() + 10.0
+        final_status = started["status"]
+        while time.monotonic() < deadline:
+            final_status = svc.core_update_status(check_remote=False)
+            if final_status["state"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(final_status["state"], "succeeded", final_status)
+        self.assertEqual(final_status["currentVersion"], "2.0.0-alpha.2")
+        self.assertFalse(final_status["updateAvailable"])
+        self.assertEqual(final_status["commitsBehind"], 0)
+        self.assertIn("up -d --build", Path(docker_log).read_text(encoding="utf-8"))
+        self.assertEqual(
+            Path(os.path.join(vpsagent_root, "runtime-bridge.py")).read_text(encoding="utf-8"),
+            "# bridge v2\n",
+        )
+        # Live app route for slug "00-default" must be untouched!
+        self.assertIn(
+            "default.example.com",
+            Path(app_default_route).read_text(encoding="utf-8"),
+        )
+        # Wait deterministically for the post-success --no-block systemctl restart
+        sys_deadline = time.monotonic() + 5.0
+        sys_log_text = ""
+        while time.monotonic() < sys_deadline:
+            if os.path.isfile(systemctl_log):
+                sys_log_text = Path(systemctl_log).read_text(encoding="utf-8")
+                if "restart --no-block vpsagent-runtime.service" in sys_log_text:
+                    break
+            time.sleep(0.05)
+        self.assertIn(
+            "restart --no-block vpsagent-runtime.service",
+            sys_log_text,
+        )
+
+        # Simulate restarted bridge loading persisted update state cleanly
+        restarted_svc = rb.RuntimeService(
+            apps_root=os.path.join(vpsagent_root, "apps"),
+            caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+            caddy_container="vpsagent-caddy",
+            docker_bin=fake_docker_sh,
+            systemctl_bin=fake_sys_sh,
+            vpsagent_root=vpsagent_root,
+            repo_dir=clone_dir,
+            allow_unauthenticated=True,
+        )
+        recovered = restarted_svc.core_update_status(check_remote=False)
+        self.assertEqual(recovered["state"], "succeeded")
+        self.assertEqual(recovered["currentVersion"], "2.0.0-alpha.2")
+
+        # 3. Diverged branch (local commit + upstream commit) is rejected cleanly instead of advertising unusable update
+        Path(os.path.join(work_dir, "package.json")).write_text(
+            json.dumps({"name": "vpsagent", "version": "2.0.0-alpha.3"}),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(
+            ["git", "-C", work_dir, "commit", "-m", "upstream v3"],
+            check=True,
+            env=git_env,
+        )
+        subprocess.run(["git", "-C", work_dir, "push", "origin", "main"], check=True, env=git_env)
+
+        Path(os.path.join(clone_dir, "local-note.txt")).write_text("local commit\n", encoding="utf-8")
+        subprocess.run(["git", "-C", clone_dir, "add", "local-note.txt"], check=True, env=git_env)
+        subprocess.run(
+            ["git", "-C", clone_dir, "commit", "-m", "local diverged commit"],
+            check=True,
+            env=git_env,
+        )
+        diverged = restarted_svc.core_update_status(check_remote=True)
+        self.assertFalse(diverged["canUpdate"])
+        self.assertFalse(diverged["updateAvailable"])
+        self.assertIn("diverged", (diverged["unavailableReason"] or "").lower())
+
+        # 4. Dirty working tree blocks self-update safely
+        Path(os.path.join(clone_dir, "package.json")).write_text(
+            '{"name":"vpsagent","version":"dirty"}\n', encoding="utf-8"
+        )
+        dirty_status = restarted_svc.core_update_status(check_remote=False)
+        self.assertFalse(dirty_status["canUpdate"])
+        self.assertTrue(dirty_status["dirtyWorkingTree"])
+        with self.assertRaises(rb.BridgeRequestError) as ctx_dirty:
+            restarted_svc.start_core_update({})
+        self.assertEqual(ctx_dirty.exception.status_code, 400)
+
+    def test_run_repo_git_drops_privileges_for_user_owned_checkout(self) -> None:
+        from types import SimpleNamespace
+        from unittest import mock
+
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            repo_dir=self.tmp,
+            allow_unauthenticated=True,
+        )
+        fake_stat = SimpleNamespace(st_uid=1000, st_gid=1000)
+        fake_pw = SimpleNamespace(pw_name="ubuntu", pw_dir="/home/ubuntu")
+        fake_proc = SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+
+        with (
+            mock.patch.object(rb.os, "geteuid", return_value=0),
+            mock.patch.object(rb.os, "stat", return_value=fake_stat),
+            mock.patch.object(rb.pwd, "getpwuid", return_value=fake_pw),
+            mock.patch.object(rb.subprocess, "run", return_value=fake_proc) as run_mock,
+        ):
+            proc = svc._run_repo_git(self.tmp, ["rev-parse", "--abbrev-ref", "HEAD"])
+
+        self.assertEqual(proc.returncode, 0)
+        run_mock.assert_called_once()
+        _, kwargs = run_mock.call_args
+        self.assertEqual(kwargs["user"], 1000)
+        self.assertEqual(kwargs["group"], 1000)
+        self.assertEqual(kwargs["env"]["HOME"], "/home/ubuntu")
+        self.assertEqual(kwargs["env"]["USER"], "ubuntu")
+        self.assertEqual(kwargs["env"]["LOGNAME"], "ubuntu")
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_core_update_restores_config_when_write_fails_after_truncation(self) -> None:
+        import builtins
+        import subprocess
+        from unittest import mock
+
+        remote_dir = os.path.join(self.tmp, "wfail-remote.git")
+        work_dir = os.path.join(self.tmp, "wfail-work")
+        clone_dir = os.path.join(self.tmp, "wfail-clone")
+        vpsagent_root = os.path.join(self.tmp, "wfail-root")
+        os.makedirs(os.path.join(vpsagent_root, "apps"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "caddy", "apps.d"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "run"), exist_ok=True)
+        Path(os.path.join(vpsagent_root, ".env")).write_text(
+            "VPSAGENT_RUNTIME_TOKEN=test-secret-token-value-123456\n", encoding="utf-8"
+        )
+        caddy_dst = os.path.join(vpsagent_root, "Caddyfile")
+        Path(caddy_dst).write_text("# original v1 caddyfile\n", encoding="utf-8")
+
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        subprocess.run(["git", "init", "--bare", remote_dir], check=True, env=git_env)
+        subprocess.run(["git", "clone", remote_dir, work_dir], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "checkout", "-b", "main"], check=True, env=git_env)
+        os.makedirs(os.path.join(work_dir, "bootstrap"), exist_ok=True)
+        Path(os.path.join(work_dir, "bootstrap", "Caddyfile")).write_text("# v1\n", encoding="utf-8")
+        Path(os.path.join(work_dir, "bootstrap", "docker-compose.core.yml")).write_text("services: {}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "commit", "-m", "v1"], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "push", "-u", "origin", "main"], check=True, env=git_env)
+        subprocess.run(["git", "--git-dir", remote_dir, "symbolic-ref", "HEAD", "refs/heads/main"], check=True, env=git_env)
+        subprocess.run(["git", "clone", "--branch", "main", remote_dir, clone_dir], check=True, env=git_env)
+
+        Path(os.path.join(work_dir, "bootstrap", "Caddyfile")).write_text("# v2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "commit", "-m", "v2"], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "push", "origin", "main"], check=True, env=git_env)
+
+        svc = rb.RuntimeService(
+            apps_root=os.path.join(vpsagent_root, "apps"),
+            caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+            caddy_container="vpsagent-caddy",
+            vpsagent_root=vpsagent_root,
+            repo_dir=clone_dir,
+            allow_unauthenticated=True,
+        )
+
+        real_open = builtins.open
+        fail_once = {"triggered": False}
+
+        class FailingWriter:
+            def __init__(self, inner: object) -> None:
+                self._inner = inner
+
+            def __enter__(self) -> "FailingWriter":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                self._inner.close()  # type: ignore[attr-defined]
+
+            def write(self, _data: bytes) -> int:
+                raise OSError("simulated disk full after truncation")
+
+        def guarded_open(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+            fh = real_open(file, mode, *args, **kwargs)  # type: ignore[call-overload]
+            if (
+                not fail_once["triggered"]
+                and mode == "wb"
+                and os.path.abspath(str(file)) == os.path.abspath(caddy_dst)
+            ):
+                fail_once["triggered"] = True
+                return FailingWriter(fh)
+            return fh
+
+        with mock.patch.object(builtins, "open", side_effect=guarded_open):
+            svc._run_core_update_worker(clone_dir, "main")
+
+        self.assertTrue(fail_once["triggered"])
+        self.assertEqual(
+            Path(caddy_dst).read_text(encoding="utf-8"),
+            "# original v1 caddyfile\n",
+        )
+        self.assertEqual(svc.core_update_status(check_remote=False)["state"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()
