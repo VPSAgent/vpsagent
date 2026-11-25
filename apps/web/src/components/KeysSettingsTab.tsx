@@ -1,56 +1,72 @@
 import { useState } from "react";
-import { Check, Copy, Globe, KeyRound, Plus, Trash2 } from "lucide-react";
+import { Check, Copy, Globe, KeyRound, Lock, Plus, Trash2 } from "lucide-react";
 import {
   api,
+  type AppRecord,
   type McpSnippets,
   type McpTokenRecord,
+  type McpTokenScope,
   type SetupState,
 } from "../api";
 
 interface KeysSettingsTabProps {
   tokens: McpTokenRecord[];
+  apps: AppRecord[];
   snippets: McpSnippets | null;
   setup: SetupState;
+  publicIp: string | null;
   onRefresh: () => Promise<void>;
 }
 
 const SCOPE_LABELS: Record<
-  McpTokenRecord["scope"],
+  McpTokenScope,
   { title: string; desc: string; badge: string }
 > = {
   "read-only": {
     title: "Look Only",
-    desc: "Check server health and read logs. Can never change or delete anything.",
+    desc: "Check server health, inspect GitHub repos, and read logs. Can never change or delete anything.",
     badge: "bg-slate-700/80 text-slate-200",
   },
   "approval-required": {
-    title: "Ask Me First (Recommended)",
-    desc: "Can check health & logs, and queues deploys/changes for your Approve click.",
+    title: "Ask Me First",
+    desc: "Can check health & logs, and queues every deploy or change for your Approve click.",
     badge: "bg-amber-500/15 text-amber-300",
+  },
+  "safe-auto-deploy": {
+    title: "Safe Auto-Deploy (Recommended)",
+    desc: "Can launch, rebuild, restart, and update apps right away — but ALWAYS asks your approval before deleting an app.",
+    badge: "bg-sky-500/15 text-sky-300",
   },
   "auto-approve": {
     title: "Trusted Auto-Pass",
-    desc: "Can launch and update isolated apps right away without waiting.",
+    desc: "Can launch, update, and delete isolated apps right away without waiting.",
     badge: "bg-emerald-500/15 text-emerald-300",
   },
 };
 
 export function KeysSettingsTab({
   tokens,
+  apps,
   snippets,
   setup,
+  publicIp,
   onRefresh,
 }: KeysSettingsTabProps) {
   const [name, setName] = useState("");
-  const [scope, setScope] =
-    useState<McpTokenRecord["scope"]>("approval-required");
+  const [scope, setScope] = useState<McpTokenScope>("safe-auto-deploy");
+  const [restrictApps, setRestrictApps] = useState(false);
+  const [selectedSlugs, setSelectedSlugs] = useState<string[]>([]);
+  const [customSlugsText, setCustomSlugsText] = useState("");
   const [newRawToken, setNewRawToken] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [activeClient, setActiveClient] = useState<
-    "claudeCode" | "cursor" | "codex"
+    "claudeCode" | "cursor" | "codex" | "genericHttp"
   >("claudeCode");
   const [domain, setDomain] = useState(setup.domain ?? "");
   const [acmeEmail, setAcmeEmail] = useState(setup.acmeEmail ?? "");
+  const [appsBaseDomain, setAppsBaseDomain] = useState(
+    setup.appsBaseDomain ?? "",
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -61,14 +77,37 @@ export function KeysSettingsTab({
     setTimeout(() => setCopiedId(null), 2000);
   };
 
+  const toggleAllowedSlug = (slug: string) => {
+    setSelectedSlugs((prev) =>
+      prev.includes(slug) ? prev.filter((s) => s !== slug) : [...prev, slug],
+    );
+  };
+
   const handleCreateToken = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setNotice(null);
     setBusy(true);
     try {
-      const res = await api.createToken(name.trim(), scope);
+      const extraSlugs = customSlugsText
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+      const allowedSlugs = restrictApps
+        ? Array.from(new Set([...selectedSlugs, ...extraSlugs]))
+        : [];
+      if (restrictApps && allowedSlugs.length === 0) {
+        setError(
+          "Pick at least one app or enter an app short ID when app lock is turned on.",
+        );
+        return;
+      }
+      const res = await api.createToken(name.trim(), scope, allowedSlugs);
       setNewRawToken(res.rawToken);
       setName("");
+      setRestrictApps(false);
+      setSelectedSlugs([]);
+      setCustomSlugsText("");
       await onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not create key.");
@@ -107,6 +146,30 @@ export function KeysSettingsTab({
     }
   };
 
+  const handleUpdateAppsBaseDomain = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      await api.updateAppsBaseDomain(appsBaseDomain.trim() || null);
+      setNotice(
+        appsBaseDomain.trim()
+          ? `Default app addresses enabled for *.${appsBaseDomain.trim()}.`
+          : "Cleared default apps base domain.",
+      );
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not save default apps base domain.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const activeSnippet = snippets ? snippets[activeClient] : "";
 
   return (
@@ -116,8 +179,8 @@ export function KeysSettingsTab({
           AI Keys &amp; Settings
         </h2>
         <p className="text-sm text-slate-400">
-          Create visitor passes for Claude Code, Cursor, or Codex and copy their
-          ready-to-paste setup snippets.
+          Create scoped visitor passes for Claude Code, Cursor, Codex, or T3
+          Code, and configure automatic app web addresses.
         </p>
       </div>
 
@@ -162,21 +225,78 @@ export function KeysSettingsTab({
               </label>
               <select
                 value={scope}
-                onChange={(e) =>
-                  setScope(e.target.value as McpTokenRecord["scope"])
-                }
+                onChange={(e) => setScope(e.target.value as McpTokenScope)}
                 className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
               >
+                <option value="safe-auto-deploy">
+                  Safe Auto-Deploy (Recommended — always asks before delete)
+                </option>
                 <option value="approval-required">
-                  Ask Me First (Recommended)
+                  Ask Me First (queues every change for approval)
                 </option>
                 <option value="read-only">Look Only (Read-Only)</option>
-                <option value="auto-approve">Trusted Auto-Pass</option>
+                <option value="auto-approve">
+                  Trusted Auto-Pass (full auto, including delete)
+                </option>
               </select>
             </div>
           </div>
 
           <p className="text-xs text-slate-400">{SCOPE_LABELS[scope].desc}</p>
+
+          {/* Optional App Lock */}
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-4 space-y-3">
+            <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-200 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={restrictApps}
+                onChange={(e) => setRestrictApps(e.target.checked)}
+                className="rounded border-slate-600 bg-slate-950"
+              />
+              <Lock className="h-3.5 w-3.5 text-sky-400" />
+              Lock this pass to specific apps only (optional)
+            </label>
+
+            {restrictApps && (
+              <div className="space-y-3 pt-1">
+                {apps.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {apps.map((app) => {
+                      const checked = selectedSlugs.includes(app.slug);
+                      return (
+                        <button
+                          key={app.slug}
+                          type="button"
+                          onClick={() => toggleAllowedSlug(app.slug)}
+                          className={`rounded-lg border px-2.5 py-1 text-xs font-mono transition cursor-pointer ${
+                            checked
+                              ? "border-sky-400 bg-sky-500/20 text-sky-200"
+                              : "border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          {checked ? "✓ " : "+ "}
+                          {app.slug}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                <div>
+                  <label className="block text-xs text-slate-400 mb-1">
+                    Or type allowed app short IDs separated by commas (even for
+                    apps not launched yet)
+                  </label>
+                  <input
+                    type="text"
+                    value={customSlugsText}
+                    onChange={(e) => setCustomSlugsText(e.target.value)}
+                    placeholder="my-blog, landing-page"
+                    className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-mono text-white"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
 
           <button
             type="submit"
@@ -253,12 +373,13 @@ export function KeysSettingsTab({
                 <code className="text-emerald-300">{snippets.mcpUrl}</code>
               </p>
             </div>
-            <div className="flex gap-1.5">
+            <div className="flex flex-wrap gap-1.5">
               {(
                 [
                   ["claudeCode", "Claude Code"],
                   ["cursor", "Cursor"],
                   ["codex", "Codex"],
+                  ["genericHttp", "T3 Code / Generic"],
                 ] as const
               ).map(([id, label]) => (
                 <button
@@ -319,7 +440,7 @@ export function KeysSettingsTab({
                   className="flex flex-wrap items-center justify-between gap-3 px-6 py-3.5"
                 >
                   <div className="space-y-0.5">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span
                         className={`text-sm font-medium ${
                           isRevoked
@@ -334,6 +455,12 @@ export function KeysSettingsTab({
                       >
                         {info.title}
                       </span>
+                      {tok.allowedSlugs.length > 0 && (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-slate-800 px-2 py-0.5 text-xs font-mono text-sky-300">
+                          <Lock className="h-3 w-3" />
+                          {tok.allowedSlugs.join(", ")}
+                        </span>
+                      )}
                       {isRevoked && (
                         <span className="rounded-full bg-rose-500/15 px-2 py-0.5 text-xs text-rose-300">
                           Turned Off
@@ -363,18 +490,22 @@ export function KeysSettingsTab({
         )}
       </section>
 
-      {/* Dashboard Domain / Automatic HTTPS Settings */}
-      <section className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6 space-y-4">
+      {/* Dashboard Domain & Default Apps Base Domain */}
+      <section className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6 space-y-6">
         <div className="flex items-center gap-2">
           <Globe className="h-4 w-4 text-sky-400" />
           <h3 className="text-base font-semibold text-white">
-            Dashboard Domain &amp; Automatic HTTPS
+            Domains &amp; Automatic HTTPS
           </h3>
         </div>
-        <form onSubmit={handleUpdateDomain} className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end">
+
+        <form
+          onSubmit={handleUpdateDomain}
+          className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end"
+        >
           <div>
             <label className="block text-xs font-medium text-slate-300 mb-1">
-              Domain Name
+              Dashboard Domain Name
             </label>
             <input
               type="text"
@@ -401,9 +532,57 @@ export function KeysSettingsTab({
             disabled={busy}
             className="rounded-lg bg-slate-100 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-white disabled:opacity-50 cursor-pointer"
           >
-            Save Domain
+            Save Dashboard Domain
           </button>
         </form>
+
+        <div className="border-t border-slate-800 pt-5 space-y-3">
+          <div>
+            <h4 className="text-sm font-semibold text-white">
+              Default Web Address for New Apps (Optional)
+            </h4>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Set a base domain once so every new app automatically gets{" "}
+              <code className="text-emerald-300">
+                https://app-name.{appsBaseDomain || "yourdomain.com"}
+              </code>{" "}
+              with automatic HTTPS. Add one wildcard DNS{" "}
+              <code className="text-slate-200">A</code> record:{" "}
+              <code className="text-slate-200">
+                *.{appsBaseDomain || "yourdomain.com"}
+              </code>{" "}
+              &rarr;{" "}
+              <code className="text-slate-200">
+                {publicIp || "YOUR_SERVER_IP"}
+              </code>
+              .
+            </p>
+          </div>
+          <form
+            onSubmit={handleUpdateAppsBaseDomain}
+            className="grid grid-cols-1 md:grid-cols-3 gap-3 items-end"
+          >
+            <div className="md:col-span-2">
+              <label className="block text-xs font-medium text-slate-300 mb-1">
+                Default Apps Base Domain
+              </label>
+              <input
+                type="text"
+                value={appsBaseDomain}
+                onChange={(e) => setAppsBaseDomain(e.target.value)}
+                placeholder="apps.yourdomain.com (leave empty to disable)"
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={busy}
+              className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+            >
+              Save Default Domain
+            </button>
+          </form>
+        </div>
       </section>
     </div>
   );

@@ -25,16 +25,50 @@ import { OverviewTab } from "./components/OverviewTab";
 import { SetupAndAuth } from "./components/SetupAndAuth";
 
 type TabId = "overview" | "apps" | "approvals" | "keys";
+type AppDrawerSection = "deployments" | "logs" | "domain" | "env" | "security";
+
+interface AppDeepLink {
+  slug: string;
+  section: AppDrawerSection;
+  deploymentId?: string;
+}
+
+function parseAppDeepLink(hash: string): AppDeepLink | null {
+  const match = hash.match(
+    /^#?\/?apps\/([a-z0-9][a-z0-9-]{0,46}[a-z0-9])\/(deployments|logs|domain|env|security)$/i,
+  );
+  if (!match) return null;
+  return {
+    slug: match[1]!.toLowerCase(),
+    section: match[2]!.toLowerCase() as AppDrawerSection,
+  };
+}
 
 export function App() {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [tab, setTab] = useState<TabId>("overview");
+  const [deepLink, setDeepLink] = useState<AppDeepLink | null>(() =>
+    typeof window !== "undefined" ? parseAppDeepLink(window.location.hash) : null,
+  );
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [tokens, setTokens] = useState<McpTokenRecord[]>([]);
   const [snippets, setSnippets] = useState<McpSnippets | null>(null);
   const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const syncFromHash = () => {
+      const parsed = parseAppDeepLink(window.location.hash);
+      if (parsed) {
+        setTab("apps");
+        setDeepLink(parsed);
+      }
+    };
+    syncFromHash();
+    window.addEventListener("hashchange", syncFromHash);
+    return () => window.removeEventListener("hashchange", syncFromHash);
+  }, []);
 
   const loadAll = useCallback(async (auditQuery?: string) => {
     setLoading(true);
@@ -177,6 +211,9 @@ export function App() {
         {tab === "apps" && (
           <AppsTab
             apps={overview?.apps ?? []}
+            appsBaseDomain={session.setup.appsBaseDomain}
+            deepLink={deepLink}
+            onConsumeDeepLink={() => setDeepLink(null)}
             onRefresh={() => loadAll()}
             onInspectSync={handleInspectSync}
           />
@@ -186,13 +223,19 @@ export function App() {
             approvals={approvals}
             events={auditEvents}
             onRefresh={(q) => loadAll(q)}
+            onWatchDeployment={(slug, deploymentId) => {
+              setDeepLink({ slug, section: "deployments", deploymentId });
+              setTab("apps");
+            }}
           />
         )}
         {tab === "keys" && (
           <KeysSettingsTab
             tokens={tokens}
+            apps={overview?.apps ?? []}
             snippets={snippets}
             setup={session.setup}
+            publicIp={session.publicIp}
             onRefresh={() => loadAll()}
           />
         )}

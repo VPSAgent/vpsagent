@@ -159,12 +159,22 @@ function createFakeGitShim(tempDir: string): string {
 args = sys.argv[1:]
 if "clone" in args:
     dst = args[-1]
+    url = args[-2] if len(args) >= 2 else ""
     os.makedirs(dst, exist_ok=True)
-    with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as fh:
-        fh.write("FROM alpine:3.20\\n")
+    if "no-dockerfile" in url:
+        with open(os.path.join(dst, "package.json"), "w", encoding="utf-8") as fh:
+            fh.write('{"name":"auto-app","dependencies":{"next":"15.0.0"},"scripts":{"build":"next build","start":"next start"}}')
+        with open(os.path.join(dst, ".env.example"), "w", encoding="utf-8") as fh:
+            fh.write("OPENAI_API_KEY=sk-example-secret-should-never-appear\\nPUBLIC_MODE=demo\\n")
+    else:
+        with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as fh:
+            fh.write("FROM alpine:3.20\\n")
     sys.exit(0)
 if "rev-parse" in args:
-    print("0123456789abcdef0123456789abcdef01234567")
+    if "--abbrev-ref" in args:
+        print("main")
+    else:
+        print("0123456789abcdef0123456789abcdef01234567")
     sys.exit(0)
 sys.exit(0)
 `,
@@ -836,6 +846,183 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
         .listAuditEvents({ targetSlug: "landing-site" })
         .find((e) => e.action === "deploy_app");
       expect(deployAudit?.actorTokenId).toBe(autoApprove.token.id);
+
+      // 11b. Default apps base domain + MCP instructions + get_server_info + inspect_git_repo + safe-auto-deploy + app lock + secret handoff
+      expect((initBody.result as { instructions?: string }).instructions).toContain(
+        "inspect_git_repo",
+      );
+
+      const baseDomainRes = await app.request(
+        "https://vps.example.com/api/setup/apps-base-domain",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({ appsBaseDomain: "apps.example.com" }),
+        },
+      );
+      expect(baseDomainRes.status).toBe(200);
+
+      const safeScopedRes = await app.request(
+        "https://vps.example.com/api/mcp/tokens",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({
+            name: "Safe Scoped Agent",
+            scope: "safe-auto-deploy",
+            allowedSlugs: ["auto-next"],
+          }),
+        },
+      );
+      expect(safeScopedRes.status).toBe(201);
+      const safeScoped = (await safeScopedRes.json()) as { rawToken: string };
+
+      const serverInfoRes = await postMcp(safeScoped.rawToken, {
+        jsonrpc: "2.0",
+        id: 20,
+        method: "tools/call",
+        params: { name: "get_server_info", arguments: {} },
+      });
+      const serverInfoText = (
+        (await serverInfoRes.json()) as { result: { content: Array<{ text: string }> } }
+      ).result.content[0]!.text;
+      const serverInfo = JSON.parse(serverInfoText) as {
+        server: { appsBaseDomain: string };
+        visitorPass: { scope: string; allowedSlugs: string[]; deleteRequiresApproval: boolean };
+      };
+      expect(serverInfo.server.appsBaseDomain).toBe("apps.example.com");
+      expect(serverInfo.visitorPass.scope).toBe("safe-auto-deploy");
+      expect(serverInfo.visitorPass.allowedSlugs).toEqual(["auto-next"]);
+      expect(serverInfo.visitorPass.deleteRequiresApproval).toBe(true);
+
+      // App lock strictly blocks reading or acting on other apps
+      const blockedCrossApp = await postMcp(safeScoped.rawToken, {
+        jsonrpc: "2.0",
+        id: 21,
+        method: "tools/call",
+        params: { name: "get_app_logs", arguments: { slug: "shop-api" } },
+      });
+      expect(
+        ((await blockedCrossApp.json()) as { result: { isError: boolean } }).result
+          .isError,
+      ).toBe(true);
+
+      // Inspecting a public repo without a Dockerfile auto-detects Next.js, port 3000, and .env.example keys
+      const inspectGitRes = await postMcp(safeScoped.rawToken, {
+        jsonrpc: "2.0",
+        id: 22,
+        method: "tools/call",
+        params: {
+          name: "inspect_git_repo",
+          arguments: {
+            gitRepoUrl: "https://140.82.121.4/acme/no-dockerfile-demo",
+          },
+        },
+      });
+      const inspectGit = JSON.parse(
+        ((await inspectGitRes.json()) as { result: { content: Array<{ text: string }> } })
+          .result.content[0]!.text,
+      ) as {
+        detectedRuntime: string;
+        hasDockerfile: boolean;
+        suggestedPort: number;
+        suggestedDomain: string;
+        envExampleKeys: Array<{ key: string }>;
+      };
+      expect(inspectGit.detectedRuntime).toBe("nextjs");
+      expect(inspectGit.hasDockerfile).toBe(false);
+      expect(inspectGit.suggestedPort).toBe(3000);
+      expect(inspectGit.suggestedDomain).toBe("no-dockerfile-demo.apps.example.com");
+      expect(inspectGit.envExampleKeys.map((k) => k.key)).toEqual([
+        "OPENAI_API_KEY",
+        "PUBLIC_MODE",
+      ]);
+
+      // Safe Auto-Deploy launches the repo without approval, assigns auto-subdomain, tracks deployment, and returns secret handoff URL
+      const autoNextDeployRes = await postMcp(safeScoped.rawToken, {
+        jsonrpc: "2.0",
+        id: 23,
+        method: "tools/call",
+        params: {
+          name: "deploy_app",
+          arguments: {
+            slug: "auto-next",
+            name: "Auto Next",
+            sourceType: "git",
+            gitRepoUrl: "https://140.82.121.4/acme/no-dockerfile-demo",
+            internalPort: livePort,
+          },
+        },
+      });
+      const autoNextPayload = JSON.parse(
+        ((await autoNextDeployRes.json()) as { result: { content: Array<{ text: string }> } })
+          .result.content[0]!.text,
+      ) as {
+        status: string;
+        result: {
+          app: { domain: string; detectedRuntime: string };
+          deployment: { id: string; usedAutoDockerfile: boolean; status: string };
+          liveUrl: string;
+          missingEnvKeys: string[];
+          envSettingsUrl: string;
+        };
+      };
+      expect(autoNextPayload.status).toBe("executed");
+      expect(autoNextPayload.result.app.domain).toBe("auto-next.apps.example.com");
+      expect(autoNextPayload.result.app.detectedRuntime).toBe("nextjs");
+      expect(autoNextPayload.result.deployment.usedAutoDockerfile).toBe(true);
+      expect(autoNextPayload.result.deployment.status).toBe("succeeded");
+      expect(autoNextPayload.result.liveUrl).toBe("https://auto-next.apps.example.com");
+      expect(autoNextPayload.result.missingEnvKeys).toEqual([
+        "OPENAI_API_KEY",
+        "PUBLIC_MODE",
+      ]);
+      expect(autoNextPayload.result.envSettingsUrl).toBe(
+        "https://vps.example.com/#apps/auto-next/env",
+      );
+
+      // get_deployment returns persisted build logs & commit info
+      const getDepRes = await postMcp(safeScoped.rawToken, {
+        jsonrpc: "2.0",
+        id: 24,
+        method: "tools/call",
+        params: {
+          name: "get_deployment",
+          arguments: { deploymentId: autoNextPayload.result.deployment.id },
+        },
+      });
+      const getDep = JSON.parse(
+        ((await getDepRes.json()) as { result: { content: Array<{ text: string }> } })
+          .result.content[0]!.text,
+      ) as { deployment: { status: string; commitSha: string; buildLogs: string[] } };
+      expect(getDep.deployment.status).toBe("succeeded");
+      expect(getDep.deployment.commitSha).toBe("0123456789abcdef0123456789abcdef01234567");
+      expect(getDep.deployment.buildLogs.length).toBeGreaterThan(0);
+
+      // Safe Auto-Deploy MUST still queue delete_app for human approval!
+      const safeDeleteRes = await postMcp(safeScoped.rawToken, {
+        jsonrpc: "2.0",
+        id: 25,
+        method: "tools/call",
+        params: { name: "delete_app", arguments: { slug: "auto-next" } },
+      });
+      const safeDelete = JSON.parse(
+        ((await safeDeleteRes.json()) as { result: { content: Array<{ text: string }> } })
+          .result.content[0]!.text,
+      ) as { status: string; approvalId: string };
+      expect(safeDelete.status).toBe("pending_approval");
+      expect(safeDelete.approvalId).toMatch(/^apr_/);
+      expect(store.getApp("auto-next")).not.toBeNull();
 
       // 12. Bootstrap invariants: zero docker.sock, VPSAgent/vpsagent repo URL, no plaintext public claim URL
       const coreCompose = fs.readFileSync(

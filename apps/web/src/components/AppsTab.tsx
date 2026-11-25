@@ -1,14 +1,19 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Database,
   ExternalLink,
+  GitBranch,
   Globe,
   Hammer,
   KeyRound,
+  Loader2,
   Play,
   Plus,
+  Rocket,
   RotateCw,
+  Search,
   ShieldCheck,
+  Sparkles,
   Square,
   Terminal,
   Trash2,
@@ -18,6 +23,8 @@ import {
   type AppEnvEntry,
   type AppRecord,
   type CompanionService,
+  type DeploymentRecord,
+  type GitInspectResult,
   type InspectResult,
 } from "../api";
 import { formatSafetyCheckHealth, type HealthBadge } from "../health-display";
@@ -29,68 +36,213 @@ function healthToneClass(tone: HealthBadge["tone"]): string {
   return "text-slate-200";
 }
 
+function isDeploymentActive(status: DeploymentRecord["status"]): boolean {
+  return (
+    status === "queued" ||
+    status === "cloning" ||
+    status === "building" ||
+    status === "starting" ||
+    status === "verifying"
+  );
+}
+
+function deploymentBadgeClass(status: DeploymentRecord["status"]): string {
+  if (status === "succeeded") return "bg-emerald-500/15 text-emerald-300";
+  if (status === "failed") return "bg-rose-500/15 text-rose-300";
+  return "bg-amber-500/15 text-amber-300";
+}
+
+type DrawerSection = "deployments" | "logs" | "domain" | "env" | "security";
+
 interface AppsTabProps {
   apps: AppRecord[];
+  appsBaseDomain: string | null;
+  deepLink?: {
+    slug: string;
+    section: DrawerSection;
+    deploymentId?: string;
+  } | null;
+  onConsumeDeepLink?: () => void;
   onRefresh: () => Promise<void>;
   onInspectSync?: (inspect: InspectResult) => void;
 }
 
-type DrawerSection = "logs" | "domain" | "env" | "security";
-
-export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
+export function AppsTab({
+  apps,
+  appsBaseDomain,
+  deepLink,
+  onConsumeDeepLink,
+  onRefresh,
+  onInspectSync,
+}: AppsTabProps) {
   const [showCreate, setShowCreate] = useState(false);
   const [busySlug, setBusySlug] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  // Create form state
+  // Create form state (GitHub first!)
   const [slug, setSlug] = useState("");
   const [name, setName] = useState("");
-  const [sourceType, setSourceType] = useState<"image" | "git">("image");
+  const [sourceType, setSourceType] = useState<"git" | "image">("git");
   const [image, setImage] = useState("nginxinc/nginx-unprivileged:alpine");
   const [gitRepoUrl, setGitRepoUrl] = useState("");
-  const [gitBranch, setGitBranch] = useState("main");
-  const [dockerfilePath, setDockerfilePath] = useState("Dockerfile");
-  const [internalPort, setInternalPort] = useState("8080");
+  const [gitBranch, setGitBranch] = useState("");
+  const [dockerfilePath, setDockerfilePath] = useState("auto");
+  const [internalPort, setInternalPort] = useState("");
   const [domain, setDomain] = useState("");
+  const [noDomain, setNoDomain] = useState(false);
   const [withPostgres, setWithPostgres] = useState(false);
   const [withRedis, setWithRedis] = useState(false);
   const [envText, setEnvText] = useState("");
+  const [inspectingGit, setInspectingGit] = useState(false);
+  const [gitPreview, setGitPreview] = useState<GitInspectResult | null>(null);
   const [creating, setCreating] = useState(false);
+
+  // Active background deployment tracker banner
+  const [trackedDeployment, setTrackedDeployment] =
+    useState<DeploymentRecord | null>(null);
 
   // Expanded app inspector drawer
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
-  const [section, setSection] = useState<DrawerSection>("logs");
+  const [section, setSection] = useState<DrawerSection>("deployments");
+  const [deployments, setDeployments] = useState<DeploymentRecord[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [envVars, setEnvVars] = useState<AppEnvEntry[]>([]);
+  const [missingEnvKeys, setMissingEnvKeys] = useState<string[]>([]);
   const [inspectData, setInspectData] = useState<InspectResult | null>(null);
   const [newEnvKey, setNewEnvKey] = useState("");
   const [newEnvVal, setNewEnvVal] = useState("");
   const [editDomain, setEditDomain] = useState("");
   const [drawerLoading, setDrawerLoading] = useState(false);
 
-  const openDrawer = async (app: AppRecord, sec: DrawerSection) => {
-    setSelectedSlug(app.slug);
-    setSection(sec);
-    setEditDomain(app.domain ?? "");
-    setDrawerLoading(true);
-    setError(null);
-    try {
-      if (sec === "logs") {
-        const res = await api.getAppLogs(app.slug, 120);
-        setLogs(res.lines);
-      } else if (sec === "env") {
-        const res = await api.getAppEnv(app.slug);
-        setEnvVars(res.envVars);
-      } else if (sec === "security") {
-        const res = await api.inspectApp(app.slug);
-        setInspectData(res.inspect);
-        onInspectSync?.(res.inspect);
+  const openDrawerBySlug = useCallback(
+    async (targetSlug: string, sec: DrawerSection, currentDomain?: string | null) => {
+      setSelectedSlug(targetSlug);
+      setSection(sec);
+      setEditDomain(currentDomain ?? "");
+      setDrawerLoading(true);
+      setError(null);
+      try {
+        if (sec === "deployments") {
+          const res = await api.listDeployments(targetSlug, 10);
+          setDeployments(res.deployments);
+        } else if (sec === "logs") {
+          const res = await api.getAppLogs(targetSlug, 120);
+          setLogs(res.lines);
+        } else if (sec === "env") {
+          const res = await api.getAppEnv(targetSlug);
+          setEnvVars(res.envVars);
+          setMissingEnvKeys(res.missingEnvKeys ?? []);
+        } else if (sec === "security") {
+          const res = await api.inspectApp(targetSlug);
+          setInspectData(res.inspect);
+          onInspectSync?.(res.inspect);
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Could not load details.");
+      } finally {
+        setDrawerLoading(false);
       }
+    },
+    [onInspectSync],
+  );
+
+  // Handle deep links like /#apps/<slug>/env (from AI secret handoff!) or approved deployments
+  useEffect(() => {
+    if (!deepLink) return;
+    const match = apps.find((a) => a.slug === deepLink.slug);
+    if (deepLink.deploymentId) {
+      void api
+        .getDeployment(deepLink.deploymentId)
+        .then((res) => setTrackedDeployment(res.deployment))
+        .catch(() => {});
+    }
+    if (match) {
+      void openDrawerBySlug(match.slug, deepLink.section, match.domain);
+    }
+    onConsumeDeepLink?.();
+  }, [apps, deepLink, onConsumeDeepLink, openDrawerBySlug]);
+
+  // Poll any active background deployment every 1.5s until it finishes
+  useEffect(() => {
+    if (!trackedDeployment || !isDeploymentActive(trackedDeployment.status)) {
+      return;
+    }
+    const id = trackedDeployment.id;
+    const timer = window.setInterval(() => {
+      void api
+        .getDeployment(id)
+        .then(async (res) => {
+          setTrackedDeployment(res.deployment);
+          if (selectedSlug === res.deployment.slug && section === "deployments") {
+            const list = await api.listDeployments(res.deployment.slug, 10);
+            setDeployments(list.deployments);
+          }
+          if (!isDeploymentActive(res.deployment.status)) {
+            await onRefresh();
+            if (res.deployment.status === "succeeded") {
+              setNotice(
+                res.deployment.domain
+                  ? `${res.deployment.slug} is live at https://${res.deployment.domain}`
+                  : `${res.deployment.slug} finished deploying and is running safely.`,
+              );
+              if (res.missingEnvKeys.length > 0) {
+                setMissingEnvKeys(res.missingEnvKeys);
+                void openDrawerBySlug(
+                  res.deployment.slug,
+                  "env",
+                  res.deployment.domain,
+                );
+              }
+            } else {
+              setError(
+                res.deployment.error ||
+                  `Deployment failed for ${res.deployment.slug}.`,
+              );
+            }
+          }
+        })
+        .catch(() => {});
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [onRefresh, openDrawerBySlug, section, selectedSlug, trackedDeployment]);
+
+  const handleInspectGit = async () => {
+    if (!gitRepoUrl.trim()) {
+      setError("Paste a public HTTPS GitHub link first.");
+      return;
+    }
+    setInspectingGit(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.inspectGitRepo(
+        gitRepoUrl.trim(),
+        gitBranch.trim() || null,
+        dockerfilePath.trim() || "auto",
+      );
+      const info = res.inspect;
+      setGitPreview(info);
+      if (!name.trim()) setName(info.suggestedName);
+      if (!slug.trim()) setSlug(info.suggestedSlug);
+      if (!gitBranch.trim() && info.resolvedBranch) {
+        setGitBranch(info.resolvedBranch);
+      }
+      setDockerfilePath(info.hasDockerfile ? info.dockerfilePath : "auto");
+      setInternalPort(String(info.suggestedPort));
+      if (!domain.trim() && info.suggestedDomain && !noDomain) {
+        setDomain(info.suggestedDomain);
+      }
+      setWithPostgres(info.suggestedCompanions.includes("postgres"));
+      setWithRedis(info.suggestedCompanions.includes("redis"));
+      setNotice(info.buildPlanSummary);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load details.");
+      setGitPreview(null);
+      setError(
+        err instanceof Error ? err.message : "Could not inspect GitHub repo.",
+      );
     } finally {
-      setDrawerLoading(false);
+      setInspectingGit(false);
     }
   };
 
@@ -102,8 +254,14 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
     setError(null);
     setNotice(null);
     try {
-      await api.appAction(targetSlug, action);
-      setNotice(`Completed "${action}" on ${targetSlug}.`);
+      const res = await api.appAction(targetSlug, action, action === "rebuild");
+      if (action === "rebuild" && res.deployment) {
+        setTrackedDeployment(res.deployment);
+        setNotice(`Rebuild started in the background for ${targetSlug}.`);
+        await openDrawerBySlug(targetSlug, "deployments");
+      } else {
+        setNotice(`Completed "${action}" on ${targetSlug}.`);
+      }
       await onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to ${action} app.`);
@@ -133,6 +291,7 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setNotice(null);
     setCreating(true);
     try {
       const companions: CompanionService[] = [];
@@ -149,28 +308,60 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
         }
       }
 
-      await api.deployApp({
-        slug: slug.trim().toLowerCase(),
-        name: name.trim(),
-        sourceType,
-        image: sourceType === "image" ? image.trim() : null,
-        gitRepoUrl: sourceType === "git" ? gitRepoUrl.trim() : null,
-        gitBranch: sourceType === "git" ? gitBranch.trim() || "main" : null,
-        dockerfilePath: dockerfilePath.trim() || "Dockerfile",
-        domain: domain.trim() || null,
-        internalPort: Number.parseInt(internalPort, 10) || 8080,
-        cpuLimit: "0.5",
-        memoryLimitMb: 512,
-        companions,
-        envVars: parsedEnv,
-      });
+      const parsedPort = internalPort.trim()
+        ? Number.parseInt(internalPort, 10)
+        : undefined;
+
+      const res = await api.deployApp(
+        {
+          slug: slug.trim().toLowerCase(),
+          name: name.trim(),
+          sourceType,
+          image: sourceType === "image" ? image.trim() : null,
+          gitRepoUrl: sourceType === "git" ? gitRepoUrl.trim() : null,
+          gitBranch: sourceType === "git" ? gitBranch.trim() || null : null,
+          dockerfilePath:
+            sourceType === "git"
+              ? dockerfilePath.trim() || "auto"
+              : "Dockerfile",
+          ...(noDomain
+            ? { noDomain: true, domain: null }
+            : domain.trim()
+              ? { domain: domain.trim() }
+              : {}),
+          ...(parsedPort && Number.isFinite(parsedPort)
+            ? { internalPort: parsedPort }
+            : {}),
+          cpuLimit: "0.5",
+          memoryLimitMb: 512,
+          companions,
+          envVars: parsedEnv,
+        },
+        true,
+      );
 
       setShowCreate(false);
+      setGitPreview(null);
       setSlug("");
       setName("");
+      setGitRepoUrl("");
+      setGitBranch("");
+      setDockerfilePath("auto");
+      setInternalPort("");
       setDomain("");
+      setNoDomain(false);
+      setWithPostgres(false);
+      setWithRedis(false);
       setEnvText("");
-      setNotice("App launched safely inside its Locked Apartment.");
+
+      if (res.deployment) {
+        setTrackedDeployment(res.deployment);
+        setNotice(
+          `Deployment started for ${res.deployment.slug} — watching build progress live.`,
+        );
+      } else {
+        setNotice("App launched safely inside its Locked Apartment.");
+      }
       await onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not launch app.");
@@ -189,6 +380,7 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
         { key: newEnvKey.trim(), value: newEnvVal },
       ]);
       setEnvVars(res.envVars);
+      setMissingEnvKeys(res.missingEnvKeys ?? []);
       setNewEnvKey("");
       setNewEnvVal("");
       setNotice(`Saved hidden setting ${newEnvKey.trim()}.`);
@@ -205,6 +397,7 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
     try {
       const res = await api.deleteAppEnv(selectedSlug, key);
       setEnvVars(res.envVars);
+      setMissingEnvKeys(res.missingEnvKeys ?? []);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete setting.");
     } finally {
@@ -241,8 +434,8 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
         <div>
           <h2 className="text-xl font-semibold text-white">Apps</h2>
           <p className="text-sm text-slate-400">
-            Every app runs in its own locked apartment with private storage and
-            optional databases.
+            Deploy public GitHub repos (even without a Dockerfile) or Docker
+            images inside isolated Locked Apartments.
           </p>
         </div>
         <button
@@ -266,6 +459,64 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
         </div>
       )}
 
+      {/* Live Background Deployment Tracker */}
+      {trackedDeployment && (
+        <div className="rounded-2xl border border-slate-700 bg-slate-900/90 p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2.5">
+              {isDeploymentActive(trackedDeployment.status) ? (
+                <Loader2 className="h-4 w-4 animate-spin text-amber-300" />
+              ) : (
+                <Rocket className="h-4 w-4 text-emerald-400" />
+              )}
+              <span className="text-sm font-semibold text-white">
+                Deployment for{" "}
+                <code className="text-emerald-300">{trackedDeployment.slug}</code>
+              </span>
+              <span
+                className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${deploymentBadgeClass(trackedDeployment.status)}`}
+              >
+                {trackedDeployment.status}
+              </span>
+              {trackedDeployment.detectedRuntime && (
+                <span className="rounded-full bg-slate-800 px-2.5 py-0.5 text-xs text-slate-300">
+                  {trackedDeployment.detectedRuntime}
+                  {trackedDeployment.usedAutoDockerfile ? " (auto)" : ""}
+                </span>
+              )}
+              {trackedDeployment.commitSha && (
+                <span className="inline-flex items-center gap-1 text-xs font-mono text-slate-400">
+                  <GitBranch className="h-3 w-3" />
+                  {trackedDeployment.commitSha.slice(0, 7)}
+                </span>
+              )}
+            </div>
+            {!isDeploymentActive(trackedDeployment.status) && (
+              <button
+                type="button"
+                onClick={() => setTrackedDeployment(null)}
+                className="text-xs text-slate-400 hover:text-white cursor-pointer"
+              >
+                Dismiss
+              </button>
+            )}
+          </div>
+          {trackedDeployment.phaseDetail && (
+            <p className="text-xs text-slate-300">
+              {trackedDeployment.phaseDetail}
+            </p>
+          )}
+          {trackedDeployment.error && (
+            <p className="text-xs text-rose-300">{trackedDeployment.error}</p>
+          )}
+          {trackedDeployment.buildLogs.length > 0 && (
+            <pre className="max-h-48 overflow-auto rounded-xl border border-slate-800 bg-black/60 p-3 text-xs font-mono text-slate-300 whitespace-pre-wrap">
+              {trackedDeployment.buildLogs.join("\n")}
+            </pre>
+          )}
+        </div>
+      )}
+
       {showCreate && (
         <form
           onSubmit={handleCreate}
@@ -274,6 +525,128 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
           <h3 className="text-base font-semibold text-white">
             Launch a New Locked-Apartment App
           </h3>
+
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setSourceType("git")}
+              className={`rounded-lg px-3.5 py-2 text-xs font-semibold border transition cursor-pointer ${
+                sourceType === "git"
+                  ? "border-emerald-500 bg-emerald-500/15 text-emerald-300"
+                  : "border-slate-700 bg-slate-950 text-slate-400"
+              }`}
+            >
+              Deploy from GitHub (Auto-Detect or Dockerfile)
+            </button>
+            <button
+              type="button"
+              onClick={() => setSourceType("image")}
+              className={`rounded-lg px-3.5 py-2 text-xs font-semibold border transition cursor-pointer ${
+                sourceType === "image"
+                  ? "border-emerald-500 bg-emerald-500/15 text-emerald-300"
+                  : "border-slate-700 bg-slate-950 text-slate-400"
+              }`}
+            >
+              Ready-Made Package (Docker Image)
+            </button>
+          </div>
+
+          {sourceType === "git" ? (
+            <div className="space-y-3">
+              <div className="flex flex-wrap gap-2 items-end">
+                <div className="flex-1 min-w-[260px]">
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Public HTTPS GitHub Repo URL
+                  </label>
+                  <input
+                    type="url"
+                    value={gitRepoUrl}
+                    onChange={(e) => setGitRepoUrl(e.target.value)}
+                    placeholder="https://github.com/owner/repo"
+                    required
+                    className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm font-mono text-white"
+                  />
+                </div>
+                <button
+                  type="button"
+                  disabled={inspectingGit || !gitRepoUrl.trim()}
+                  onClick={handleInspectGit}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-sky-500/40 bg-sky-500/15 px-3.5 py-2 text-xs font-semibold text-sky-200 hover:bg-sky-500/25 disabled:opacity-50 cursor-pointer"
+                >
+                  {inspectingGit ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Search className="h-3.5 w-3.5" />
+                  )}
+                  {inspectingGit ? "Inspecting..." : "Inspect & Auto-Fill"}
+                </button>
+              </div>
+
+              {gitPreview && (
+                <div className="rounded-xl border border-sky-500/30 bg-sky-500/10 p-3.5 space-y-1.5 text-xs">
+                  <div className="flex flex-wrap items-center gap-2 text-sky-200 font-medium">
+                    <Sparkles className="h-3.5 w-3.5" />
+                    <span>{gitPreview.buildPlanSummary}</span>
+                  </div>
+                  {gitPreview.envExampleKeys.length > 0 && (
+                    <p className="text-slate-300">
+                      Detected settings from <code>.env.example</code>:{" "}
+                      <span className="font-mono text-amber-200">
+                        {gitPreview.envExampleKeys.map((k) => k.key).join(", ")}
+                      </span>{" "}
+                      (you can fill them below or safely later in Hidden Settings).
+                    </p>
+                  )}
+                  {gitPreview.notes.map((n, i) => (
+                    <p key={i} className="text-slate-400">
+                      {n}
+                    </p>
+                  ))}
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Branch (Optional — defaults to repo default)
+                  </label>
+                  <input
+                    type="text"
+                    value={gitBranch}
+                    onChange={(e) => setGitBranch(e.target.value)}
+                    placeholder="main"
+                    className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Dockerfile Path (leave &ldquo;auto&rdquo; to auto-detect)
+                  </label>
+                  <input
+                    type="text"
+                    value={dockerfilePath}
+                    onChange={(e) => setDockerfilePath(e.target.value)}
+                    placeholder="auto"
+                    className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm font-mono text-white"
+                  />
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">
+                Docker Image
+              </label>
+              <input
+                type="text"
+                value={image}
+                onChange={(e) => setImage(e.target.value)}
+                placeholder="nginxinc/nginx-unprivileged:alpine"
+                required
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm font-mono text-white"
+              />
+            </div>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
@@ -304,110 +677,59 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
             </div>
           </div>
 
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={() => setSourceType("image")}
-              className={`rounded-lg px-3.5 py-2 text-xs font-semibold border transition cursor-pointer ${
-                sourceType === "image"
-                  ? "border-emerald-500 bg-emerald-500/15 text-emerald-300"
-                  : "border-slate-700 bg-slate-950 text-slate-400"
-              }`}
-            >
-              Ready-Made Package (Docker Image)
-            </button>
-            <button
-              type="button"
-              onClick={() => setSourceType("git")}
-              className={`rounded-lg px-3.5 py-2 text-xs font-semibold border transition cursor-pointer ${
-                sourceType === "git"
-                  ? "border-emerald-500 bg-emerald-500/15 text-emerald-300"
-                  : "border-slate-700 bg-slate-950 text-slate-400"
-              }`}
-            >
-              Build from GitHub (Dockerfile)
-            </button>
-          </div>
-
-          {sourceType === "image" ? (
-            <div>
-              <label className="block text-xs font-medium text-slate-300 mb-1">
-                Docker Image
-              </label>
-              <input
-                type="text"
-                value={image}
-                onChange={(e) => setImage(e.target.value)}
-                placeholder="nginxinc/nginx-unprivileged:alpine"
-                required
-                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm font-mono text-white"
-              />
-            </div>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="md:col-span-2">
-                <label className="block text-xs font-medium text-slate-300 mb-1">
-                  Public HTTPS GitHub Repo URL
-                </label>
-                <input
-                  type="url"
-                  value={gitRepoUrl}
-                  onChange={(e) => setGitRepoUrl(e.target.value)}
-                  placeholder="https://github.com/yourname/your-app.git"
-                  required
-                  className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm font-mono text-white"
-                />
-              </div>
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">
-                  Branch &amp; Dockerfile
-                </label>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    value={gitBranch}
-                    onChange={(e) => setGitBranch(e.target.value)}
-                    placeholder="main"
-                    className="w-1/2 rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-2 text-sm text-white"
-                  />
-                  <input
-                    type="text"
-                    value={dockerfilePath}
-                    onChange={(e) => setDockerfilePath(e.target.value)}
-                    placeholder="Dockerfile"
-                    className="w-1/2 rounded-lg border border-slate-700 bg-slate-950 px-2.5 py-2 text-sm text-white"
-                  />
-                </div>
-              </div>
-            </div>
-          )}
-
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-medium text-slate-300 mb-1">
-                App Internal Port
+                App Internal Port{" "}
+                {sourceType === "git" && (
+                  <span className="text-slate-500">
+                    (Optional — auto-detected)
+                  </span>
+                )}
               </label>
               <input
                 type="number"
                 value={internalPort}
                 onChange={(e) => setInternalPort(e.target.value)}
+                placeholder={sourceType === "git" ? "Auto-detect" : "8080"}
                 min={1}
                 max={65535}
-                required
+                required={sourceType === "image"}
                 className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
               />
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-300 mb-1">
-                Public Domain (Optional, automatic HTTPS)
+                Public Domain{" "}
+                {appsBaseDomain && !noDomain && (
+                  <span className="text-emerald-400">
+                    (auto: {slug || "your-app"}.{appsBaseDomain})
+                  </span>
+                )}
               </label>
               <input
                 type="text"
                 value={domain}
+                disabled={noDomain}
                 onChange={(e) => setDomain(e.target.value)}
-                placeholder="app.yourdomain.com"
-                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white"
+                placeholder={
+                  appsBaseDomain
+                    ? `${slug || "my-app"}.${appsBaseDomain}`
+                    : "app.yourdomain.com"
+                }
+                className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-white disabled:opacity-50"
               />
+              {appsBaseDomain && (
+                <label className="mt-1.5 inline-flex items-center gap-2 text-xs text-slate-400 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={noDomain}
+                    onChange={(e) => setNoDomain(e.target.checked)}
+                    className="rounded border-slate-600 bg-slate-950"
+                  />
+                  Keep private (don&rsquo;t assign an automatic subdomain)
+                </label>
+              )}
             </div>
           </div>
 
@@ -458,7 +780,7 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
               disabled={creating}
               className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
             >
-              {creating ? "Launching..." : "Launch App"}
+              {creating ? "Starting..." : "Launch App"}
             </button>
           </div>
         </form>
@@ -494,11 +816,22 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
                             ? "bg-emerald-500/15 text-emerald-300"
                             : app.status === "error"
                               ? "bg-rose-500/15 text-rose-300"
-                              : "bg-slate-700/60 text-slate-300"
+                              : "bg-amber-500/15 text-amber-300"
                         }`}
                       >
                         {app.status}
                       </span>
+                      {app.detectedRuntime && (
+                        <span className="rounded-full bg-slate-800 px-2.5 py-0.5 text-xs text-slate-300">
+                          {app.detectedRuntime}
+                        </span>
+                      )}
+                      {app.lastCommitSha && (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-slate-800/80 px-2 py-0.5 text-xs font-mono text-slate-400">
+                          <GitBranch className="h-3 w-3" />
+                          {app.lastCommitSha.slice(0, 7)}
+                        </span>
+                      )}
                       {app.companions.map((c) => (
                         <span
                           key={c.type}
@@ -579,6 +912,7 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
                 <div className="border-t border-slate-800/80 bg-slate-950/40 px-5 py-2.5 flex flex-wrap gap-2">
                   {(
                     [
+                      ["deployments", "Deployments", Rocket],
                       ["logs", "Logs", Terminal],
                       ["domain", "Domain", Globe],
                       ["env", "Hidden Settings (.env)", KeyRound],
@@ -591,7 +925,7 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
                       onClick={() =>
                         isOpen && section === key
                           ? setSelectedSlug(null)
-                          : openDrawer(app, key)
+                          : void openDrawerBySlug(app.slug, key, app.domain)
                       }
                       className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition cursor-pointer ${
                         isOpen && section === key
@@ -609,6 +943,84 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
                   <div className="border-t border-slate-800 bg-slate-950/80 p-5">
                     {drawerLoading ? (
                       <p className="text-sm text-slate-400">Loading...</p>
+                    ) : section === "deployments" ? (
+                      <div className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-medium text-slate-400">
+                            Recent builds &amp; deployments (build logs are
+                            automatically scrubbed of secrets)
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void openDrawerBySlug(
+                                app.slug,
+                                "deployments",
+                                app.domain,
+                              )
+                            }
+                            className="text-xs text-emerald-400 hover:text-emerald-300 cursor-pointer"
+                          >
+                            Refresh
+                          </button>
+                        </div>
+                        {deployments.length === 0 ? (
+                          <p className="text-xs text-slate-400">
+                            No tracked deployments yet.
+                          </p>
+                        ) : (
+                          <div className="space-y-3">
+                            {deployments.map((dep) => (
+                              <div
+                                key={dep.id}
+                                className="rounded-xl border border-slate-800 bg-slate-900/70 p-3.5 space-y-2"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span
+                                      className={`rounded-full px-2 py-0.5 font-semibold ${deploymentBadgeClass(dep.status)}`}
+                                    >
+                                      {dep.status}
+                                    </span>
+                                    <span className="font-mono text-slate-300">
+                                      {dep.action}
+                                    </span>
+                                    {dep.detectedRuntime && (
+                                      <span className="text-slate-400">
+                                        {dep.detectedRuntime}
+                                        {dep.usedAutoDockerfile ? " (auto)" : ""}
+                                      </span>
+                                    )}
+                                    {dep.commitSha && (
+                                      <span className="font-mono text-slate-400">
+                                        @{dep.commitSha.slice(0, 7)}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <span className="text-slate-500">
+                                    {new Date(dep.createdAt).toLocaleString()}
+                                  </span>
+                                </div>
+                                {dep.phaseDetail && (
+                                  <p className="text-xs text-slate-300">
+                                    {dep.phaseDetail}
+                                  </p>
+                                )}
+                                {dep.error && (
+                                  <p className="text-xs text-rose-300">
+                                    {dep.error}
+                                  </p>
+                                )}
+                                {dep.buildLogs.length > 0 && (
+                                  <pre className="max-h-40 overflow-auto rounded-lg border border-slate-800 bg-black/60 p-2.5 text-[11px] font-mono text-slate-300 whitespace-pre-wrap">
+                                    {dep.buildLogs.join("\n")}
+                                  </pre>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                     ) : section === "logs" ? (
                       <div className="space-y-2">
                         <div className="flex items-center justify-between">
@@ -618,7 +1030,9 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
                           </span>
                           <button
                             type="button"
-                            onClick={() => openDrawer(app, "logs")}
+                            onClick={() =>
+                              void openDrawerBySlug(app.slug, "logs", app.domain)
+                            }
                             className="text-xs text-emerald-400 hover:text-emerald-300 cursor-pointer"
                           >
                             Refresh Logs
@@ -661,6 +1075,27 @@ export function AppsTab({ apps, onRefresh, onInspectSync }: AppsTabProps) {
                       </div>
                     ) : section === "env" ? (
                       <div className="space-y-4">
+                        {missingEnvKeys.length > 0 && (
+                          <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3.5 space-y-2">
+                            <p className="text-xs font-medium text-amber-200">
+                              Suggested settings from this repo&rsquo;s{" "}
+                              <code>.env.example</code> (click one to fill it
+                              safely here):
+                            </p>
+                            <div className="flex flex-wrap gap-1.5">
+                              {missingEnvKeys.map((key) => (
+                                <button
+                                  key={key}
+                                  type="button"
+                                  onClick={() => setNewEnvKey(key)}
+                                  className="rounded-md border border-amber-500/40 bg-slate-950 px-2.5 py-1 text-xs font-mono text-amber-200 hover:bg-amber-500/20 cursor-pointer"
+                                >
+                                  + {key}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                         <form
                           onSubmit={handleSaveEnv}
                           className="flex flex-wrap gap-2"

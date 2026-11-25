@@ -1,4 +1,9 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { isSlugAllowedForToken, requiresApprovalForScope } from "./mcp.js";
 import { RegistryStore } from "./store.js";
 
 describe("RegistryStore (SQLite WAL)", () => {
@@ -169,10 +174,121 @@ describe("RegistryStore (SQLite WAL)", () => {
     const updated = store.updateSetupState({
       claimed: true,
       domain: "vps.example.com",
+      appsBaseDomain: "apps.example.com",
       acmeEmail: "owner@example.com",
       claimedAt: new Date().toISOString(),
     });
     expect(updated.claimed).toBe(true);
     expect(updated.domain).toBe("vps.example.com");
+    expect(updated.appsBaseDomain).toBe("apps.example.com");
+  });
+
+  it("supports safe-auto-deploy tokens, per-app allowlists, deployments with redacted logs, and legacy DB migration", () => {
+    expect(requiresApprovalForScope("safe-auto-deploy", "deploy_app")).toBe(false);
+    expect(requiresApprovalForScope("safe-auto-deploy", "delete_app")).toBe(true);
+    expect(requiresApprovalForScope("auto-approve", "delete_app")).toBe(false);
+
+    const { record, rawToken } = store.createMcpToken({
+      name: "Scoped Cursor",
+      scope: "safe-auto-deploy",
+      allowedSlugs: ["my-blog"],
+    });
+    expect(record.scope).toBe("safe-auto-deploy");
+    expect(record.allowedSlugs).toEqual(["my-blog"]);
+    expect(isSlugAllowedForToken(record, "my-blog")).toBe(true);
+    expect(isSlugAllowedForToken(record, "other-app")).toBe(false);
+
+    const verified = store.verifyMcpToken(rawToken);
+    expect(verified?.scope).toBe("safe-auto-deploy");
+    expect(verified?.allowedSlugs).toEqual(["my-blog"]);
+
+    const dep = store.createDeployment({
+      slug: "my-blog",
+      action: "deploy_app",
+      actor: "agent",
+      actorTokenId: record.id,
+      sourceType: "git",
+      gitRepoUrl: "https://github.com/acme/my-blog",
+      gitBranch: "main",
+      domain: "my-blog.apps.example.com",
+    });
+    expect(dep.status).toBe("queued");
+
+    const failed = store.updateDeployment(dep.id, {
+      status: "failed",
+      commitSha: "abcdef1234567890",
+      detectedRuntime: "nextjs",
+      usedAutoDockerfile: true,
+      buildLogs: ["Step 1: npm ci", "OPENAI_API_KEY=sk-secret-value-12345678"],
+      error: "Build failed with Bearer topsecretbearertoken123",
+    })!;
+    expect(failed.status).toBe("failed");
+    expect(failed.finishedAt).toBeTruthy();
+    expect(failed.usedAutoDockerfile).toBe(true);
+    expect(failed.buildLogs.join("\n")).not.toContain("sk-secret-value-12345678");
+    expect(failed.error).not.toContain("topsecretbearertoken123");
+    expect(store.listDeployments({ slug: "my-blog" })).toHaveLength(1);
+
+    // Verify legacy DB without 'safe-auto-deploy' in CHECK constraints migrates cleanly
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpsagent-migrate-"));
+    const legacyDbPath = path.join(tmpDir, "legacy.db");
+    try {
+      const legacy = new DatabaseSync(legacyDbPath);
+      legacy.exec(`
+        CREATE TABLE mcp_tokens (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          scope TEXT NOT NULL CHECK (scope IN ('read-only', 'approval-required', 'auto-approve')),
+          token_hash TEXT NOT NULL UNIQUE,
+          token_prefix TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          last_used_at TEXT,
+          revoked_at TEXT
+        );
+        CREATE TABLE approval_requests (
+          id TEXT PRIMARY KEY,
+          action TEXT NOT NULL,
+          target_slug TEXT,
+          summary TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          requested_by TEXT NOT NULL,
+          token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'auto-approve')),
+          status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'executed', 'failed')),
+          risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high')),
+          decided_by TEXT,
+          decision_note TEXT,
+          result_summary TEXT,
+          created_at TEXT NOT NULL,
+          decided_at TEXT,
+          executed_at TEXT,
+          execution_owner TEXT
+        );
+      `);
+      legacy.close();
+
+      const upgraded = new RegistryStore(legacyDbPath);
+      try {
+        const created = upgraded.createMcpToken({
+          name: "Upgraded Pass",
+          scope: "safe-auto-deploy",
+          allowedSlugs: ["demo-app"],
+        });
+        expect(created.record.scope).toBe("safe-auto-deploy");
+        const apr = upgraded.createApproval({
+          action: "delete_app",
+          targetSlug: "demo-app",
+          summary: "Delete demo-app",
+          payload: { slug: "demo-app" },
+          requestedBy: "Upgraded Pass",
+          tokenScope: "safe-auto-deploy",
+          riskLevel: "high",
+        });
+        expect(apr.tokenScope).toBe("safe-auto-deploy");
+      } finally {
+        upgraded.close();
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

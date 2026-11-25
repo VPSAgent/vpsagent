@@ -1,6 +1,7 @@
 export interface SetupState {
   claimed: boolean;
   domain: string | null;
+  appsBaseDomain: string | null;
   acmeEmail: string | null;
   httpsActive: boolean;
   tlsStatus: "inactive" | "pending" | "active" | "failed";
@@ -36,8 +37,58 @@ export interface AppRecord {
   cpuLimit: string;
   memoryLimitMb: number;
   companions: CompanionService[];
+  lastCommitSha: string | null;
+  detectedRuntime: string | null;
+  envExampleKeys: string[];
   createdAt: string;
   updatedAt: string;
+}
+
+export interface DeploymentRecord {
+  id: string;
+  slug: string;
+  action: "deploy_app" | "rebuild_app";
+  status:
+    | "queued"
+    | "cloning"
+    | "building"
+    | "starting"
+    | "verifying"
+    | "succeeded"
+    | "failed";
+  actor: "user" | "agent" | "system";
+  actorTokenId: string | null;
+  sourceType: "image" | "git";
+  gitRepoUrl: string | null;
+  gitBranch: string | null;
+  commitSha: string | null;
+  detectedRuntime: string | null;
+  usedAutoDockerfile: boolean;
+  domain: string | null;
+  phaseDetail: string | null;
+  buildLogs: string[];
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  finishedAt: string | null;
+}
+
+export interface GitInspectResult {
+  ok: boolean;
+  gitRepoUrl: string;
+  resolvedBranch: string | null;
+  commitSha: string | null;
+  hasDockerfile: boolean;
+  dockerfilePath: string;
+  detectedRuntime: string;
+  suggestedPort: number;
+  suggestedSlug: string;
+  suggestedName: string;
+  suggestedDomain: string | null;
+  envExampleKeys: Array<{ key: string; isSecret: boolean }>;
+  suggestedCompanions: Array<"postgres" | "redis">;
+  buildPlanSummary: string;
+  notes: string[];
 }
 
 export interface AppEnvEntry {
@@ -76,6 +127,12 @@ export interface OverviewResponse {
   setup: SetupState;
 }
 
+export type McpTokenScope =
+  | "read-only"
+  | "approval-required"
+  | "safe-auto-deploy"
+  | "auto-approve";
+
 export interface ApprovalRequest {
   id: string;
   action: string;
@@ -83,7 +140,7 @@ export interface ApprovalRequest {
   summary: string;
   payload: Record<string, unknown>;
   requestedBy: string;
-  tokenScope: "read-only" | "approval-required" | "auto-approve";
+  tokenScope: McpTokenScope;
   status: "pending" | "approved" | "rejected" | "executed" | "failed";
   riskLevel: "low" | "medium" | "high";
   decidedBy: string | null;
@@ -107,7 +164,8 @@ export interface AuditEvent {
 export interface McpTokenRecord {
   id: string;
   name: string;
-  scope: "read-only" | "approval-required" | "auto-approve";
+  scope: McpTokenScope;
+  allowedSlugs: string[];
   tokenPrefix: string;
   createdAt: string;
   lastUsedAt: string | null;
@@ -120,6 +178,7 @@ export interface McpSnippets {
   claudeCode: string;
   cursor: string;
   codex: string;
+  genericHttp: string;
 }
 
 export interface InspectResult {
@@ -206,6 +265,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ domain, acmeEmail }),
     }),
+  updateAppsBaseDomain: (appsBaseDomain: string | null) =>
+    apiFetch<{ ok: true; setup: SetupState }>("/api/setup/apps-base-domain", {
+      method: "POST",
+      body: JSON.stringify({ appsBaseDomain }),
+    }),
   recheckTls: () =>
     apiFetch<{ ok: true; setup: SetupState }>("/api/setup/tls-recheck", {
       method: "POST",
@@ -219,29 +283,66 @@ export const api = {
 
   getOverview: () => apiFetch<OverviewResponse>("/api/overview"),
   listApps: () => apiFetch<{ apps: AppRecord[] }>("/api/apps"),
-  deployApp: (body: {
-    slug: string;
-    name: string;
-    sourceType: "image" | "git";
-    image?: string | null;
-    gitRepoUrl?: string | null;
-    gitBranch?: string | null;
-    dockerfilePath?: string;
-    domain?: string | null;
-    internalPort: number;
-    cpuLimit: string;
-    memoryLimitMb: number;
-    companions: CompanionService[];
-    envVars: Record<string, string>;
-  }) =>
-    apiFetch<{ app: AppRecord }>("/api/apps", {
+  inspectGitRepo: (
+    gitRepoUrl: string,
+    gitBranch?: string | null,
+    dockerfilePath?: string,
+  ) =>
+    apiFetch<{ inspect: GitInspectResult }>("/api/git/inspect", {
       method: "POST",
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        gitRepoUrl,
+        ...(gitBranch ? { gitBranch } : {}),
+        ...(dockerfilePath ? { dockerfilePath } : {}),
+      }),
     }),
-  appAction: (slug: string, action: "start" | "stop" | "restart" | "rebuild") =>
-    apiFetch<{ app: AppRecord }>(`/api/apps/${encodeURIComponent(slug)}/${action}`, {
-      method: "POST",
-    }),
+  listDeployments: (slug?: string, limit = 15) =>
+    apiFetch<{ deployments: DeploymentRecord[] }>(
+      `/api/deployments?limit=${limit}${slug ? `&slug=${encodeURIComponent(slug)}` : ""}`,
+    ),
+  getDeployment: (id: string) =>
+    apiFetch<{
+      deployment: DeploymentRecord;
+      app: AppRecord | null;
+      missingEnvKeys: string[];
+    }>(`/api/deployments/${encodeURIComponent(id)}`),
+  deployApp: (
+    body: {
+      slug: string;
+      name: string;
+      sourceType: "image" | "git";
+      image?: string | null;
+      gitRepoUrl?: string | null;
+      gitBranch?: string | null;
+      dockerfilePath?: string;
+      domain?: string | null;
+      noDomain?: boolean;
+      internalPort?: number;
+      cpuLimit: string;
+      memoryLimitMb: number;
+      companions: CompanionService[];
+      envVars: Record<string, string>;
+    },
+    asyncMode = true,
+  ) =>
+    apiFetch<{ app: AppRecord | null; deployment?: DeploymentRecord }>(
+      `/api/apps${asyncMode ? "?async=true" : ""}`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    ),
+  appAction: (
+    slug: string,
+    action: "start" | "stop" | "restart" | "rebuild",
+    asyncRebuild = false,
+  ) =>
+    apiFetch<{ app: AppRecord | null; deployment?: DeploymentRecord }>(
+      `/api/apps/${encodeURIComponent(slug)}/${action}${action === "rebuild" && asyncRebuild ? "?async=true" : ""}`,
+      {
+        method: "POST",
+      },
+    ),
   deleteApp: (slug: string) =>
     apiFetch<{ ok: true }>(`/api/apps/${encodeURIComponent(slug)}?removeFiles=true`, {
       method: "DELETE",
@@ -263,34 +364,46 @@ export const api = {
       },
     ),
   getAppEnv: (slug: string) =>
-    apiFetch<{ envVars: AppEnvEntry[] }>(
+    apiFetch<{ envVars: AppEnvEntry[]; missingEnvKeys: string[] }>(
       `/api/apps/${encodeURIComponent(slug)}/env`,
     ),
   updateAppEnv: (
     slug: string,
     vars: Array<{ key: string; value: string; isSecret?: boolean }>,
   ) =>
-    apiFetch<{ app: AppRecord; envVars: AppEnvEntry[] }>(
-      `/api/apps/${encodeURIComponent(slug)}/env`,
-      {
-        method: "PUT",
-        body: JSON.stringify({ vars, deleteKeys: [] }),
-      },
-    ),
+    apiFetch<{
+      app: AppRecord;
+      envVars: AppEnvEntry[];
+      missingEnvKeys: string[];
+    }>(`/api/apps/${encodeURIComponent(slug)}/env`, {
+      method: "PUT",
+      body: JSON.stringify({ vars, deleteKeys: [] }),
+    }),
   deleteAppEnv: (slug: string, key: string) =>
-    apiFetch<{ app: AppRecord; envVars: AppEnvEntry[] }>(
-      `/api/apps/${encodeURIComponent(slug)}/env/${encodeURIComponent(key)}`,
-      { method: "DELETE" },
-    ),
+    apiFetch<{
+      app: AppRecord;
+      envVars: AppEnvEntry[];
+      missingEnvKeys: string[];
+    }>(`/api/apps/${encodeURIComponent(slug)}/env/${encodeURIComponent(key)}`, {
+      method: "DELETE",
+    }),
 
   listApprovals: () =>
     apiFetch<{ approvals: ApprovalRequest[] }>("/api/approvals"),
-  approveRequest: (id: string, note?: string) =>
-    apiFetch<{ ok: boolean; approval: ApprovalRequest; summary: string }>(
-      `/api/approvals/${encodeURIComponent(id)}/approve`,
+  approveRequest: (id: string, note?: string, asyncDeploy = true) =>
+    apiFetch<{
+      ok: boolean;
+      approval: ApprovalRequest;
+      summary: string;
+      deployment?: DeploymentRecord;
+    }>(
+      `/api/approvals/${encodeURIComponent(id)}/approve${asyncDeploy ? "?async=true" : ""}`,
       {
         method: "POST",
-        body: JSON.stringify(note ? { note } : {}),
+        body: JSON.stringify({
+          ...(note ? { note } : {}),
+          ...(asyncDeploy ? { async: true } : {}),
+        }),
       },
     ),
   rejectRequest: (id: string, note?: string) =>
@@ -309,11 +422,12 @@ export const api = {
   listTokens: () => apiFetch<{ tokens: McpTokenRecord[] }>("/api/mcp/tokens"),
   createToken: (
     name: string,
-    scope: "read-only" | "approval-required" | "auto-approve",
+    scope: McpTokenScope,
+    allowedSlugs: string[] = [],
   ) =>
     apiFetch<{ token: McpTokenRecord; rawToken: string }>("/api/mcp/tokens", {
       method: "POST",
-      body: JSON.stringify({ name, scope }),
+      body: JSON.stringify({ name, scope, allowedSlugs }),
     }),
   revokeToken: (id: string) =>
     apiFetch<{ ok: true }>(`/api/mcp/tokens/${encodeURIComponent(id)}`, {

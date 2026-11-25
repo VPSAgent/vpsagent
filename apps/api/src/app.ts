@@ -23,6 +23,7 @@ import {
 import {
   AppExecutor,
   DeployAppInputSchema,
+  InspectGitInputSchema,
   UpdateAppEnvInputSchema,
 } from "./executor.js";
 import {
@@ -48,6 +49,7 @@ export interface VpsAgentAppOptions {
   readinessTimeoutSeconds?: number | undefined;
   readinessPollIntervalMs?: number | undefined;
   buildTimeoutSeconds?: number | undefined;
+  mcpDeployGraceMs?: number | undefined;
 }
 
 const ClaimInputSchema = z.object({
@@ -67,12 +69,17 @@ const SetupDomainInputSchema = z.object({
   acmeEmail: z.string().trim().email().nullable().optional(),
 });
 
+const SetupAppsBaseDomainSchema = z.object({
+  appsBaseDomain: z.string().trim().min(1).max(253).nullable(),
+});
+
 const SetAppDomainBodySchema = z.object({
   domain: z.string().trim().min(1).max(253).nullable(),
 });
 
 const DecisionBodySchema = z.object({
   note: z.string().max(400).optional(),
+  async: z.boolean().optional(),
 });
 
 const MIME_TYPES: Record<string, string> = {
@@ -306,7 +313,13 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
 
   app.post(
     "/mcp",
-    createMcpPostHandler({ store, bridge, executor, transportOptions }),
+    createMcpPostHandler({
+      store,
+      bridge,
+      executor,
+      transportOptions,
+      mcpDeployGraceMs: options.mcpDeployGraceMs,
+    }),
   );
 
   // Streamable HTTP spec: return 405 Method Not Allowed on GET /mcp when SSE is not offered
@@ -337,8 +350,12 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   };
 
   app.use("/api/setup/domain", requireOwner);
+  app.use("/api/setup/apps-base-domain", requireOwner);
   app.use("/api/setup/tls-recheck", requireOwner);
   app.use("/api/overview", requireOwner);
+  app.use("/api/git/*", requireOwner);
+  app.use("/api/deployments/*", requireOwner);
+  app.use("/api/deployments", requireOwner);
   app.use("/api/apps/*", requireOwner);
   app.use("/api/apps", requireOwner);
   app.use("/api/approvals/*", requireOwner);
@@ -403,6 +420,65 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     }
   });
 
+  app.post("/api/setup/apps-base-domain", async (c) => {
+    try {
+      const body = SetupAppsBaseDomainSchema.parse(await c.req.json());
+      const safeBase = body.appsBaseDomain
+        ? validateDomain(body.appsBaseDomain)
+        : null;
+      const setup = store.updateSetupState({ appsBaseDomain: safeBase });
+      store.recordAudit({
+        actor: "user",
+        action: "setup.apps_base_domain_updated",
+        summary: safeBase
+          ? `Set default apps base domain to *.${safeBase}`
+          : "Cleared default apps base domain",
+        riskLevel: "low",
+      });
+      return c.json({ ok: true, setup });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/git/inspect", async (c) => {
+    try {
+      const body = InspectGitInputSchema.parse(await c.req.json());
+      const inspect = await executor.inspectGitRepo(body);
+      return c.json({ inspect });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.get("/api/deployments", (c) => {
+    const slug = c.req.query("slug")?.trim() || undefined;
+    const rawLimit = Number.parseInt(c.req.query("limit") ?? "20", 10);
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(rawLimit, 1), 100)
+      : 20;
+    const deployments = store.listDeployments({
+      ...(slug ? { slug } : {}),
+      limit,
+    });
+    return c.json({ deployments });
+  });
+
+  app.get("/api/deployments/:id", (c) => {
+    const deployment = store.getDeployment(c.req.param("id"));
+    if (!deployment) {
+      return c.json({ error: "Deployment not found." }, 404);
+    }
+    const appRecord = store.getApp(deployment.slug);
+    return c.json({
+      deployment,
+      app: appRecord,
+      missingEnvKeys: executor.getMissingEnvKeys(deployment.slug),
+    });
+  });
+
   // Tab 1 — Overview
   app.get("/api/overview", async (c) => {
     try {
@@ -437,6 +513,13 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   app.post("/api/apps", async (c) => {
     try {
       const body = DeployAppInputSchema.parse(await c.req.json());
+      const runAsync = c.req.query("async") === "true";
+      if (runAsync) {
+        const started = await executor.startDeployApp(body, "user", {
+          waitMs: 0,
+        });
+        return c.json(started, 202);
+      }
       const result = await executor.deployApp(body, "user");
       return c.json(result, 201);
     } catch (err) {
@@ -500,6 +583,15 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
 
   app.post("/api/apps/:slug/rebuild", async (c) => {
     try {
+      const runAsync = c.req.query("async") === "true";
+      if (runAsync) {
+        const started = await executor.startRebuildApp(
+          c.req.param("slug"),
+          "user",
+          { waitMs: 0 },
+        );
+        return c.json(started, 202);
+      }
       const updated = await executor.rebuildApp(c.req.param("slug"), "user");
       return c.json({ app: updated });
     } catch (err) {
@@ -579,7 +671,10 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     if (!store.getApp(slug)) {
       return c.json({ error: "App not found." }, 404);
     }
-    return c.json({ envVars: store.listAppEnvVars(slug) });
+    return c.json({
+      envVars: store.listAppEnvVars(slug),
+      missingEnvKeys: executor.getMissingEnvKeys(slug),
+    });
   });
 
   app.put("/api/apps/:slug/env", async (c) => {
@@ -587,7 +682,11 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       const slug = c.req.param("slug");
       const body = UpdateAppEnvInputSchema.parse(await c.req.json());
       const updated = await executor.updateAppEnv(slug, body, "user");
-      return c.json({ app: updated, envVars: store.listAppEnvVars(slug) });
+      return c.json({
+        app: updated,
+        envVars: store.listAppEnvVars(slug),
+        missingEnvKeys: executor.getMissingEnvKeys(slug),
+      });
     } catch (err) {
       const { status, error } = handleError(err);
       return c.json({ error }, status);
@@ -603,7 +702,11 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         { vars: [], deleteKeys: [key] },
         "user",
       );
-      return c.json({ app: updated, envVars: store.listAppEnvVars(slug) });
+      return c.json({
+        app: updated,
+        envVars: store.listAppEnvVars(slug),
+        missingEnvKeys: executor.getMissingEnvKeys(slug),
+      });
     } catch (err) {
       const { status, error } = handleError(err);
       return c.json({ error }, status);
@@ -635,9 +738,13 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     try {
       const id = c.req.param("id");
       let note: string | undefined;
+      let asyncDeploy = c.req.query("async") === "true";
       try {
         const parsed = DecisionBodySchema.parse(await c.req.json());
         note = parsed.note;
+        if (parsed.async) {
+          asyncDeploy = true;
+        }
       } catch {
         // Optional body
       }
@@ -656,13 +763,16 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         riskLevel: decided.riskLevel,
       });
 
-      const execution = await executor.executeApprovedRequest(id);
+      const execution = await executor.executeApprovedRequest(id, {
+        asyncDeploy,
+      });
       const finalRecord = store.getApproval(id);
       return c.json(
         {
           ok: execution.ok,
           approval: finalRecord,
           summary: execution.summary,
+          ...(execution.deployment ? { deployment: execution.deployment } : {}),
           ...(execution.ok ? {} : { error: execution.summary }),
         },
         execution.ok ? 200 : 502,
