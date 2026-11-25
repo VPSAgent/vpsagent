@@ -131,7 +131,8 @@ export type McpTokenScope =
   | "read-only"
   | "approval-required"
   | "safe-auto-deploy"
-  | "auto-approve";
+  | "auto-approve"
+  | "host-admin";
 
 export interface ApprovalRequest {
   id: string;
@@ -175,10 +176,24 @@ export interface McpTokenRecord {
 export interface McpSnippets {
   mcpUrl: string;
   httpsReady: boolean;
+  tokenPlaceholder: string;
   claudeCode: string;
+  t3AndAgy: string;
   cursor: string;
   codex: string;
   genericHttp: string;
+  curlTest: string;
+}
+
+export interface McpConnectionTestResult {
+  ok: boolean;
+  mcpUrl: string;
+  httpsReady: boolean;
+  bridgeOk: boolean;
+  toolCount: number;
+  activeTokens: number;
+  protocolVersion: string;
+  message: string;
 }
 
 export interface InspectResult {
@@ -434,4 +449,6 @@ export const api = {
       method: "DELETE",
     }),
   getSnippets: () => apiFetch<McpSnippets>("/api/mcp/snippets"),
+  testMcpConnection: () =>
+    apiFetch<McpConnectionTestResult>("/api/mcp/test", { method: "POST" }),
 };

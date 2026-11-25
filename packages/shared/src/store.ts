@@ -301,7 +301,7 @@ export class RegistryStore {
         payload_json TEXT NOT NULL,
         requested_by TEXT NOT NULL,
         token_id TEXT,
-        token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
+        token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve', 'host-admin')),
         status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'executed', 'failed')),
         risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high')),
         decided_by TEXT,
@@ -339,7 +339,7 @@ export class RegistryStore {
       CREATE TABLE IF NOT EXISTS mcp_tokens (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        scope TEXT NOT NULL CHECK (scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
+        scope TEXT NOT NULL CHECK (scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve', 'host-admin')),
         allowed_slugs_json TEXT NOT NULL DEFAULT '[]',
         token_hash TEXT NOT NULL UNIQUE,
         token_prefix TEXT NOT NULL,
@@ -379,7 +379,7 @@ export class RegistryStore {
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mcp_tokens'",
       )
       .get() as { sql?: string } | undefined;
-    if (tokenTable?.sql && !tokenTable.sql.includes("safe-auto-deploy")) {
+    if (tokenTable?.sql && !tokenTable.sql.includes("host-admin")) {
       this.db.exec("PRAGMA foreign_keys = OFF;");
       try {
         this.db.exec(`
@@ -387,7 +387,7 @@ export class RegistryStore {
           CREATE TABLE mcp_tokens_new (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            scope TEXT NOT NULL CHECK (scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
+            scope TEXT NOT NULL CHECK (scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve', 'host-admin')),
             allowed_slugs_json TEXT NOT NULL DEFAULT '[]',
             token_hash TEXT NOT NULL UNIQUE,
             token_prefix TEXT NOT NULL,
@@ -414,7 +414,7 @@ export class RegistryStore {
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_requests'",
       )
       .get() as { sql?: string } | undefined;
-    if (approvalTable?.sql && !approvalTable.sql.includes("safe-auto-deploy")) {
+    if (approvalTable?.sql && !approvalTable.sql.includes("host-admin")) {
       this.db.exec("PRAGMA foreign_keys = OFF;");
       try {
         this.db.exec(`
@@ -427,7 +427,7 @@ export class RegistryStore {
             payload_json TEXT NOT NULL,
             requested_by TEXT NOT NULL,
             token_id TEXT,
-            token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
+            token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve', 'host-admin')),
             status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'executed', 'failed')),
             risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high')),
             decided_by TEXT,

@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { isSlugAllowedForToken, requiresApprovalForScope } from "./mcp.js";
+import {
+  hashMcpToken,
+  isSlugAllowedForToken,
+  requiresApprovalForScope,
+} from "./mcp.js";
 import { RegistryStore } from "./store.js";
 
 describe("RegistryStore (SQLite WAL)", () => {
@@ -284,8 +288,81 @@ describe("RegistryStore (SQLite WAL)", () => {
           riskLevel: "high",
         });
         expect(apr.tokenScope).toBe("safe-auto-deploy");
+        const hostAdmin = upgraded.createMcpToken({
+          name: "Root Host Pass",
+          scope: "host-admin",
+        });
+        expect(hostAdmin.record.scope).toBe("host-admin");
+        expect(upgraded.verifyMcpToken(created.rawToken)?.scope).toBe(
+          "safe-auto-deploy",
+        );
+        expect(upgraded.verifyMcpToken(hostAdmin.rawToken)?.scope).toBe(
+          "host-admin",
+        );
       } finally {
         upgraded.close();
+      }
+
+      // Also verify upgrading a PR #2-format DB that ALREADY has a saved safe-auto-deploy pass + app lock
+      const pr2DbPath = path.join(tmpDir, "pr2-registry.db");
+      const pr2Db = new DatabaseSync(pr2DbPath);
+      const seededRawToken = "vpsmcp_seeded_safe_auto_deploy_token_1234567890";
+      const seededHash = hashMcpToken(seededRawToken);
+      pr2Db.exec(`
+        CREATE TABLE mcp_tokens (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          scope TEXT NOT NULL CHECK (scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
+          allowed_slugs_json TEXT NOT NULL DEFAULT '[]',
+          token_hash TEXT NOT NULL UNIQUE,
+          token_prefix TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          last_used_at TEXT,
+          revoked_at TEXT
+        );
+        CREATE TABLE approval_requests (
+          id TEXT PRIMARY KEY,
+          action TEXT NOT NULL,
+          target_slug TEXT,
+          summary TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          requested_by TEXT NOT NULL,
+          token_id TEXT,
+          token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
+          status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'executed', 'failed')),
+          risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high')),
+          decided_by TEXT,
+          decision_note TEXT,
+          result_summary TEXT,
+          created_at TEXT NOT NULL,
+          decided_at TEXT,
+          executed_at TEXT,
+          execution_owner TEXT
+        );
+      `);
+      pr2Db
+        .prepare(
+          `INSERT INTO mcp_tokens (id, name, scope, allowed_slugs_json, token_hash, token_prefix, created_at)
+           VALUES ('tok_seeded', 'Existing Safe Deploy', 'safe-auto-deploy', '["demo-app"]', ?, 'vpsmcp_seeded', '2026-11-24T00:00:00.000Z')`,
+        )
+        .run(seededHash);
+      pr2Db.close();
+
+      const migratedPr2 = new RegistryStore(pr2DbPath);
+      try {
+        const verified = migratedPr2.verifyMcpToken(seededRawToken);
+        expect(verified).not.toBeNull();
+        expect(verified?.scope).toBe("safe-auto-deploy");
+        expect(verified?.allowedSlugs).toEqual(["demo-app"]);
+        const listed = migratedPr2.listMcpTokens();
+        expect(listed.some((t) => t.id === "tok_seeded")).toBe(true);
+        const newHostAdmin = migratedPr2.createMcpToken({
+          name: "New Host Admin",
+          scope: "host-admin",
+        });
+        expect(newHostAdmin.record.scope).toBe("host-admin");
+      } finally {
+        migratedPr2.close();
       }
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });

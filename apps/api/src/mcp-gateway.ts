@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import type { Context } from "hono";
 import { z } from "zod";
 import {
@@ -21,9 +22,15 @@ import {
 } from "./auth.js";
 import {
   type AppExecutor,
+  DeleteHostFileInputSchema,
   DeployAppInputSchema,
   InspectGitInputSchema,
+  DockerCleanupInputSchema,
+  ExecInAppInputSchema,
+  ManageHostServiceInputSchema,
+  RunHostCommandInputSchema,
   UpdateAppEnvInputSchema,
+  WriteHostFileInputSchema,
 } from "./executor.js";
 
 export const SUPPORTED_MCP_PROTOCOL_VERSIONS = [
@@ -52,13 +59,222 @@ const JsonRpcRequestSchema = z.object({
   params: z.record(z.string(), z.unknown()).optional(),
 });
 
+export interface McpToolAnnotations {
+  title: string;
+  readOnlyHint: boolean;
+  destructiveHint: boolean;
+  idempotentHint: boolean;
+  openWorldHint: boolean;
+}
+
 interface McpToolDefinition {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  annotations?: McpToolAnnotations;
 }
 
-export const MCP_TOOLS: McpToolDefinition[] = [
+const TOOL_ANNOTATIONS: Record<string, McpToolAnnotations> = {
+  get_host_health: {
+    title: "Get Server Health",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  list_apps: {
+    title: "List Managed Apps",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  get_app_logs: {
+    title: "Read App Logs",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  inspect_app: {
+    title: "Inspect App & Security",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  list_approvals: {
+    title: "List Approval Requests",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  wait_for_approval: {
+    title: "Wait for Human Approval",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  get_audit_history: {
+    title: "Search Activity History",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  get_setup_status: {
+    title: "Check Domain & HTTPS Status",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  list_files: {
+    title: "List Server Files",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  read_file: {
+    title: "Read Server File",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  list_services: {
+    title: "List System Services",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  deploy_app: {
+    title: "Deploy App",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+  rebuild_app: {
+    title: "Rebuild App",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+  update_app_env: {
+    title: "Update App Environment",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  set_app_domain: {
+    title: "Set App Domain",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  start_app: {
+    title: "Start App",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  restart_app: {
+    title: "Restart App",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  stop_app: {
+    title: "Stop App",
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  delete_app: {
+    title: "Delete App",
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  exec_in_app: {
+    title: "Run Command Inside App",
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+  run_host_command: {
+    title: "Run Server Command",
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
+  },
+  write_file: {
+    title: "Write Server File",
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  delete_file: {
+    title: "Delete Server File",
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  manage_service: {
+    title: "Manage System Service",
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  docker_cleanup: {
+    title: "Clean Up Unused Docker Space",
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+};
+
+export const MCP_RESOURCES = [
+  {
+    uri: "vpsagent://server/overview",
+    name: "Server Overview",
+    description:
+      "Live VPS CPU, memory, disk space, uptime, domain/HTTPS status, and running app counts.",
+    mimeType: "application/json",
+  },
+  {
+    uri: "vpsagent://apps/list",
+    name: "Managed Apps",
+    description: "Live list of all apps managed by VPSAgent and their current status.",
+    mimeType: "application/json",
+  },
+  {
+    uri: "vpsagent://audit/recent",
+    name: "Recent Activity History",
+    description: "The 30 most recent actions recorded on this VPS.",
+    mimeType: "application/json",
+  },
+] as const;
+
+const RAW_MCP_TOOLS: McpToolDefinition[] = [
   {
     name: "get_server_info",
     description:
@@ -313,7 +529,272 @@ export const MCP_TOOLS: McpToolDefinition[] = [
       required: ["slug"],
     },
   },
+  {
+    name: "start_app",
+    description: "Start a stopped app container.",
+    inputSchema: {
+      type: "object",
+      properties: { slug: { type: "string" } },
+      required: ["slug"],
+    },
+  },
+  {
+    name: "get_audit_history",
+    description:
+      "Search and read recent activity and audit history recorded on the VPS.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Optional text filter matching action or summary",
+        },
+        targetSlug: {
+          type: "string",
+          description: "Optional app slug to filter history for",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 200,
+          default: 50,
+        },
+      },
+    },
+  },
+  {
+    name: "get_setup_status",
+    description:
+      "Read the server's configured domain, HTTPS/TLS certificate status, and setup state.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        recheckTls: {
+          type: "boolean",
+          default: false,
+          description: "Set true to actively re-verify live HTTPS certificate status",
+        },
+      },
+    },
+  },
+  {
+    name: "exec_in_app",
+    description:
+      "Run a shell command inside a running app container or one of its companion services (e.g., postgres or redis) for migrations, debugging, or admin tasks.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        slug: { type: "string", description: "App slug identifier" },
+        command: {
+          type: "string",
+          description: "Shell command to execute inside the container",
+        },
+        service: {
+          type: "string",
+          default: "app",
+          description: "Compose service name (default: app, or e.g. postgres, redis)",
+        },
+        timeoutSeconds: {
+          type: "integer",
+          minimum: 1,
+          maximum: 180,
+          default: 30,
+        },
+      },
+      required: ["slug", "command"],
+    },
+  },
+  {
+    name: "run_host_command",
+    description:
+      "Run a shell command directly on the VPS host for full server management (installing packages, checking ports/processes/firewall/cron, debugging, running scripts). Output is automatically secret-redacted and logged.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        command: {
+          type: "string",
+          description: "Shell command to execute on the VPS host",
+        },
+        cwd: {
+          type: "string",
+          description: "Optional absolute working directory path on the host",
+        },
+        timeoutSeconds: {
+          type: "integer",
+          minimum: 1,
+          maximum: 180,
+          default: 30,
+        },
+      },
+      required: ["command"],
+    },
+  },
+  {
+    name: "list_files",
+    description: "List files and folders inside a directory on the VPS host.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "Absolute directory path on the host",
+        },
+        showHidden: { type: "boolean", default: false },
+        maxEntries: {
+          type: "integer",
+          minimum: 1,
+          maximum: 500,
+          default: 200,
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "read_file",
+    description:
+      "Read a text file on the VPS host (sensitive secret files like .env and private keys are blocked; embedded secrets are redacted).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute file path on the host" },
+        startLine: { type: "integer", minimum: 1, default: 1 },
+        endLine: { type: "integer", minimum: 1 },
+        maxBytes: {
+          type: "integer",
+          minimum: 256,
+          maximum: 131072,
+          default: 65536,
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "write_file",
+    description:
+      "Create, overwrite, or append to a text file on the VPS host (up to 256 KB; protected secret files are blocked).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute file path on the host" },
+        content: { type: "string", description: "Text content to write" },
+        append: { type: "boolean", default: false },
+        createDirs: {
+          type: "boolean",
+          default: false,
+          description: "Create missing parent directories if needed",
+        },
+      },
+      required: ["path", "content"],
+    },
+  },
+  {
+    name: "delete_file",
+    description:
+      "Delete a file or directory on the VPS host (critical system directories and secret files are protected).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Absolute file or folder path" },
+        recursive: {
+          type: "boolean",
+          default: false,
+          description: "Set true to delete a non-empty directory recursively",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "list_services",
+    description: "List systemd background services on the VPS host.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filter: {
+          type: "string",
+          description: "Optional substring to filter service names or descriptions",
+        },
+        state: {
+          type: "string",
+          enum: ["all", "running", "failed"],
+          default: "all",
+        },
+        limit: { type: "integer", minimum: 1, maximum: 300, default: 100 },
+      },
+    },
+  },
+  {
+    name: "manage_service",
+    description:
+      "Start, stop, restart, reload, enable, disable, or check status of a systemd service on the VPS host.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        service: {
+          type: "string",
+          description: "Systemd service unit name (e.g. nginx, caddy, cron)",
+        },
+        action: {
+          type: "string",
+          enum: [
+            "start",
+            "stop",
+            "restart",
+            "reload",
+            "enable",
+            "disable",
+            "status",
+          ],
+        },
+      },
+      required: ["service", "action"],
+    },
+  },
+  {
+    name: "docker_cleanup",
+    description:
+      "Reclaim VPS disk space by pruning stopped containers and unused Docker images, build cache, or volumes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pruneImages: { type: "boolean", default: true },
+        pruneBuildCache: { type: "boolean", default: true },
+        pruneVolumes: { type: "boolean", default: false },
+      },
+    },
+  },
+  {
+    name: "wait_for_approval",
+    description:
+      "Wait for a queued human approval request to be approved, rejected, or finished executing, and return its final status and result summary.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        approvalId: {
+          type: "string",
+          description: "The approvalId returned when an action was queued",
+        },
+        timeoutSeconds: {
+          type: "integer",
+          minimum: 1,
+          maximum: 60,
+          default: 30,
+          description: "How long to wait before returning current status",
+        },
+      },
+      required: ["approvalId"],
+    },
+  },
 ];
+
+export const MCP_TOOLS: McpToolDefinition[] = RAW_MCP_TOOLS.map((tool) => ({
+  ...tool,
+  ...(TOOL_ANNOTATIONS[tool.name]
+    ? { annotations: TOOL_ANNOTATIONS[tool.name] }
+    : {}),
+}));
 
 function jsonRpcResult(id: string | number | null, result: unknown) {
   return { jsonrpc: "2.0", id, result };
@@ -393,6 +874,23 @@ export function buildSafeApprovalPreview(
     return redactStructuredValue(copy) as Record<string, unknown>;
   }
 
+  if (action === "write_file") {
+    const rawContent =
+      typeof rawPayload.content === "string" ? rawPayload.content : "";
+    const redactedContent = redactSecrets(rawContent);
+    const preview =
+      redactedContent.length > 500
+        ? `${redactedContent.slice(0, 500)}... (${Buffer.byteLength(rawContent, "utf8")} bytes total)`
+        : redactedContent;
+    return {
+      path: rawPayload.path,
+      append: Boolean(rawPayload.append),
+      createDirs: Boolean(rawPayload.createDirs),
+      bytes: Buffer.byteLength(rawContent, "utf8"),
+      contentPreview: preview,
+    };
+  }
+
   return redactStructuredValue(rawPayload) as Record<string, unknown>;
 }
 
@@ -469,32 +967,53 @@ function budgetWireLogsResponse(
   };
 }
 
+export const MCP_TOKEN_PLACEHOLDER = "vpsmcp_YOUR_TOKEN_HERE";
+
 export interface McpSetupSnippets {
   mcpUrl: string;
   httpsReady: boolean;
+  tokenPlaceholder: string;
   claudeCode: string;
+  t3AndAgy: string;
   cursor: string;
   codex: string;
   genericHttp: string;
+  curlTest: string;
 }
 
-/** Builds ready-to-paste client setup snippets for Claude Code, Cursor, Codex, and generic MCP clients (e.g. T3 Code). */
+/** Builds ready-to-paste client setup snippets for Claude Code, T3 Code / Antigravity, Cursor, Codex, generic HTTP, and curl. */
 export function buildMcpSetupSnippets(
   mcpUrl: string,
   httpsReady: boolean,
 ): McpSetupSnippets {
   const cleanUrl = mcpUrl.replace(/\/+$/, "");
-  const tokenPlaceholder = "vpsmcp_YOUR_TOKEN_HERE";
+  const tokenPlaceholder = MCP_TOKEN_PLACEHOLDER;
+
+  const standardJson = JSON.stringify(
+    {
+      mcpServers: {
+        vpsagent: {
+          url: cleanUrl,
+          headers: {
+            Authorization: `Bearer ${tokenPlaceholder}`,
+          },
+        },
+      },
+    },
+    null,
+    2,
+  );
 
   return {
     mcpUrl: cleanUrl,
     httpsReady,
+    tokenPlaceholder,
     claudeCode: `claude mcp add --transport http vpsagent ${cleanUrl} \\\n  --header "Authorization: Bearer ${tokenPlaceholder}"`,
-    cursor: JSON.stringify(
+    t3AndAgy: JSON.stringify(
       {
         mcpServers: {
           vpsagent: {
-            url: cleanUrl,
+            serverUrl: cleanUrl,
             headers: {
               Authorization: `Bearer ${tokenPlaceholder}`,
             },
@@ -504,6 +1023,7 @@ export function buildMcpSetupSnippets(
       null,
       2,
     ),
+    cursor: standardJson,
     codex: `[mcp_servers.vpsagent]\nurl = "${cleanUrl}"\nbearer_token_env_var = "VPSAGENT_MCP_TOKEN"\n\n# In your shell:\n# export VPSAGENT_MCP_TOKEN="${tokenPlaceholder}"`,
     genericHttp: JSON.stringify(
       {
@@ -517,7 +1037,60 @@ export function buildMcpSetupSnippets(
       null,
       2,
     ),
+    curlTest: `curl -sS -X POST "${cleanUrl}" \\\n  -H "Content-Type: application/json" \\\n  -H "Authorization: Bearer ${tokenPlaceholder}" \\\n  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"curl-test","version":"1.0"}}}'`,
   };
+}
+
+const MAX_MCP_SESSIONS = 1000;
+
+/** Server-side MCP Streamable HTTP session registry so closed sessions are actually rejected. */
+export class McpSessionStore {
+  private readonly sessions = new Map<string, string>();
+
+  create(tokenId: string): string {
+    if (this.sessions.size >= MAX_MCP_SESSIONS) {
+      const oldest = this.sessions.keys().next().value;
+      if (oldest) this.sessions.delete(oldest);
+    }
+    const id = `vpsagent-${crypto.randomBytes(16).toString("hex")}`;
+    this.sessions.set(id, tokenId);
+    return id;
+  }
+
+  isValid(sessionId: string, tokenId: string): boolean {
+    return this.sessions.get(sessionId) === tokenId;
+  }
+
+  close(sessionId: string, tokenId: string): boolean {
+    if (this.sessions.get(sessionId) !== tokenId) {
+      return false;
+    }
+    this.sessions.delete(sessionId);
+    return true;
+  }
+}
+
+function buildServerInstructions(
+  token: McpTokenRecord,
+  dashboardUrl: string | null,
+): string {
+  const scopeDesc =
+    token.scope === "read-only"
+      ? "LOOK-ONLY (read-only): you can inspect server health, apps, logs, allowed files, services, and history, but you cannot make changes or run commands."
+      : token.scope === "approval-required"
+        ? `ASK-FIRST (approval-required): read-only tools run immediately; mutating tools queue an approval request in the owner's dashboard${dashboardUrl ? ` (${dashboardUrl})` : ""}. When a tool returns status "pending_approval", share the dashboard link with the owner and call wait_for_approval with the approvalId if you want to wait for their decision.`
+        : token.scope === "safe-auto-deploy"
+          ? `SAFE AUTO-DEPLOY (safe-auto-deploy): app deploys, rebuilds, restarts, env updates, and domains run right away; deleting apps and host-level admin actions queue for human approval${dashboardUrl ? ` (${dashboardUrl})` : ""}.`
+          : token.scope === "auto-approve"
+            ? `TRUSTED AUTO-PASS (auto-approve): all isolated app actions run right away; host-level admin tools (run_host_command, write_file, delete_file, manage_service, docker_cleanup) still queue for human approval${dashboardUrl ? ` (${dashboardUrl})` : ""}.`
+            : "FULL SERVER ADMIN (host-admin): explicit root-level host administration access; both app and host tools run immediately and are logged in History.";
+
+  return [
+    `You are connected to VPSAgent as AI pass "${token.name}".`,
+    `Permission level: ${scopeDesc}`,
+    MCP_SERVER_INSTRUCTIONS,
+    "Tool boundaries: structured file tools (list_files/read_file/write_file/delete_file) are restricted to explicitly allowed directories and block secret files (.env, private keys, VPSAgent DB); manage_service protects vpsagent-runtime. Note: run_host_command executes directly on the host with full shell privileges (gated by approval unless this pass has explicit host-admin scope).",
+  ].join("\n");
 }
 
 export interface McpGatewayDeps {
@@ -526,6 +1099,7 @@ export interface McpGatewayDeps {
   executor: AppExecutor;
   transportOptions: TransportContextOptions;
   mcpDeployGraceMs?: number | undefined;
+  sessions?: McpSessionStore | undefined;
 }
 
 function buildDashboardBaseUrl(store: RegistryStore): string | null {
@@ -660,15 +1234,21 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
         summary: `AI key "${token.name}" requested approval (${approval.id}): ${input.summary}`,
         riskLevel: input.riskLevel,
       });
+      const setup = store.getSetupState();
+      const dashboardUrl =
+        setup.domain && setup.httpsActive && setup.tlsStatus === "active"
+          ? `https://${setup.domain}`
+          : null;
       return toolOk({
         status: "pending_approval",
         approvalId: approval.id,
         action: approval.action,
         targetSlug: approval.targetSlug,
+        dashboardUrl,
         message:
           input.action === "delete_app" && token.scope === "safe-auto-deploy"
-            ? "Deleting an app always requires human confirmation under Safe Auto-Deploy. Ask the server owner to review and click Approve in the VPSAgent dashboard."
-            : "Action queued for human approval. Ask the server owner to click Approve in the VPSAgent dashboard.",
+            ? `Deleting an app always requires human confirmation under Safe Auto-Deploy. Ask the server owner to review and click Approve in the VPSAgent dashboard${dashboardUrl ? ` (${dashboardUrl})` : ""} — you can call wait_for_approval with approvalId "${approval.id}".`
+            : `Action queued for human approval. Ask the server owner to click Approve in the VPSAgent dashboard${dashboardUrl ? ` (${dashboardUrl})` : ""} — you can call wait_for_approval with approvalId "${approval.id}" to wait for their decision.`,
       });
     }
 
@@ -680,6 +1260,24 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
       (result as { status: unknown }).status === "deploying"
     ) {
       return toolOk(result);
+    }
+    const failedExit =
+      result &&
+      typeof result === "object" &&
+      "exitCode" in result &&
+      typeof (result as { exitCode: unknown }).exitCode === "number" &&
+      (result as { exitCode: number }).exitCode !== 0;
+    const failedOk =
+      result &&
+      typeof result === "object" &&
+      "ok" in result &&
+      (result as { ok: unknown }).ok === false;
+    if (failedExit || failedOk) {
+      const safe = redactStructuredValue({ status: "failed", result });
+      return {
+        content: [{ type: "text", text: JSON.stringify(safe, null, 2) }],
+        isError: true,
+      };
     }
     return toolOk({ status: "executed", result });
   }
@@ -735,6 +1333,20 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
         );
       }
       c.header("MCP-Protocol-Version", headerVersion);
+    } else if (method !== "initialize") {
+      c.header("MCP-Protocol-Version", DEFAULT_MCP_PROTOCOL_VERSION);
+    }
+
+    const sessionStore = deps.sessions;
+    const incomingSessionId = c.req.header("mcp-session-id")?.trim();
+    if (method !== "initialize" && incomingSessionId) {
+      if (sessionStore && !sessionStore.isValid(incomingSessionId, token.id)) {
+        return c.json(
+          { error: "MCP session not found or has been closed." },
+          404,
+        );
+      }
+      c.header("Mcp-Session-Id", incomingSessionId);
     }
 
     if (method === "notifications/initialized") {
@@ -755,7 +1367,15 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
       ).includes(requestedVersion)
         ? requestedVersion
         : DEFAULT_MCP_PROTOCOL_VERSION;
+      const setup = store.getSetupState();
+      const dashboardUrl =
+        setup.domain && setup.httpsActive && setup.tlsStatus === "active"
+          ? `https://${setup.domain}`
+          : null;
       c.header("MCP-Protocol-Version", negotiatedVersion);
+      if (sessionStore) {
+        c.header("Mcp-Session-Id", sessionStore.create(token.id));
+      }
       return c.json(
         jsonRpcResult(id, {
           protocolVersion: negotiatedVersion,
@@ -765,14 +1385,73 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           },
           capabilities: {
             tools: {},
+            resources: {},
           },
-          instructions: MCP_SERVER_INSTRUCTIONS,
+          instructions: buildServerInstructions(token, dashboardUrl),
         }),
       );
     }
 
     if (method === "tools/list") {
       return c.json(jsonRpcResult(id, { tools: MCP_TOOLS }));
+    }
+
+    if (method === "resources/list") {
+      return c.json(jsonRpcResult(id, { resources: MCP_RESOURCES }));
+    }
+
+    if (method === "resources/read") {
+      const uri = typeof params.uri === "string" ? params.uri.trim() : "";
+      try {
+        let data: unknown;
+        if (uri === "vpsagent://server/overview") {
+          const [stats, apps] = await Promise.all([
+            bridge.getHostStats(),
+            syncAppStatuses(store, bridge),
+          ]);
+          data = {
+            ...stats,
+            setup: store.getSetupState(),
+            appCount: apps.length,
+            runningApps: apps.filter((a) => a.status === "running").length,
+            pendingApprovals: store.listApprovals({
+              status: "pending",
+              limit: 50,
+            }).length,
+          };
+        } else if (uri === "vpsagent://apps/list") {
+          const apps = await syncAppStatuses(store, bridge);
+          data = { apps };
+        } else if (uri === "vpsagent://audit/recent") {
+          const events = store.listAuditEvents({ limit: 30 });
+          data = { events };
+        } else {
+          return c.json(
+            jsonRpcError(id, -32602, `Unknown MCP resource URI "${uri}".`),
+            200,
+          );
+        }
+        return c.json(
+          jsonRpcResult(id, {
+            contents: [
+              {
+                uri,
+                mimeType: "application/json",
+                text: JSON.stringify(redactStructuredValue(data), null, 2),
+              },
+            ],
+          }),
+        );
+      } catch (err) {
+        return c.json(
+          jsonRpcError(
+            id,
+            -32000,
+            err instanceof Error ? err.message : String(err),
+          ),
+          200,
+        );
+      }
     }
 
     if (method !== "tools/call") {
@@ -1171,6 +1850,249 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             riskLevel: "high",
             run: () => executor.deleteApp(slug, removeFiles, "agent", token.id),
           });
+          break;
+        }
+
+        case "start_app": {
+          const slug = validateAppSlug(String(args.slug ?? ""));
+          callResult = await handleMutation(token, {
+            action: "start_app",
+            targetSlug: slug,
+            summary: `Start app "${slug}"`,
+            payload: { slug },
+            riskLevel: "low",
+            run: () => executor.lifecycleApp(slug, "start", "agent", token.id),
+          });
+          break;
+        }
+
+        case "get_audit_history": {
+          const query =
+            typeof args.query === "string" && args.query.trim()
+              ? args.query.trim()
+              : undefined;
+          const targetSlug =
+            typeof args.targetSlug === "string" && args.targetSlug.trim()
+              ? validateAppSlug(args.targetSlug.trim())
+              : undefined;
+          const limit =
+            typeof args.limit === "number"
+              ? Math.min(Math.max(Math.trunc(args.limit), 1), 200)
+              : 50;
+          const events = store.listAuditEvents({
+            limit,
+            ...(query ? { query } : {}),
+            ...(targetSlug ? { targetSlug } : {}),
+          });
+          callResult = toolOk({ events });
+          break;
+        }
+
+        case "get_setup_status": {
+          let setup = store.getSetupState();
+          if (args.recheckTls === true && setup.domain && bridge.checkCoreTls) {
+            const checked = await bridge.checkCoreTls(setup.domain);
+            setup = store.updateSetupState({
+              httpsActive: checked.httpsActive,
+              tlsStatus: checked.tlsStatus,
+              tlsError: checked.tlsError,
+            });
+          }
+          callResult = toolOk({ setup });
+          break;
+        }
+
+        case "exec_in_app": {
+          const input = ExecInAppInputSchema.parse(args);
+          const slug = validateAppSlug(input.slug);
+          const cmdPreview = redactSecrets(input.command).slice(0, 120);
+          callResult = await handleMutation(token, {
+            action: "exec_in_app",
+            targetSlug: slug,
+            summary: `Run command in "${slug}" (${input.service ?? "app"}): ${cmdPreview}`,
+            payload: input as unknown as Record<string, unknown>,
+            riskLevel: "medium",
+            run: () => executor.execInApp(input, "agent", token.id),
+          });
+          break;
+        }
+
+        case "run_host_command": {
+          const input = RunHostCommandInputSchema.parse(args);
+          const cmdPreview = redactSecrets(input.command).slice(0, 140);
+          callResult = await handleMutation(token, {
+            action: "run_host_command",
+            targetSlug: null,
+            summary: `Run host command: ${cmdPreview}`,
+            payload: input as unknown as Record<string, unknown>,
+            riskLevel: "high",
+            run: () => executor.runHostCommand(input, "agent", token.id),
+          });
+          break;
+        }
+
+        case "list_files": {
+          const targetPath = z.string().trim().min(1).max(1024).parse(args.path);
+          const res = await bridge.listHostFiles({
+            path: targetPath,
+            showHidden:
+              typeof args.showHidden === "boolean"
+                ? args.showHidden
+                : undefined,
+            maxEntries:
+              typeof args.maxEntries === "number"
+                ? Math.min(Math.max(Math.trunc(args.maxEntries), 1), 500)
+                : undefined,
+          });
+          callResult = toolOk(res);
+          break;
+        }
+
+        case "read_file": {
+          const targetPath = z.string().trim().min(1).max(1024).parse(args.path);
+          const res = await bridge.readHostFile({
+            path: targetPath,
+            startLine:
+              typeof args.startLine === "number"
+                ? Math.max(Math.trunc(args.startLine), 1)
+                : undefined,
+            endLine:
+              typeof args.endLine === "number"
+                ? Math.max(Math.trunc(args.endLine), 1)
+                : undefined,
+            maxBytes:
+              typeof args.maxBytes === "number"
+                ? Math.min(Math.max(Math.trunc(args.maxBytes), 256), 131072)
+                : undefined,
+          });
+          callResult = toolOk(res);
+          break;
+        }
+
+        case "write_file": {
+          const input = WriteHostFileInputSchema.parse(args);
+          callResult = await handleMutation(token, {
+            action: "write_file",
+            targetSlug: null,
+            summary: `${input.append ? "Append to" : "Write"} file ${input.path}`,
+            payload: input as unknown as Record<string, unknown>,
+            riskLevel: "high",
+            run: () => executor.writeHostFile(input, "agent", token.id),
+          });
+          break;
+        }
+
+        case "delete_file": {
+          const input = DeleteHostFileInputSchema.parse(args);
+          callResult = await handleMutation(token, {
+            action: "delete_file",
+            targetSlug: null,
+            summary: `Delete ${input.recursive ? "path recursively" : "path"} ${input.path}`,
+            payload: input as unknown as Record<string, unknown>,
+            riskLevel: "high",
+            run: () => executor.deleteHostFile(input, "agent", token.id),
+          });
+          break;
+        }
+
+        case "list_services": {
+          const res = await bridge.listHostServices({
+            filter: typeof args.filter === "string" ? args.filter : undefined,
+            state:
+              args.state === "running" ||
+              args.state === "failed" ||
+              args.state === "all"
+                ? args.state
+                : undefined,
+            limit:
+              typeof args.limit === "number"
+                ? Math.min(Math.max(Math.trunc(args.limit), 1), 300)
+                : undefined,
+          });
+          callResult = toolOk(res);
+          break;
+        }
+
+        case "manage_service": {
+          const input = ManageHostServiceInputSchema.parse(args);
+          if (input.action === "status") {
+            const res = await bridge.manageHostService(input);
+            if (!res.ok) {
+              const safe = redactStructuredValue(res);
+              callResult = {
+                content: [{ type: "text", text: JSON.stringify(safe, null, 2) }],
+                isError: true,
+              };
+            } else {
+              callResult = toolOk(res);
+            }
+            break;
+          }
+          callResult = await handleMutation(token, {
+            action: "manage_service",
+            targetSlug: null,
+            summary: `Run systemctl ${input.action} on ${input.service}`,
+            payload: input as unknown as Record<string, unknown>,
+            riskLevel: "high",
+            run: () => executor.manageHostService(input, "agent", token.id),
+          });
+          break;
+        }
+
+        case "docker_cleanup": {
+          const input = DockerCleanupInputSchema.parse(args);
+          callResult = await handleMutation(token, {
+            action: "docker_cleanup",
+            targetSlug: null,
+            summary: `Prune unused Docker resources (images=${String(input.pruneImages)}, cache=${String(input.pruneBuildCache)}, volumes=${String(input.pruneVolumes)})`,
+            payload: input as unknown as Record<string, unknown>,
+            riskLevel: "medium",
+            run: () => executor.dockerCleanup(input, "agent", token.id),
+          });
+          break;
+        }
+
+        case "wait_for_approval": {
+          const approvalId = z.string().trim().min(1).max(128).parse(args.approvalId);
+          const timeoutSeconds =
+            typeof args.timeoutSeconds === "number"
+              ? Math.min(Math.max(Math.trunc(args.timeoutSeconds), 1), 60)
+              : 30;
+          const deadline = Date.now() + timeoutSeconds * 1000;
+          let approval = store.getApproval(approvalId);
+          if (!approval || approval.tokenId !== token.id) {
+            callResult = toolErr(`Approval request "${approvalId}" not found.`);
+            break;
+          }
+          while (
+            (approval.status === "pending" || approval.status === "approved") &&
+            Date.now() < deadline
+          ) {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            const latest = store.getApproval(approvalId);
+            if (!latest || latest.tokenId !== token.id) break;
+            approval = latest;
+          }
+          const done =
+            approval.status === "executed" ||
+            approval.status === "rejected" ||
+            approval.status === "failed";
+          const safeOutcome = redactStructuredValue({
+            done,
+            status: approval.status,
+            approvalId: approval.id,
+            action: approval.action,
+            targetSlug: approval.targetSlug,
+            resultSummary: approval.resultSummary,
+            decisionNote: approval.decisionNote,
+            message: done
+              ? `Approval ${approval.id} finished with status "${approval.status}": ${approval.resultSummary ?? approval.decisionNote ?? approval.summary}`
+              : `Approval ${approval.id} is still "${approval.status}" after waiting ${timeoutSeconds}s. Ask the server owner to approve it in the dashboard and call wait_for_approval again.`,
+          });
+          callResult = {
+            content: [{ type: "text", text: JSON.stringify(safeOutcome, null, 2) }],
+            isError: approval.status === "failed",
+          };
           break;
         }
 

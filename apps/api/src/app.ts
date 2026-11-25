@@ -27,6 +27,9 @@ import {
   UpdateAppEnvInputSchema,
 } from "./executor.js";
 import {
+  MCP_TOOLS,
+  McpSessionStore,
+  SUPPORTED_MCP_PROTOCOL_VERSIONS,
   buildMcpSetupSnippets,
   createMcpPostHandler,
   enforceMcpBoundary,
@@ -311,6 +314,8 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   // Remote MCP Gateway (`POST /mcp` — bearer token auth + HTTPS/Host/Origin)
   // ---------------------------------------------------------------------------
 
+  const mcpSessions = new McpSessionStore();
+
   app.post(
     "/mcp",
     createMcpPostHandler({
@@ -319,6 +324,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       executor,
       transportOptions,
       mcpDeployGraceMs: options.mcpDeployGraceMs,
+      sessions: mcpSessions,
     }),
   );
 
@@ -328,11 +334,31 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     if (!guard.ok) {
       return guard.response;
     }
-    c.header("Allow", "POST");
+    c.header("Allow", "POST, DELETE");
     return c.json(
       { error: "Method Not Allowed: /mcp only accepts POST JSON-RPC requests." },
       405,
     );
+  });
+
+  // Streamable HTTP spec: close & invalidate a server-issued session via DELETE /mcp
+  app.delete("/mcp", (c) => {
+    const guard = enforceMcpBoundary(c, store, transportOptions);
+    if (!guard.ok) {
+      return guard.response;
+    }
+    const authHeader = c.req.header("authorization") ?? "";
+    const match = authHeader.match(/^Bearer\s+(.+)$/i);
+    const rawToken = match?.[1]?.trim();
+    const token = rawToken ? store.verifyMcpToken(rawToken) : null;
+    if (!token) {
+      return c.json({ error: "Invalid or missing Bearer token." }, 401);
+    }
+    const sessionId = c.req.header("mcp-session-id")?.trim();
+    if (sessionId && !mcpSessions.close(sessionId, token.id)) {
+      return c.json({ error: "MCP session not found." }, 404);
+    }
+    return c.body(null, 204);
   });
 
   // ---------------------------------------------------------------------------
@@ -885,6 +911,47 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       ? `https://${setup.domain}/mcp`
       : `http://${host}/mcp`;
     return c.json(buildMcpSetupSnippets(mcpUrl, httpsReady));
+  });
+
+  app.post("/api/mcp/test", async (c) => {
+    const setup = store.getSetupState();
+    const httpsReady = Boolean(
+      setup.domain && setup.httpsActive && setup.tlsStatus === "active",
+    );
+    const host = getRequestHost(c, trustProxy) || "localhost:3002";
+    const mcpUrl = httpsReady
+      ? `https://${setup.domain}/mcp`
+      : `http://${host}/mcp`;
+
+    let bridgeOk = false;
+    try {
+      bridgeOk = (await bridge.health()).ok;
+    } catch {
+      bridgeOk = false;
+    }
+
+    const activeTokens = store
+      .listMcpTokens()
+      .filter((t) => !t.revokedAt).length;
+    const ok = bridgeOk && activeTokens > 0;
+    const message = !bridgeOk
+      ? "The server handyman (Runtime Bridge) is not responding right now."
+      : activeTokens === 0
+        ? "Gateway is healthy, but you haven't created an AI visitor pass yet."
+        : httpsReady
+          ? `Server-side gateway check OK: bridge healthy, HTTPS active, ${MCP_TOOLS.length} tools loaded, ${activeTokens} active pass(es). Use the Curl Test tab to run a live client handshake.`
+          : `Server-side gateway check OK locally (${MCP_TOOLS.length} tools loaded, ${activeTokens} active pass(es)). Connect a domain below for remote HTTPS access.`;
+
+    return c.json({
+      ok,
+      mcpUrl,
+      httpsReady,
+      bridgeOk,
+      toolCount: MCP_TOOLS.length,
+      activeTokens,
+      protocolVersion: SUPPORTED_MCP_PROTOCOL_VERSIONS[0],
+      message,
+    });
   });
 
   // ---------------------------------------------------------------------------
