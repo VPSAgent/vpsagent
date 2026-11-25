@@ -219,17 +219,20 @@ export function App() {
           </nav>
 
           {/* Right Utilities */}
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-3 min-w-0 shrink-0">
             {overview?.metrics.hostname && (
-              <span className="hidden lg:inline-flex items-center gap-1.5 text-xs font-mono text-[#9CA3AF]">
-                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                {overview.metrics.hostname}
+              <span
+                title={overview.metrics.hostname}
+                className="hidden lg:inline-flex items-center gap-1.5 max-w-[160px] xl:max-w-[220px] min-w-0 text-xs font-mono text-[#9CA3AF]"
+              >
+                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
+                <span className="truncate">{overview.metrics.hostname}</span>
               </span>
             )}
             <button
               type="button"
               onClick={handleLogout}
-              className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#111317] px-3 py-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white hover:border-white/[0.16] cursor-pointer"
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#111317] px-3 py-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white hover:border-white/[0.16] shrink-0 cursor-pointer"
             >
               <LogOut className="h-3.5 w-3.5" />
               <span>Sign out</span>
@@ -270,6 +273,27 @@ export function App() {
       </header>
 
       <main className="mx-auto max-w-6xl px-4 sm:px-6 py-7">
+        {connectError && (
+          <div
+            role="alert"
+            className="mb-6 rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3"
+          >
+            <span>
+              <strong className="font-semibold">
+                Could not refresh server data:
+              </strong>{" "}
+              {connectError}
+            </span>
+            <button
+              type="button"
+              onClick={() => void loadAll()}
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-amber-400 px-3 py-1.5 text-xs font-semibold text-[#1A1200] hover:bg-amber-300 cursor-pointer"
+            >
+              <RefreshCw className="h-3 w-3" />
+              Retry
+            </button>
+          </div>
+        )}
         {tab === "overview" && (
           <OverviewTab
             data={overview}

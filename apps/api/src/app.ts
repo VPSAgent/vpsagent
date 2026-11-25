@@ -388,6 +388,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   app.use("/api/approvals", requireOwner);
   app.use("/api/audit", requireOwner);
   app.use("/api/mcp/*", requireOwner);
+  app.use("/api/system/*", requireOwner);
 
   // Step 2 of first-boot setup (applies directly to Caddy via Runtime Bridge!)
   app.post("/api/setup/domain", async (c) => {
@@ -952,6 +953,84 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       protocolVersion: SUPPORTED_MCP_PROTOCOL_VERSIONS[0],
       message,
     });
+  });
+
+  // ---------------------------------------------------------------------------
+  // VPSAgent Self-Update (Owner-only)
+  // ---------------------------------------------------------------------------
+
+  const unavailableUpdateStatus = {
+    state: "idle" as const,
+    phase: null,
+    canUpdate: false,
+    unavailableReason:
+      "Automatic updates are not supported by the connected runtime bridge.",
+    repoDir: null,
+    branch: null,
+    currentVersion: null,
+    currentCommit: null,
+    latestCommit: null,
+    latestCommitSubject: null,
+    latestCommitDate: null,
+    commitsBehind: 0,
+    updateAvailable: false,
+    dirtyWorkingTree: false,
+    checkedAt: null,
+    startedAt: null,
+    finishedAt: null,
+    message: null,
+    error: null,
+    logs: [] as string[],
+  };
+
+  app.get("/api/system/update/status", async (c) => {
+    try {
+      if (!bridge.getCoreUpdateStatus) {
+        return c.json({ status: unavailableUpdateStatus });
+      }
+      const status = await bridge.getCoreUpdateStatus();
+      return c.json({ status });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/system/update/check", async (c) => {
+    try {
+      if (!bridge.checkCoreUpdate) {
+        return c.json({ status: unavailableUpdateStatus });
+      }
+      const status = await bridge.checkCoreUpdate();
+      return c.json({ status });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/system/update/apply", async (c) => {
+    try {
+      if (!bridge.applyCoreUpdate) {
+        return c.json(
+          { error: unavailableUpdateStatus.unavailableReason },
+          501,
+        );
+      }
+      const result = await bridge.applyCoreUpdate();
+      store.recordAudit({
+        actor: "user",
+        action: "system.update_started",
+        summary: result.status.branch
+          ? `Started VPSAgent self-update from branch ${result.status.branch}`
+          : "Started VPSAgent self-update",
+        riskLevel: "high",
+      });
+      return c.json(result, 202);
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
   });
 
   // ---------------------------------------------------------------------------

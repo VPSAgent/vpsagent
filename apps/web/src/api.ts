@@ -196,6 +196,29 @@ export interface McpConnectionTestResult {
   message: string;
 }
 
+export interface SystemUpdateStatus {
+  state: "idle" | "updating" | "succeeded" | "failed";
+  phase: string | null;
+  canUpdate: boolean;
+  unavailableReason: string | null;
+  repoDir: string | null;
+  branch: string | null;
+  currentVersion: string | null;
+  currentCommit: string | null;
+  latestCommit: string | null;
+  latestCommitSubject: string | null;
+  latestCommitDate: string | null;
+  commitsBehind: number;
+  updateAvailable: boolean;
+  dirtyWorkingTree: boolean;
+  checkedAt: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  message: string | null;
+  error: string | null;
+  logs: string[];
+}
+
 export interface InspectResult {
   slug: string;
   status: AppRecord["status"];
@@ -451,4 +474,15 @@ export const api = {
   getSnippets: () => apiFetch<McpSnippets>("/api/mcp/snippets"),
   testMcpConnection: () =>
     apiFetch<McpConnectionTestResult>("/api/mcp/test", { method: "POST" }),
+  getSystemUpdateStatus: () =>
+    apiFetch<{ status: SystemUpdateStatus }>("/api/system/update/status"),
+  checkSystemUpdate: () =>
+    apiFetch<{ status: SystemUpdateStatus }>("/api/system/update/check", {
+      method: "POST",
+    }),
+  applySystemUpdate: () =>
+    apiFetch<{ ok: boolean; started: boolean; status: SystemUpdateStatus }>(
+      "/api/system/update/apply",
+      { method: "POST" },
+    ),
 };

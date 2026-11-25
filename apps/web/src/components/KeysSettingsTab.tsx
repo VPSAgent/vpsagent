@@ -1,12 +1,16 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Activity,
+  ArrowDownToLine,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
   Globe,
   KeyRound,
   Lock,
   Plus,
+  RefreshCw,
   Trash2,
 } from "lucide-react";
 import {
@@ -17,6 +21,7 @@ import {
   type McpTokenRecord,
   type McpTokenScope,
   type SetupState,
+  type SystemUpdateStatus,
 } from "../api";
 
 interface KeysSettingsTabProps {
@@ -97,6 +102,108 @@ export function KeysSettingsTab({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<SystemUpdateStatus | null>(
+    null,
+  );
+  const [updateLoading, setUpdateLoading] = useState(true);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [startingUpdate, setStartingUpdate] = useState(false);
+  const [reconnectingUpdate, setReconnectingUpdate] = useState(false);
+  const [showUpdateLogs, setShowUpdateLogs] = useState(false);
+
+  const loadUpdateStatus = useCallback(async () => {
+    try {
+      const res = await api.getSystemUpdateStatus();
+      setUpdateStatus(res.status);
+      setReconnectingUpdate(false);
+    } catch {
+      // Keep previous status if the server is restarting mid-update
+    } finally {
+      setUpdateLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadUpdateStatus();
+  }, [loadUpdateStatus]);
+
+  useEffect(() => {
+    if (updateStatus?.state !== "updating") {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await api.getSystemUpdateStatus();
+        if (cancelled) return;
+        setReconnectingUpdate(false);
+        setUpdateStatus(res.status);
+        if (res.status.state === "succeeded") {
+          setNotice(
+            res.status.message ||
+              "VPSAgent updated! Reloading the dashboard...",
+          );
+          window.setTimeout(() => {
+            window.location.reload();
+          }, 1800);
+        } else if (res.status.state === "failed") {
+          setError(res.status.error || "VPSAgent update failed.");
+        }
+      } catch {
+        if (!cancelled) {
+          setReconnectingUpdate(true);
+        }
+      }
+    }, 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [updateStatus?.state]);
+
+  const handleCheckUpdates = async () => {
+    setCheckingUpdate(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.checkSystemUpdate();
+      setUpdateStatus(res.status);
+      if (res.status.updateAvailable) {
+        setNotice(
+          res.status.message ||
+            "A new version of VPSAgent is ready to install.",
+        );
+      } else if (res.status.canUpdate) {
+        setNotice("VPSAgent is already up to date.");
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not check for updates.",
+      );
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleApplyUpdate = async () => {
+    setStartingUpdate(true);
+    setError(null);
+    setNotice(null);
+    setShowUpdateLogs(true);
+    try {
+      const res = await api.applySystemUpdate();
+      setUpdateStatus(res.status);
+      setNotice(
+        "Update started. VPSAgent will rebuild and restart automatically in 1–2 minutes.",
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not start VPSAgent update.",
+      );
+    } finally {
+      setStartingUpdate(false);
+    }
+  };
 
   const copyText = async (id: string, text: string) => {
     await navigator.clipboard.writeText(text);
@@ -451,6 +558,36 @@ export function KeysSettingsTab({
               role="tablist"
               aria-label="AI client snippets"
               className="inline-flex flex-wrap rounded-lg border border-white/[0.08] bg-[#0C0E12] p-1 gap-0.5"
+              onKeyDown={(e) => {
+                if (
+                  e.key !== "ArrowLeft" &&
+                  e.key !== "ArrowRight" &&
+                  e.key !== "Home" &&
+                  e.key !== "End"
+                ) {
+                  return;
+                }
+                e.preventDefault();
+                const order = [
+                  "claudeCode",
+                  "t3AndAgy",
+                  "cursor",
+                  "codex",
+                  "genericHttp",
+                  "curlTest",
+                ] as const;
+                const idx = order.indexOf(activeClient);
+                const next =
+                  e.key === "Home"
+                    ? order[0]
+                    : e.key === "End"
+                      ? order[order.length - 1]!
+                      : e.key === "ArrowRight"
+                        ? order[(idx + 1) % order.length]!
+                        : order[(idx - 1 + order.length) % order.length]!;
+                setActiveClient(next);
+                document.getElementById(`mcp-client-tab-${next}`)?.focus();
+              }}
             >
               {(
                 [
@@ -464,8 +601,11 @@ export function KeysSettingsTab({
               ).map(([id, label]) => (
                 <button
                   key={id}
+                  id={`mcp-client-tab-${id}`}
                   role="tab"
                   aria-selected={activeClient === id}
+                  aria-controls="mcp-client-snippet-panel"
+                  tabIndex={activeClient === id ? 0 : -1}
                   type="button"
                   onClick={() => setActiveClient(id)}
                   className={`btn-press rounded-md px-2.5 py-1 text-xs font-medium cursor-pointer ${
@@ -495,7 +635,12 @@ export function KeysSettingsTab({
             </div>
           )}
 
-          <div className="relative">
+          <div
+            id="mcp-client-snippet-panel"
+            role="tabpanel"
+            aria-labelledby={`mcp-client-tab-${activeClient}`}
+            className="relative"
+          >
             <pre className="surface-well rounded-lg p-4 pr-24 text-xs font-mono text-[#E5E7EB] overflow-x-auto leading-relaxed">
               {activeSnippet}
             </pre>
@@ -685,6 +830,182 @@ export function KeysSettingsTab({
             </button>
           </form>
         </div>
+      </section>
+
+      {/* VPSAgent Updates */}
+      <section className="surface-panel rounded-xl p-6 space-y-5">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <ArrowDownToLine className="h-4 w-4 text-emerald-400" />
+              <h2 className="text-sm font-semibold text-white">
+                VPSAgent updates
+              </h2>
+              {updateStatus?.state === "updating" && (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  {reconnectingUpdate ? "Restarting..." : "Updating..."}
+                </span>
+              )}
+              {updateStatus?.state !== "updating" &&
+                updateStatus?.updateAvailable && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                    {updateStatus.commitsBehind} new{" "}
+                    {updateStatus.commitsBehind === 1 ? "update" : "updates"}
+                  </span>
+                )}
+              {updateStatus?.state !== "updating" &&
+                updateStatus?.checkedAt &&
+                !updateStatus.updateAvailable &&
+                updateStatus.canUpdate && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.1] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-[#D1D5DB]">
+                    Up to date
+                  </span>
+                )}
+            </div>
+            <p className="text-xs text-[#9CA3AF]">
+              Pull the latest VPSAgent version and rebuild the dashboard
+              automatically without touching your running apps or secrets.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={
+                updateLoading ||
+                checkingUpdate ||
+                startingUpdate ||
+                updateStatus?.state === "updating"
+              }
+              onClick={handleCheckUpdates}
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0C0E12] px-3 py-2 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${checkingUpdate ? "animate-spin" : ""}`}
+              />
+              {checkingUpdate ? "Checking..." : "Check for updates"}
+            </button>
+            <button
+              type="button"
+              disabled={
+                updateLoading ||
+                startingUpdate ||
+                checkingUpdate ||
+                !updateStatus?.canUpdate ||
+                updateStatus.state === "updating"
+              }
+              onClick={handleApplyUpdate}
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+            >
+              <ArrowDownToLine className="h-4 w-4" />
+              {updateStatus?.state === "updating"
+                ? "Updating..."
+                : startingUpdate
+                  ? "Starting..."
+                  : "Update VPSAgent"}
+            </button>
+          </div>
+        </div>
+
+        <div className="surface-well rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[#9CA3AF]">
+            <span>
+              Version:{" "}
+              <code className="font-mono text-[#F4F5F7]">
+                {updateStatus?.currentVersion
+                  ? `v${updateStatus.currentVersion}`
+                  : "Unknown"}
+              </code>
+            </span>
+            {updateStatus?.currentCommit && (
+              <span>
+                Build:{" "}
+                <code className="font-mono text-[#F4F5F7]">
+                  {updateStatus.currentCommit.slice(0, 7)}
+                </code>
+              </span>
+            )}
+            {updateStatus?.branch && (
+              <span>
+                Branch:{" "}
+                <code className="font-mono text-[#F4F5F7]">
+                  {updateStatus.branch}
+                </code>
+              </span>
+            )}
+          </div>
+          {updateStatus?.checkedAt && (
+            <span className="text-[11px] text-[#6B7280] tabular-nums">
+              Last checked {new Date(updateStatus.checkedAt).toLocaleString()}
+            </span>
+          )}
+        </div>
+
+        {updateStatus?.latestCommitSubject && updateStatus.updateAvailable && (
+          <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/[0.06] px-4 py-3 text-xs text-emerald-200">
+            <span className="font-semibold">Latest change: </span>
+            {updateStatus.latestCommitSubject}
+            {updateStatus.latestCommit && (
+              <code className="ml-2 font-mono text-emerald-300/80">
+                ({updateStatus.latestCommit.slice(0, 7)})
+              </code>
+            )}
+          </div>
+        )}
+
+        {updateStatus?.state === "updating" && (
+          <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+            <span className="font-semibold">
+              {reconnectingUpdate
+                ? "Restarting VPSAgent: "
+                : "Update in progress: "}
+            </span>
+            {reconnectingUpdate
+              ? "Reconnecting to your server automatically. This page will refresh as soon as it is back."
+              : updateStatus.message ||
+                "Downloading and rebuilding VPSAgent..."}
+          </div>
+        )}
+
+        {updateStatus?.state === "failed" && updateStatus.error && (
+          <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+            <span className="font-semibold">Last update failed: </span>
+            {updateStatus.error}
+          </div>
+        )}
+
+        {!updateLoading &&
+          updateStatus &&
+          !updateStatus.canUpdate &&
+          updateStatus.unavailableReason && (
+            <p className="text-xs text-[#9CA3AF]">
+              {updateStatus.unavailableReason}
+            </p>
+          )}
+
+        {updateStatus && updateStatus.logs.length > 0 && (
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={() => setShowUpdateLogs((prev) => !prev)}
+              className="inline-flex items-center gap-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
+            >
+              {showUpdateLogs ? (
+                <ChevronUp className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5" />
+              )}
+              {showUpdateLogs ? "Hide update log" : "View update log"}
+            </button>
+            {showUpdateLogs && (
+              <pre className="surface-well max-h-56 overflow-auto rounded-lg p-3 text-[11px] font-mono text-[#D1D5DB] leading-relaxed">
+                {updateStatus.logs.join("\n")}
+              </pre>
+            )}
+          </div>
+        )}
       </section>
     </div>
   );

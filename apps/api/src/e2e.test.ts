@@ -1508,6 +1508,22 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       expect(testConnBody.ok).toBe(true);
       expect(testConnBody.toolCount).toBe(toolsListBody.result.tools.length);
 
+      // 11b. System self-update endpoints require owner auth and return typed status
+      const unauthUpdateStatus = await app.request("/api/system/update/status", {
+        headers: { host: "localhost:3002" },
+      });
+      expect(unauthUpdateStatus.status).toBe(401);
+
+      const authUpdateStatus = await app.request("/api/system/update/status", {
+        headers: { cookie: cookieHeader, host: "localhost:3002" },
+      });
+      expect(authUpdateStatus.status).toBe(200);
+      const authUpdateBody = (await authUpdateStatus.json()) as {
+        status: { state: string; canUpdate: boolean };
+      };
+      expect(authUpdateBody.status.state).toBe("idle");
+      expect(typeof authUpdateBody.status.canUpdate).toBe("boolean");
+
       // 12. Bootstrap invariants: zero docker.sock, VPSAgent/vpsagent repo URL, no plaintext public claim URL
       const coreCompose = fs.readFileSync(
         path.join(REPO_ROOT, "bootstrap", "docker-compose.core.yml"),

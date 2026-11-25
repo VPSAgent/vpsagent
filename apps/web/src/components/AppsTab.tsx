@@ -543,10 +543,36 @@ export function AppsTab({
               role="tablist"
               aria-label="App source type"
               className="inline-flex rounded-lg border border-white/[0.08] bg-[#0C0E12] p-1 gap-0.5"
+              onKeyDown={(e) => {
+                if (
+                  e.key !== "ArrowLeft" &&
+                  e.key !== "ArrowRight" &&
+                  e.key !== "Home" &&
+                  e.key !== "End"
+                ) {
+                  return;
+                }
+                e.preventDefault();
+                const order = ["git", "image"] as const;
+                const idx = order.indexOf(sourceType);
+                const next =
+                  e.key === "Home"
+                    ? order[0]
+                    : e.key === "End"
+                      ? order[order.length - 1]!
+                      : e.key === "ArrowRight"
+                        ? order[(idx + 1) % order.length]!
+                        : order[(idx - 1 + order.length) % order.length]!;
+                setSourceType(next);
+                document.getElementById(`app-source-tab-${next}`)?.focus();
+              }}
             >
               <button
+                id="app-source-tab-git"
                 role="tab"
                 aria-selected={sourceType === "git"}
+                aria-controls="app-source-panel-git"
+                tabIndex={sourceType === "git" ? 0 : -1}
                 type="button"
                 onClick={() => setSourceType("git")}
                 className={`btn-press rounded-md px-3 py-1.5 text-xs font-medium cursor-pointer ${
@@ -558,8 +584,11 @@ export function AppsTab({
                 GitHub repository
               </button>
               <button
+                id="app-source-tab-image"
                 role="tab"
                 aria-selected={sourceType === "image"}
+                aria-controls="app-source-panel-image"
+                tabIndex={sourceType === "image" ? 0 : -1}
                 type="button"
                 onClick={() => setSourceType("image")}
                 className={`btn-press rounded-md px-3 py-1.5 text-xs font-medium cursor-pointer ${
@@ -574,7 +603,12 @@ export function AppsTab({
           </div>
 
           {sourceType === "git" ? (
-            <div className="space-y-4">
+            <div
+              id="app-source-panel-git"
+              role="tabpanel"
+              aria-labelledby="app-source-tab-git"
+              className="space-y-4"
+            >
               <div className="flex flex-wrap gap-2.5 items-end">
                 <div className="flex-1 min-w-[260px]">
                   <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
@@ -655,7 +689,11 @@ export function AppsTab({
               </div>
             </div>
           ) : (
-            <div>
+            <div
+              id="app-source-panel-image"
+              role="tabpanel"
+              aria-labelledby="app-source-tab-image"
+            >
               <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
                 Docker image
               </label>
@@ -907,7 +945,7 @@ export function AppsTab({
                   </div>
 
                   {/* Grouped Lifecycle Control Bar */}
-                  <div className="inline-flex items-center rounded-lg border border-white/[0.08] bg-[#0C0E12] divide-x divide-white/[0.08] overflow-hidden shrink-0">
+                  <div className="inline-flex max-w-full flex-wrap items-center rounded-lg border border-white/[0.08] bg-[#0C0E12] divide-x divide-white/[0.08] overflow-hidden">
                     {app.status === "running" ? (
                       <button
                         type="button"
@@ -1191,7 +1229,7 @@ export function AppsTab({
                                 key={entry.key}
                                 className="flex items-center justify-between px-3.5 py-2.5 text-xs"
                               >
-                                <div className="min-w-0 truncate">
+                                <div className="min-w-0 [overflow-wrap:anywhere]">
                                   <span className="font-mono text-[#F4F5F7]">
                                     {entry.key}
                                   </span>

@@ -2332,6 +2332,9 @@ class RuntimeService:
         caddy_container: str,
         docker_bin: str = "docker",
         git_bin: str = "git",
+        systemctl_bin: str = "systemctl",
+        vpsagent_root: str | None = None,
+        repo_dir: str | None = None,
         runtime_token: str | None = None,
         allow_unauthenticated: bool = False,
         status_deadline_s: float = DEFAULT_STATUS_DEADLINE_S,
@@ -2347,6 +2350,8 @@ class RuntimeService:
             raise ValueError("Invalid docker binary path.")
         if not git_bin or any(ch.isspace() for ch in git_bin):
             raise ValueError("Invalid git binary path.")
+        if not systemctl_bin or any(ch.isspace() for ch in systemctl_bin):
+            raise ValueError("Invalid systemctl binary path.")
         cleaned_token = (runtime_token or "").strip() or None
         if not cleaned_token and not allow_unauthenticated:
             raise ValueError(
@@ -2360,6 +2365,25 @@ class RuntimeService:
         self.caddy_container = caddy_container
         self.docker_bin = docker_bin
         self.git_bin = git_bin
+        self.systemctl_bin = systemctl_bin
+        if vpsagent_root:
+            self.vpsagent_root = os.path.abspath(vpsagent_root)
+        else:
+            env_root = os.environ.get("VPSAGENT_ROOT", "").strip()
+            if env_root:
+                self.vpsagent_root = os.path.abspath(env_root)
+            elif os.path.basename(os.path.abspath(apps_root)) == "apps":
+                self.vpsagent_root = os.path.dirname(os.path.abspath(apps_root))
+            else:
+                self.vpsagent_root = "/var/lib/vpsagent"
+        resolved_repo = (
+            repo_dir.strip()
+            if isinstance(repo_dir, str) and repo_dir.strip()
+            else os.environ.get("VPSAGENT_REPO_DIR", "").strip()
+        )
+        if not resolved_repo and os.path.isdir("/opt/vpsagent/.git"):
+            resolved_repo = "/opt/vpsagent"
+        self.repo_dir = os.path.abspath(resolved_repo) if resolved_repo else None
         self.runtime_token = cleaned_token
         self.allow_unauthenticated = allow_unauthenticated
         self.status_deadline_s = max(0.2, float(status_deadline_s))
@@ -2386,6 +2410,11 @@ class RuntimeService:
         self._host_health: dict[str, dict[str, Any]] = {}
         self._health_stop_event = threading.Event()
         self._health_thread: threading.Thread | None = None
+        self._update_lock = threading.Lock()
+        self._update_status_file = os.path.join(
+            self.vpsagent_root, "run", "update-status.json"
+        )
+        self._update_state: dict[str, Any] = self._load_persisted_update_state()
 
     def _read_app_probe_config(self, app_dir: str, slug: str) -> dict[str, Any] | None:
         probe_file = os.path.join(app_dir, "probe.json")
@@ -4643,6 +4672,581 @@ class RuntimeService:
             "reclaimedSummary": redact_secrets(reclaimed_summary),
         }
 
+    # ------------------------------------------------------------------
+    # VPSAgent Self-Update (Check + Safe Detached Rebuild)
+    # ------------------------------------------------------------------
+
+    def _default_update_state(self) -> dict[str, Any]:
+        return {
+            "state": "idle",
+            "phase": None,
+            "checkedAt": None,
+            "startedAt": None,
+            "finishedAt": None,
+            "latestCommit": None,
+            "latestCommitSubject": None,
+            "latestCommitDate": None,
+            "commitsBehind": 0,
+            "updateAvailable": False,
+            "message": None,
+            "error": None,
+            "logs": [],
+        }
+
+    def _load_persisted_update_state(self) -> dict[str, Any]:
+        base = self._default_update_state()
+        try:
+            if not os.path.isfile(self._update_status_file):
+                return base
+            with open(self._update_status_file, "r", encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if not isinstance(loaded, dict):
+                return base
+            for key in base:
+                if key in loaded:
+                    base[key] = loaded[key]
+            # If the bridge restarted while an update was marked in-progress, don't stay stuck forever.
+            if base.get("state") == "updating":
+                base["state"] = "idle"
+                base["phase"] = None
+                base["message"] = "Previous update session was interrupted by a service restart."
+            if not isinstance(base.get("logs"), list):
+                base["logs"] = []
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return base
+        return base
+
+    def _persist_update_state(self, state: dict[str, Any]) -> None:
+        try:
+            parent = os.path.dirname(self._update_status_file)
+            os.makedirs(parent, exist_ok=True)
+            tmp_path = f"{self._update_status_file}.tmp.{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, indent=2)
+            os.chmod(tmp_path, 0o640)
+            os.replace(tmp_path, self._update_status_file)
+        except OSError:
+            pass
+
+    def _read_repo_package_version(self, repo_dir: str) -> str | None:
+        pkg_path = os.path.join(repo_dir, "package.json")
+        if not os.path.isfile(pkg_path):
+            return None
+        try:
+            with open(pkg_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            version = data.get("version")
+            if isinstance(version, str) and version.strip():
+                return version.strip()
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        return None
+
+    def _inspect_core_repo(self) -> dict[str, Any]:
+        repo_dir = self.repo_dir
+        if not repo_dir or not os.path.isdir(repo_dir):
+            return {
+                "canUpdate": False,
+                "unavailableReason": "VPSAgent source folder is not configured on this server.",
+                "repoDir": repo_dir,
+                "branch": None,
+                "currentVersion": None,
+                "currentCommit": None,
+                "dirtyWorkingTree": False,
+            }
+        git_dir = os.path.join(repo_dir, ".git")
+        if not os.path.exists(git_dir):
+            return {
+                "canUpdate": False,
+                "unavailableReason": "VPSAgent source folder is not a Git repository.",
+                "repoDir": repo_dir,
+                "branch": None,
+                "currentVersion": self._read_repo_package_version(repo_dir),
+                "currentCommit": None,
+                "dirtyWorkingTree": False,
+            }
+
+        version = self._read_repo_package_version(repo_dir)
+        head_proc = self._run_cmd(
+            [self.git_bin, "-C", repo_dir, "rev-parse", "HEAD"],
+            label="git",
+            timeout=10,
+            check=False,
+        )
+        current_commit = (
+            (head_proc.stdout or "").strip() if head_proc.returncode == 0 else None
+        ) or None
+
+        branch_proc = self._run_cmd(
+            [self.git_bin, "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+            label="git",
+            timeout=10,
+            check=False,
+        )
+        raw_branch = (
+            (branch_proc.stdout or "").strip() if branch_proc.returncode == 0 else ""
+        )
+        if not raw_branch or raw_branch == "HEAD":
+            branch = os.environ.get("VPSAGENT_REPO_REF", "main").strip() or "main"
+        else:
+            branch = raw_branch
+
+        status_proc = self._run_cmd(
+            [self.git_bin, "-C", repo_dir, "status", "--porcelain"],
+            label="git",
+            timeout=10,
+            check=False,
+        )
+        dirty = bool((status_proc.stdout or "").strip()) if status_proc.returncode == 0 else False
+
+        remote_proc = self._run_cmd(
+            [self.git_bin, "-C", repo_dir, "remote", "get-url", "origin"],
+            label="git",
+            timeout=10,
+            check=False,
+        )
+        if remote_proc.returncode != 0 or not (remote_proc.stdout or "").strip():
+            return {
+                "canUpdate": False,
+                "unavailableReason": "No 'origin' Git remote is configured for VPSAgent.",
+                "repoDir": repo_dir,
+                "branch": branch,
+                "currentVersion": version,
+                "currentCommit": current_commit,
+                "dirtyWorkingTree": dirty,
+            }
+
+        unavailable_reason = (
+            "Local edits exist in the VPSAgent source folder. Clean or commit them before updating."
+            if dirty
+            else None
+        )
+        return {
+            "canUpdate": not dirty,
+            "unavailableReason": unavailable_reason,
+            "repoDir": repo_dir,
+            "branch": branch,
+            "currentVersion": version,
+            "currentCommit": current_commit,
+            "dirtyWorkingTree": dirty,
+        }
+
+    def _build_update_status_response(
+        self, repo_info: dict[str, Any], state: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "state": state.get("state", "idle"),
+            "phase": state.get("phase"),
+            "canUpdate": bool(repo_info["canUpdate"]),
+            "unavailableReason": repo_info["unavailableReason"],
+            "repoDir": repo_info["repoDir"],
+            "branch": repo_info["branch"],
+            "currentVersion": repo_info["currentVersion"],
+            "currentCommit": repo_info["currentCommit"],
+            "latestCommit": state.get("latestCommit"),
+            "latestCommitSubject": state.get("latestCommitSubject"),
+            "latestCommitDate": state.get("latestCommitDate"),
+            "commitsBehind": int(state.get("commitsBehind") or 0),
+            "updateAvailable": bool(state.get("updateAvailable")),
+            "dirtyWorkingTree": bool(repo_info["dirtyWorkingTree"]),
+            "checkedAt": state.get("checkedAt"),
+            "startedAt": state.get("startedAt"),
+            "finishedAt": state.get("finishedAt"),
+            "message": redact_secrets(state["message"])
+            if isinstance(state.get("message"), str)
+            else None,
+            "error": redact_secrets(state["error"])
+            if isinstance(state.get("error"), str)
+            else None,
+            "logs": [
+                redact_secrets(str(line))[:MAX_LOG_LINE_CHARS]
+                for line in (state.get("logs") or [])
+            ][-MAX_BUILD_LOG_LINES:],
+        }
+
+    def core_update_status(self, *, check_remote: bool = False) -> dict[str, Any]:
+        repo_info = self._inspect_core_repo()
+        with self._update_lock:
+            is_updating = self._update_state.get("state") == "updating"
+            snapshot = dict(self._update_state)
+
+        if check_remote and not is_updating and repo_info["repoDir"] and repo_info["branch"]:
+            repo_dir = repo_info["repoDir"]
+            branch = repo_info["branch"]
+            fetch_proc = self._run_cmd(
+                [self.git_bin, "-C", repo_dir, "fetch", "--prune", "origin", branch],
+                label="git",
+                timeout=45,
+                check=False,
+            )
+            if fetch_proc.returncode != 0:
+                detail = (
+                    (fetch_proc.stderr or fetch_proc.stdout or "git fetch failed").strip()
+                )
+                raise BridgeRequestError(
+                    502,
+                    f"Could not check for updates: {redact_secrets(detail)}",
+                )
+
+            remote_ref = f"origin/{branch}"
+            latest_proc = self._run_cmd(
+                [self.git_bin, "-C", repo_dir, "rev-parse", remote_ref],
+                label="git",
+                timeout=10,
+                check=False,
+            )
+            latest_commit = (
+                (latest_proc.stdout or "").strip()
+                if latest_proc.returncode == 0
+                else None
+            ) or None
+
+            meta_proc = self._run_cmd(
+                [
+                    self.git_bin,
+                    "-C",
+                    repo_dir,
+                    "show",
+                    "-s",
+                    "--format=%s%n%cI",
+                    remote_ref,
+                ],
+                label="git",
+                timeout=10,
+                check=False,
+            )
+            latest_subject: str | None = None
+            latest_date: str | None = None
+            if meta_proc.returncode == 0:
+                meta_lines = (meta_proc.stdout or "").splitlines()
+                if len(meta_lines) >= 1 and meta_lines[0].strip():
+                    latest_subject = redact_secrets(meta_lines[0].strip())[:200]
+                if len(meta_lines) >= 2 and meta_lines[1].strip():
+                    latest_date = meta_lines[1].strip()
+
+            commits_behind = 0
+            if repo_info["currentCommit"] and latest_commit:
+                count_proc = self._run_cmd(
+                    [
+                        self.git_bin,
+                        "-C",
+                        repo_dir,
+                        "rev-list",
+                        "--count",
+                        f"HEAD..{remote_ref}",
+                    ],
+                    label="git",
+                    timeout=10,
+                    check=False,
+                )
+                if count_proc.returncode == 0:
+                    try:
+                        commits_behind = max(
+                            0, int((count_proc.stdout or "0").strip())
+                        )
+                    except ValueError:
+                        commits_behind = 0
+
+            update_available = bool(
+                latest_commit
+                and repo_info["currentCommit"]
+                and latest_commit != repo_info["currentCommit"]
+                and commits_behind > 0
+            )
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with self._update_lock:
+                if self._update_state.get("state") != "updating":
+                    self._update_state["checkedAt"] = now_iso
+                    self._update_state["latestCommit"] = latest_commit
+                    self._update_state["latestCommitSubject"] = latest_subject
+                    self._update_state["latestCommitDate"] = latest_date
+                    self._update_state["commitsBehind"] = commits_behind
+                    self._update_state["updateAvailable"] = update_available
+                    if self._update_state.get("state") in ("idle", "succeeded", "failed"):
+                        self._update_state["message"] = (
+                            f"{commits_behind} new update{'s' if commits_behind != 1 else ''} ready to install."
+                            if update_available
+                            else "VPSAgent is up to date."
+                        )
+                    self._persist_update_state(self._update_state)
+                snapshot = dict(self._update_state)
+
+        return self._build_update_status_response(repo_info, snapshot)
+
+    def _append_update_log(self, line: str, *, phase: str | None = None, message: str | None = None) -> None:
+        cleaned = redact_secrets(line).strip()
+        with self._update_lock:
+            if phase is not None:
+                self._update_state["phase"] = phase
+            if message is not None:
+                self._update_state["message"] = redact_secrets(message)
+            if cleaned:
+                logs = list(self._update_state.get("logs") or [])
+                logs.append(cleaned[:MAX_LOG_LINE_CHARS])
+                self._update_state["logs"] = logs[-MAX_BUILD_LOG_LINES:]
+            self._persist_update_state(self._update_state)
+
+    def start_core_update(self, _payload: dict[str, Any]) -> dict[str, Any]:
+        repo_info = self._inspect_core_repo()
+        if not repo_info["canUpdate"] or not repo_info["repoDir"] or not repo_info["branch"]:
+            raise BridgeRequestError(
+                400,
+                repo_info["unavailableReason"]
+                or "Automatic updates are not available on this server.",
+            )
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._update_lock:
+            if self._update_state.get("state") == "updating":
+                raise BridgeRequestError(
+                    409, "A VPSAgent update is already in progress."
+                )
+            self._update_state = {
+                **self._update_state,
+                "state": "updating",
+                "phase": "fetching",
+                "startedAt": now_iso,
+                "finishedAt": None,
+                "error": None,
+                "message": "Downloading the latest VPSAgent version...",
+                "logs": [f"Starting VPSAgent update on branch {repo_info['branch']}..."],
+            }
+            self._persist_update_state(self._update_state)
+            snapshot = dict(self._update_state)
+
+        worker = threading.Thread(
+            target=self._run_core_update_worker,
+            args=(repo_info["repoDir"], repo_info["branch"]),
+            name="vpsagent-self-update",
+            daemon=False,
+        )
+        worker.start()
+
+        return {
+            "ok": True,
+            "started": True,
+            "status": self._build_update_status_response(repo_info, snapshot),
+        }
+
+    def _run_core_update_worker(self, repo_dir: str, branch: str) -> None:
+        bridge_changed = False
+        try:
+            # Step 1: Fetch and fast-forward checkout
+            self._append_update_log(
+                f"Fetching origin/{branch}...",
+                phase="fetching",
+                message="Downloading the latest VPSAgent code...",
+            )
+            fetch_proc = self._run_cmd(
+                [self.git_bin, "-C", repo_dir, "fetch", "--prune", "origin", branch],
+                label="git",
+                timeout=60,
+                check=False,
+            )
+            if fetch_proc.returncode != 0:
+                detail = (fetch_proc.stderr or fetch_proc.stdout or "git fetch failed").strip()
+                raise RuntimeError(f"Could not download updates from Git: {detail}")
+
+            status_proc = self._run_cmd(
+                [self.git_bin, "-C", repo_dir, "status", "--porcelain"],
+                label="git",
+                timeout=10,
+                check=False,
+            )
+            if status_proc.returncode == 0 and (status_proc.stdout or "").strip():
+                raise RuntimeError(
+                    "Local edits exist in the VPSAgent source folder. Clean or commit them before updating."
+                )
+
+            merge_proc = self._run_cmd(
+                [
+                    self.git_bin,
+                    "-C",
+                    repo_dir,
+                    "merge",
+                    "--ff-only",
+                    f"origin/{branch}",
+                ],
+                label="git",
+                timeout=30,
+                check=False,
+            )
+            if merge_proc.returncode != 0:
+                detail = (merge_proc.stderr or merge_proc.stdout or "git merge failed").strip()
+                raise RuntimeError(
+                    f"Could not fast-forward VPSAgent cleanly: {detail}"
+                )
+            for line in ((merge_proc.stdout or "") + "\n" + (merge_proc.stderr or "")).splitlines():
+                if line.strip():
+                    self._append_update_log(line)
+
+            # Step 2: Sync bootstrap configs into VPSAGENT_ROOT
+            self._append_update_log(
+                "Syncing VPSAgent configuration files...",
+                phase="syncing",
+                message="Preparing updated server configuration...",
+            )
+            bootstrap_dir = os.path.join(repo_dir, "bootstrap")
+            compose_src = os.path.join(bootstrap_dir, "docker-compose.core.yml")
+            compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
+            caddyfile_src = os.path.join(bootstrap_dir, "Caddyfile")
+            caddyfile_dst = os.path.join(self.vpsagent_root, "Caddyfile")
+            default_app_caddy_src = os.path.join(
+                bootstrap_dir, "caddy", "apps.d", "00-default.caddy"
+            )
+            default_app_caddy_dst = os.path.join(
+                self.vpsagent_root, "caddy", "apps.d", "00-default.caddy"
+            )
+
+            if os.path.isfile(caddyfile_src) and os.path.isdir(self.vpsagent_root):
+                shutil.copyfile(caddyfile_src, caddyfile_dst)
+            if os.path.isfile(compose_src) and os.path.isdir(self.vpsagent_root):
+                shutil.copyfile(compose_src, compose_dst)
+            if os.path.isfile(default_app_caddy_src) and os.path.isdir(
+                os.path.dirname(default_app_caddy_dst)
+            ):
+                shutil.copyfile(default_app_caddy_src, default_app_caddy_dst)
+
+            # Step 3: Rebuild and restart vpsagent-core stack
+            env_file = os.path.join(self.vpsagent_root, ".env")
+            if not os.path.isfile(compose_dst) or not os.path.isfile(env_file):
+                raise RuntimeError(
+                    f"Core stack files not found in {self.vpsagent_root} (expected docker-compose.yml and .env)."
+                )
+
+            self._append_update_log(
+                "Rebuilding and restarting VPSAgent core container...",
+                phase="building",
+                message="Rebuilding VPSAgent (this usually takes 1-2 minutes)...",
+            )
+            compose_env = {**os.environ, "VPSAGENT_REPO_DIR": repo_dir}
+            compose_proc = subprocess.run(
+                [
+                    self.docker_bin,
+                    "compose",
+                    "--project-directory",
+                    self.vpsagent_root,
+                    "-f",
+                    compose_dst,
+                    "--env-file",
+                    env_file,
+                    "up",
+                    "-d",
+                    "--build",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+                env=compose_env,
+            )
+            combined_out = (
+                (compose_proc.stdout or "") + "\n" + (compose_proc.stderr or "")
+            ).splitlines()
+            for line in combined_out[-40:]:
+                if line.strip():
+                    self._append_update_log(line)
+            if compose_proc.returncode != 0:
+                raise RuntimeError(
+                    f"Docker rebuild failed (exit {compose_proc.returncode})."
+                )
+
+            # Step 4: Install updated runtime-bridge.py if changed
+            bridge_src = os.path.join(bootstrap_dir, "runtime-bridge.py")
+            bridge_dst = os.path.join(self.vpsagent_root, "runtime-bridge.py")
+            if os.path.isfile(bridge_src) and os.path.isdir(self.vpsagent_root):
+                with open(bridge_src, "rb") as fh:
+                    new_bytes = fh.read()
+                old_bytes: bytes | None = None
+                if os.path.isfile(bridge_dst):
+                    with open(bridge_dst, "rb") as fh:
+                        old_bytes = fh.read()
+                if old_bytes != new_bytes:
+                    tmp_bridge = f"{bridge_dst}.tmp.{os.getpid()}"
+                    with open(tmp_bridge, "wb") as fh:
+                        fh.write(new_bytes)
+                    os.chmod(tmp_bridge, 0o750)
+                    os.replace(tmp_bridge, bridge_dst)
+                    bridge_changed = True
+                    self._append_update_log(
+                        "Updated host Runtime Bridge script; scheduling seamless restart...",
+                        phase="restarting",
+                        message="Finishing update and restarting background bridge...",
+                    )
+
+            # Record success BEFORE restarting runtime-bridge.service so status survives restart
+            new_info = self._inspect_core_repo()
+            finished_iso = datetime.now(timezone.utc).isoformat()
+            short_sha = (new_info["currentCommit"] or "")[:7]
+            ver_label = (
+                f"v{new_info['currentVersion']}"
+                if new_info["currentVersion"]
+                else "latest version"
+            )
+            done_msg = (
+                f"Updated VPSAgent to {ver_label} ({short_sha})."
+                if short_sha
+                else f"Updated VPSAgent to {ver_label}."
+            )
+            with self._update_lock:
+                self._update_state = {
+                    **self._update_state,
+                    "state": "succeeded",
+                    "phase": "completed",
+                    "checkedAt": finished_iso,
+                    "finishedAt": finished_iso,
+                    "latestCommit": new_info["currentCommit"],
+                    "commitsBehind": 0,
+                    "updateAvailable": False,
+                    "error": None,
+                    "message": done_msg,
+                    "logs": (list(self._update_state.get("logs") or []) + [done_msg])[
+                        -MAX_BUILD_LOG_LINES:
+                    ],
+                }
+                self._persist_update_state(self._update_state)
+
+            if bridge_changed:
+                time.sleep(0.25)
+                try:
+                    is_active = self._run_cmd(
+                        [self.systemctl_bin, "is-active", "vpsagent-runtime.service"],
+                        label="systemd",
+                        timeout=5,
+                        check=False,
+                    )
+                    if is_active.returncode == 0:
+                        self._run_cmd(
+                            [
+                                self.systemctl_bin,
+                                "restart",
+                                "--no-block",
+                                "vpsagent-runtime.service",
+                            ],
+                            label="systemd",
+                            timeout=10,
+                            check=False,
+                        )
+                except Exception:
+                    pass
+        except Exception as exc:
+            err_text = redact_secrets(str(exc))
+            finished_iso = datetime.now(timezone.utc).isoformat()
+            with self._update_lock:
+                self._update_state = {
+                    **self._update_state,
+                    "state": "failed",
+                    "phase": "failed",
+                    "finishedAt": finished_iso,
+                    "error": err_text,
+                    "message": "VPSAgent update failed.",
+                    "logs": (
+                        list(self._update_state.get("logs") or [])
+                        + [f"ERROR: {err_text}"]
+                    )[-MAX_BUILD_LOG_LINES:],
+                }
+                self._persist_update_state(self._update_state)
+
 
 def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
     class RuntimeBridgeHandler(BaseHTTPRequestHandler):
@@ -4732,6 +5336,16 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                 except Exception as exc:  # pragma: no cover
                     self._send_json(500, {"error": redact_secrets(str(exc))})
                 return
+            if self.path == "/v1/core/update/status":
+                if not self._require_auth():
+                    return
+                try:
+                    self._send_json(200, service.core_update_status(check_remote=False))
+                except BridgeRequestError as exc:
+                    self._send_json(exc.status_code, {"error": str(exc)})
+                except Exception as exc:  # pragma: no cover
+                    self._send_json(500, {"error": redact_secrets(str(exc))})
+                return
             self._send_json(404, {"error": "Not found."})
 
         def do_POST(self) -> None:
@@ -4753,6 +5367,10 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(200, service.route_core_domain(payload))
                 elif self.path == "/v1/core/tls-check":
                     self._send_json(200, service.check_core_tls(payload))
+                elif self.path == "/v1/core/update/check":
+                    self._send_json(200, service.core_update_status(check_remote=True))
+                elif self.path == "/v1/core/update/apply":
+                    self._send_json(200, service.start_core_update(payload))
                 elif self.path == "/v1/apps/remove":
                     self._send_json(200, service.remove_workload(payload))
                 elif self.path == "/v1/apps/statuses":
@@ -4863,6 +5481,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("VPSAGENT_GIT_BIN", "git"),
     )
     parser.add_argument(
+        "--systemctl-bin",
+        default=os.environ.get("VPSAGENT_SYSTEMCTL_BIN", "systemctl"),
+    )
+    parser.add_argument(
+        "--vpsagent-root",
+        default=os.environ.get("VPSAGENT_ROOT", ""),
+    )
+    parser.add_argument(
+        "--repo-dir",
+        default=os.environ.get("VPSAGENT_REPO_DIR", ""),
+    )
+    parser.add_argument(
         "--runtime-token",
         default=os.environ.get("VPSAGENT_RUNTIME_TOKEN", ""),
     )
@@ -4908,6 +5538,9 @@ def main(argv: list[str] | None = None) -> int:
         caddy_container=args.caddy_container,
         docker_bin=args.docker_bin,
         git_bin=args.git_bin,
+        systemctl_bin=args.systemctl_bin,
+        vpsagent_root=args.vpsagent_root or None,
+        repo_dir=args.repo_dir or None,
         runtime_token=token or None,
         allow_unauthenticated=bool(args.allow_unauthenticated),
         status_deadline_s=args.status_deadline,

@@ -320,6 +320,51 @@ export type RuntimeDockerCleanupResult = z.infer<
   typeof RuntimeDockerCleanupResultSchema
 >;
 
+export const RuntimeCoreUpdateStateSchema = z.enum([
+  "idle",
+  "updating",
+  "succeeded",
+  "failed",
+]);
+export type RuntimeCoreUpdateState = z.infer<
+  typeof RuntimeCoreUpdateStateSchema
+>;
+
+export const RuntimeCoreUpdateStatusSchema = z.object({
+  state: RuntimeCoreUpdateStateSchema,
+  phase: z.string().nullable().default(null),
+  canUpdate: z.boolean(),
+  unavailableReason: z.string().nullable().default(null),
+  repoDir: z.string().nullable().default(null),
+  branch: z.string().nullable().default(null),
+  currentVersion: z.string().nullable().default(null),
+  currentCommit: z.string().nullable().default(null),
+  latestCommit: z.string().nullable().default(null),
+  latestCommitSubject: z.string().nullable().default(null),
+  latestCommitDate: z.string().nullable().default(null),
+  commitsBehind: z.number().int().nonnegative().default(0),
+  updateAvailable: z.boolean().default(false),
+  dirtyWorkingTree: z.boolean().default(false),
+  checkedAt: z.string().nullable().default(null),
+  startedAt: z.string().nullable().default(null),
+  finishedAt: z.string().nullable().default(null),
+  message: z.string().nullable().default(null),
+  error: z.string().nullable().default(null),
+  logs: z.array(z.string()).default([]),
+});
+export type RuntimeCoreUpdateStatus = z.infer<
+  typeof RuntimeCoreUpdateStatusSchema
+>;
+
+export const RuntimeCoreUpdateApplyResultSchema = z.object({
+  ok: z.boolean(),
+  started: z.boolean(),
+  status: RuntimeCoreUpdateStatusSchema,
+});
+export type RuntimeCoreUpdateApplyResult = z.infer<
+  typeof RuntimeCoreUpdateApplyResultSchema
+>;
+
 export interface RuntimeExecInAppInput {
   slug: string;
   command: string;
@@ -457,6 +502,9 @@ export interface RuntimeBridge {
   dockerCleanup(
     input?: RuntimeDockerCleanupInput,
   ): Promise<RuntimeDockerCleanupResult>;
+  getCoreUpdateStatus?(): Promise<RuntimeCoreUpdateStatus>;
+  checkCoreUpdate?(): Promise<RuntimeCoreUpdateStatus>;
+  applyCoreUpdate?(): Promise<RuntimeCoreUpdateApplyResult>;
 }
 
 export class RuntimeBridgeError extends Error {
@@ -1082,6 +1130,57 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       ...parsed,
       output: redactSecrets(parsed.output),
       reclaimedSummary: redactSecrets(parsed.reclaimedSummary),
+    };
+  }
+
+  private sanitizeUpdateStatus(
+    parsed: RuntimeCoreUpdateStatus,
+  ): RuntimeCoreUpdateStatus {
+    return {
+      ...parsed,
+      unavailableReason: parsed.unavailableReason
+        ? redactSecrets(parsed.unavailableReason)
+        : null,
+      latestCommitSubject: parsed.latestCommitSubject
+        ? redactSecrets(parsed.latestCommitSubject)
+        : null,
+      message: parsed.message ? redactSecrets(parsed.message) : null,
+      error: parsed.error ? redactSecrets(parsed.error) : null,
+      logs: parsed.logs.map((line) => redactSecrets(line)),
+    };
+  }
+
+  async getCoreUpdateStatus(): Promise<RuntimeCoreUpdateStatus> {
+    const raw = await this.requestJson(
+      "GET",
+      "/v1/core/update/status",
+      undefined,
+      SHORT_TIMEOUT_MS,
+    );
+    return this.sanitizeUpdateStatus(RuntimeCoreUpdateStatusSchema.parse(raw));
+  }
+
+  async checkCoreUpdate(): Promise<RuntimeCoreUpdateStatus> {
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/core/update/check",
+      {},
+      60_000,
+    );
+    return this.sanitizeUpdateStatus(RuntimeCoreUpdateStatusSchema.parse(raw));
+  }
+
+  async applyCoreUpdate(): Promise<RuntimeCoreUpdateApplyResult> {
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/core/update/apply",
+      {},
+      SHORT_TIMEOUT_MS,
+    );
+    const parsed = RuntimeCoreUpdateApplyResultSchema.parse(raw);
+    return {
+      ...parsed,
+      status: this.sanitizeUpdateStatus(parsed.status),
     };
   }
 

@@ -1277,6 +1277,177 @@ sys.exit(0)
         self.assertFalse(os.path.exists(parent_marker))
         self.assertFalse(os.path.exists(child_marker))
 
+    def test_core_update_check_and_apply_and_dirty_guard(self) -> None:
+        import subprocess
+
+        remote_dir = os.path.join(self.tmp, "remote.git")
+        work_dir = os.path.join(self.tmp, "upstream-work")
+        clone_dir = os.path.join(self.tmp, "vpsagent-clone")
+        vpsagent_root = os.path.join(self.tmp, "vpsagent-root")
+        os.makedirs(os.path.join(vpsagent_root, "apps"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "caddy", "apps.d"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "run"), exist_ok=True)
+        Path(os.path.join(vpsagent_root, ".env")).write_text(
+            "VPSAGENT_RUNTIME_TOKEN=test-secret-token-value-123456\n",
+            encoding="utf-8",
+        )
+
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        subprocess.run(["git", "init", "--bare", remote_dir], check=True, env=git_env)
+        subprocess.run(["git", "clone", remote_dir, work_dir], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "checkout", "-b", "main"], check=True, env=git_env)
+        os.makedirs(os.path.join(work_dir, "bootstrap", "caddy", "apps.d"), exist_ok=True)
+        Path(os.path.join(work_dir, "package.json")).write_text(
+            json.dumps({"name": "vpsagent", "version": "2.0.0-alpha.1"}),
+            encoding="utf-8",
+        )
+        Path(os.path.join(work_dir, "bootstrap", "docker-compose.core.yml")).write_text(
+            "services:\n  vpsagent-core:\n    image: vpsagent/core:local\n",
+            encoding="utf-8",
+        )
+        Path(os.path.join(work_dir, "bootstrap", "Caddyfile")).write_text(
+            "# v1\n", encoding="utf-8"
+        )
+        Path(os.path.join(work_dir, "bootstrap", "caddy", "apps.d", "00-default.caddy")).write_text(
+            "# default\n", encoding="utf-8"
+        )
+        Path(os.path.join(work_dir, "bootstrap", "runtime-bridge.py")).write_text(
+            "# bridge v1\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "commit", "-m", "initial release"], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "push", "-u", "origin", "main"], check=True, env=git_env)
+        subprocess.run(
+            ["git", "--git-dir", remote_dir, "symbolic-ref", "HEAD", "refs/heads/main"],
+            check=True,
+            env=git_env,
+        )
+
+        # Clone initial revision as server's VPSAGENT_REPO_DIR
+        subprocess.run(["git", "clone", "--branch", "main", remote_dir, clone_dir], check=True, env=git_env)
+        Path(os.path.join(vpsagent_root, "runtime-bridge.py")).write_text(
+            "# bridge v1\n", encoding="utf-8"
+        )
+
+        # Push a newer commit to remote
+        Path(os.path.join(work_dir, "package.json")).write_text(
+            json.dumps({"name": "vpsagent", "version": "2.0.0-alpha.2"}),
+            encoding="utf-8",
+        )
+        Path(os.path.join(work_dir, "bootstrap", "runtime-bridge.py")).write_text(
+            "# bridge v2\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(
+            ["git", "-C", work_dir, "commit", "-m", "feat: add self-update v2"],
+            check=True,
+            env=git_env,
+        )
+        subprocess.run(["git", "-C", work_dir, "push", "origin", "main"], check=True, env=git_env)
+
+        docker_log = os.path.join(self.tmp, "docker-calls.log")
+        systemctl_log = os.path.join(self.tmp, "systemctl-calls.log")
+
+        fake_docker_py = os.path.join(self.tmp, "update_fake_docker.py")
+        Path(fake_docker_py).write_text(
+            f"""import sys
+with open({docker_log!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\\n")
+print("Rebuilt vpsagent-core ok")
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        fake_docker_sh = os.path.join(self.tmp, "update-fake-docker")
+        Path(fake_docker_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{fake_docker_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(fake_docker_sh, 0o755)
+
+        fake_sys_py = os.path.join(self.tmp, "update_fake_systemctl.py")
+        Path(fake_sys_py).write_text(
+            f"""import sys
+with open({systemctl_log!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1:2] == ["is-active"]:
+    print("active")
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        fake_sys_sh = os.path.join(self.tmp, "update-fake-systemctl")
+        Path(fake_sys_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{fake_sys_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(fake_sys_sh, 0o755)
+
+        svc = rb.RuntimeService(
+            apps_root=os.path.join(vpsagent_root, "apps"),
+            caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+            caddy_container="vpsagent-caddy",
+            docker_bin=fake_docker_sh,
+            systemctl_bin=fake_sys_sh,
+            vpsagent_root=vpsagent_root,
+            repo_dir=clone_dir,
+            allow_unauthenticated=True,
+        )
+
+        # 1. Check for updates sees 1 new commit
+        checked = svc.core_update_status(check_remote=True)
+        self.assertTrue(checked["canUpdate"])
+        self.assertTrue(checked["updateAvailable"])
+        self.assertEqual(checked["commitsBehind"], 1)
+        self.assertEqual(checked["currentVersion"], "2.0.0-alpha.1")
+        self.assertEqual(checked["latestCommitSubject"], "feat: add self-update v2")
+
+        # 2. Apply update runs asynchronously and succeeds
+        started = svc.start_core_update({})
+        self.assertTrue(started["ok"])
+        self.assertTrue(started["started"])
+
+        deadline = time.monotonic() + 10.0
+        final_status = started["status"]
+        while time.monotonic() < deadline:
+            final_status = svc.core_update_status(check_remote=False)
+            if final_status["state"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.05)
+
+        self.assertEqual(final_status["state"], "succeeded", final_status)
+        self.assertEqual(final_status["currentVersion"], "2.0.0-alpha.2")
+        self.assertFalse(final_status["updateAvailable"])
+        self.assertEqual(final_status["commitsBehind"], 0)
+        self.assertIn("up -d --build", Path(docker_log).read_text(encoding="utf-8"))
+        self.assertEqual(
+            Path(os.path.join(vpsagent_root, "runtime-bridge.py")).read_text(encoding="utf-8"),
+            "# bridge v2\n",
+        )
+        # Wait briefly for the post-success --no-block systemctl restart
+        time.sleep(0.4)
+        self.assertIn(
+            "restart --no-block vpsagent-runtime.service",
+            Path(systemctl_log).read_text(encoding="utf-8"),
+        )
+
+        # 3. Dirty working tree blocks self-update safely
+        Path(os.path.join(clone_dir, "package.json")).write_text(
+            '{"name":"vpsagent","version":"dirty"}\n', encoding="utf-8"
+        )
+        dirty_status = svc.core_update_status(check_remote=False)
+        self.assertFalse(dirty_status["canUpdate"])
+        self.assertTrue(dirty_status["dirtyWorkingTree"])
+        with self.assertRaises(rb.BridgeRequestError) as ctx_dirty:
+            svc.start_core_update({})
+        self.assertEqual(ctx_dirty.exception.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()
