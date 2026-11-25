@@ -4958,10 +4958,10 @@ class RuntimeService:
         }
 
     def core_update_status(self, *, check_remote: bool = False) -> dict[str, Any]:
-        repo_info = self._inspect_core_repo()
         with self._update_lock:
             is_updating = self._update_state.get("state") == "updating"
             snapshot = dict(self._update_state)
+        repo_info = self._inspect_core_repo()
 
         if check_remote and not is_updating and repo_info["repoDir"] and repo_info["branch"]:
             repo_dir = repo_info["repoDir"]
@@ -5109,7 +5109,7 @@ class RuntimeService:
         prev_commit: str | None = None
         after_commit: str | None = None
         merged_new_commit = False
-        config_snapshots: list[tuple[str, bytes | None]] = []
+        config_snapshots: list[tuple[str, bytes | None, bytes]] = []
         try:
             # Record current HEAD so we can roll back cleanly if Docker build fails
             prev_proc = self._run_repo_git(repo_dir, ["rev-parse", "HEAD"], timeout=10)
@@ -5183,8 +5183,11 @@ class RuntimeService:
                     if os.path.isfile(dst_path):
                         with open(dst_path, "rb") as fh:
                             old_content = fh.read()
-                    config_snapshots.append((dst_path, old_content))
-                    shutil.copyfile(src_path, dst_path)
+                    with open(src_path, "rb") as fh:
+                        written_content = fh.read()
+                    with open(dst_path, "wb") as fh:
+                        fh.write(written_content)
+                    config_snapshots.append((dst_path, old_content, written_content))
 
             # Step 3: Rebuild and restart vpsagent-core stack
             env_file = os.path.join(self.vpsagent_root, ".env")
@@ -5311,20 +5314,34 @@ class RuntimeService:
         except Exception as exc:
             err_text = redact_secrets(str(exc))
             rollback_notes: list[str] = []
-            # Restore snapshotted Compose & Caddy config files so failed updates never leave new config on disk
-            for dst_path, old_content in reversed(config_snapshots):
+            # Restore snapshotted Compose & Caddy config files ONLY if they still match what we wrote
+            # (never overwrite edits the owner made to active server config during the build).
+            restored_files: list[str] = []
+            for dst_path, old_content, written_content in reversed(config_snapshots):
+                fname = os.path.basename(dst_path)
                 try:
+                    current_content: bytes | None = None
+                    if os.path.isfile(dst_path):
+                        with open(dst_path, "rb") as fh:
+                            current_content = fh.read()
+                    if current_content != written_content:
+                        rollback_notes.append(
+                            f"Preserved {fname} because it was modified during the build."
+                        )
+                        continue
                     if old_content is None:
-                        if os.path.isfile(dst_path):
-                            os.unlink(dst_path)
+                        os.unlink(dst_path)
                     else:
                         with open(dst_path, "wb") as fh:
                             fh.write(old_content)
-                except OSError:
-                    pass
-            if config_snapshots:
+                    restored_files.append(fname)
+                except OSError as restore_exc:
+                    rollback_notes.append(
+                        f"Failed to restore {fname}: {redact_secrets(str(restore_exc))}"
+                    )
+            if restored_files:
                 rollback_notes.append(
-                    "Restored previous Docker Compose and Caddy configuration files."
+                    f"Restored previous configuration files: {', '.join(restored_files)}."
                 )
 
             # Only roll back Git checkout if it is still clean and at the exact merged commit

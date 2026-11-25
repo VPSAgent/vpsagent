@@ -1374,6 +1374,7 @@ sys.exit(0)
         docker_log = os.path.join(self.tmp, "docker-calls.log")
         docker_fail_flag = os.path.join(self.tmp, "docker-fail.flag")
         docker_dirty_edit_flag = os.path.join(self.tmp, "docker-dirty-edit.flag")
+        docker_installed_cfg_edit_flag = os.path.join(self.tmp, "docker-installed-cfg-edit.flag")
         systemctl_log = os.path.join(self.tmp, "systemctl-calls.log")
 
         fake_docker_py = os.path.join(self.tmp, "update_fake_docker.py")
@@ -1381,6 +1382,11 @@ sys.exit(0)
             f"""import os, sys
 with open({docker_log!r}, "a", encoding="utf-8") as fh:
     fh.write(" ".join(sys.argv[1:]) + "\\n")
+if os.path.exists({docker_installed_cfg_edit_flag!r}):
+    with open({os.path.join(vpsagent_root, "Caddyfile")!r}, "w", encoding="utf-8") as ef:
+        ef.write("# owner live caddy edit\\n")
+    sys.stderr.write("simulated build fail after live caddy edit\\n")
+    sys.exit(1)
 if os.path.exists({docker_dirty_edit_flag!r}):
     with open({os.path.join(clone_dir, "bootstrap", "Caddyfile")!r}, "w", encoding="utf-8") as ef:
         ef.write("# owner mid-build edit\\n")
@@ -1485,8 +1491,36 @@ sys.exit(0)
             "# v1\n",
         )
         os.unlink(docker_dirty_edit_flag)
-        # Clean up simulated owner edit and reset back to v1 before testing the happy-path update
+        # Clean up simulated owner edit and reset back to v1 before testing installed-config protection
         subprocess.run(["git", "-C", clone_dir, "reset", "--hard", "HEAD~1"], check=True, env=git_env)
+
+        # 1d. If owner edits an installed config file (Caddyfile) mid-build and Docker fails, preserve that edit
+        Path(docker_installed_cfg_edit_flag).write_text("cfg-edit", encoding="utf-8")
+        cfg_edit_start = svc.start_core_update({})
+        self.assertTrue(cfg_edit_start["ok"])
+        deadline = time.monotonic() + 10.0
+        cfg_edit_status = cfg_edit_start["status"]
+        while time.monotonic() < deadline:
+            cfg_edit_status = svc.core_update_status(check_remote=False)
+            if cfg_edit_status["state"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(cfg_edit_status["state"], "failed")
+        self.assertEqual(
+            Path(os.path.join(vpsagent_root, "Caddyfile")).read_text(encoding="utf-8"),
+            "# owner live caddy edit\n",
+        )
+        # Unmodified docker-compose.yml was still restored to v1
+        self.assertIn(
+            "vpsagent/core:local",
+            Path(os.path.join(vpsagent_root, "docker-compose.yml")).read_text(encoding="utf-8"),
+        )
+        self.assertTrue(
+            any("Preserved Caddyfile" in line for line in cfg_edit_status["logs"]),
+            cfg_edit_status["logs"],
+        )
+        os.unlink(docker_installed_cfg_edit_flag)
+        Path(os.path.join(vpsagent_root, "Caddyfile")).write_text("# v1\n", encoding="utf-8")
 
         # 2. Apply update succeeds, preserves 00-default.caddy, and survives bridge restart recovery
         started = svc.start_core_update({})
