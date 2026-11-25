@@ -4195,17 +4195,25 @@ class RuntimeService:
                 project_dir,
             ):
                 base = self._compose_cmd_base(slug, project_dir, compose_path)
-                # Enforce timeout INSIDE the container as well so timed-out shells
-                # are killed inside the container (not only the host docker CLI).
+                # Enforce timeout INSIDE the container using a dedicated process group
+                # (`setsid`) so both the shell and all child processes are killed on timeout,
+                # and emit a unique per-call sentinel only when the deadline actually expires
+                # (avoiding false positives on commands that intentionally exit 124).
+                sentinel = f"__VPSAGENT_EXEC_TIMEOUT_{os.urandom(8).hex()}__"
                 inner_wrapper = (
-                    f"if command -v timeout >/dev/null 2>&1; then "
-                    f'exec timeout -k 2 {timeout_s} sh -lc "$1"; '
-                    f"else "
-                    f'sh -lc "$1" & pid=$!; '
-                    f'(sleep {timeout_s}; kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null) & watcher=$!; '
-                    f'wait "$pid"; rc=$?; kill "$watcher" 2>/dev/null; '
-                    f'if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then exit 124; fi; exit "$rc"; '
-                    f"fi"
+                    'if command -v setsid >/dev/null 2>&1; then '
+                    'setsid sh -lc "$1" & pid=$!; '
+                    'else sh -lc "$1" & pid=$!; fi; '
+                    f'(sleep {timeout_s}; '
+                    'if kill -0 "$pid" 2>/dev/null; then '
+                    f'printf "\\n{sentinel}\\n" >&2; '
+                    'kill -TERM -"$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null; '
+                    'sleep 1; '
+                    'kill -KILL -"$pid" 2>/dev/null; kill -KILL "$pid" 2>/dev/null; '
+                    'fi) & watcher=$!; '
+                    'wait "$pid"; rc=$?; '
+                    'kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null; '
+                    'exit "$rc"'
                 )
                 t0 = time.monotonic()
                 rc, stdout, stderr, truncated = self._run_cmd_bounded(
@@ -4222,9 +4230,9 @@ class RuntimeService:
                         command,
                     ],
                     label="Docker exec",
-                    timeout=timeout_s + 3,
+                    timeout=timeout_s + 4,
                 )
-                if rc == 124:
+                if sentinel in stderr:
                     raise BridgeRequestError(
                         504,
                         f'Command inside "{slug}" timed out after {timeout_s}s.',

@@ -1254,19 +1254,28 @@ sys.exit(0)
             allow_unauthenticated=True,
             allowed_file_roots=[self.apps_root],
         )
-        marker_file = os.path.join(self.apps_root, "should-never-exist.marker")
+        # 7a. Ordinary `exit 124` is NOT misreported as a timeout
+        res_124 = svc_exec.exec_in_app(
+            {"slug": app_slug, "command": "exit 124", "timeoutSeconds": 5}
+        )
+        self.assertEqual(res_124["exitCode"], 124)
+
+        # 7b. exec_in_app timeout stops the ENTIRE command tree (parent + spawned child)
+        parent_marker = os.path.join(self.apps_root, "parent-never.marker")
+        child_marker = os.path.join(self.apps_root, "child-never.marker")
         with self.assertRaises(rb.BridgeRequestError) as ctx_exec_to:
             svc_exec.exec_in_app(
                 {
                     "slug": app_slug,
-                    "command": f"sleep 2 && touch {marker_file}",
+                    "command": f"(sleep 2 && touch {child_marker}) & sleep 2 && touch {parent_marker}",
                     "timeoutSeconds": 1,
                 }
             )
         self.assertEqual(ctx_exec_to.exception.status_code, 504)
-        # Wait past the delayed command's original 2s sleep and verify the marker was NEVER created
-        time.sleep(2.2)
-        self.assertFalse(os.path.exists(marker_file))
+        # Wait past both delayed sleeps and verify NEITHER parent nor child wrote its marker
+        time.sleep(2.4)
+        self.assertFalse(os.path.exists(parent_marker))
+        self.assertFalse(os.path.exists(child_marker))
 
 
 if __name__ == "__main__":
