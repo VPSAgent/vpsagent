@@ -79,6 +79,14 @@ if args[:1] == ["compose"]:
         print(f"Listening for {proj}")
         print("Loaded STRIPE_SECRET_KEY=sk-live-never-leak-me-123456")
         sys.exit(0)
+    if "exec" in args:
+        cmd = args[-1] if args else ""
+        print(f"exec-ok:{proj}:{cmd}")
+        sys.exit(0)
+
+if args[:2] in (["container", "prune"], ["image", "prune"], ["builder", "prune"], ["volume", "prune"]):
+    print("Total reclaimed space: 12.5MB")
+    sys.exit(0)
 
 if args[:1] == ["ps"]:
     proj = ""
@@ -547,7 +555,7 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
         },
       });
       expect(getMcpRes.status).toBe(405);
-      expect(getMcpRes.headers.get("allow")).toBe("POST");
+      expect(getMcpRes.headers.get("allow")).toBe("POST, DELETE");
 
       const postMcp = (
         rawToken: string,
@@ -1024,6 +1032,469 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       expect(safeDelete.approvalId).toMatch(/^apr_/);
       expect(store.getApp("auto-next")).not.toBeNull();
 
+      // 11c. VPS Manager MCP tools: read-only, approval-required, auto-approve (app-only), and explicit host-admin
+      const toolsListRes = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 100,
+        method: "tools/list",
+      });
+      const toolsListBody = (await toolsListRes.json()) as {
+        result: { tools: Array<{ name: string }> };
+      };
+      const toolNames = toolsListBody.result.tools.map((t) => t.name);
+      expect(toolNames).toEqual(
+        expect.arrayContaining([
+          "start_app",
+          "get_audit_history",
+          "get_setup_status",
+          "exec_in_app",
+          "run_host_command",
+          "list_files",
+          "read_file",
+          "write_file",
+          "delete_file",
+          "list_services",
+          "manage_service",
+          "docker_cleanup",
+        ]),
+      );
+
+      // Read-only key can inspect audit history & setup status, but is blocked from host commands
+      const auditMcpRes = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 101,
+        method: "tools/call",
+        params: { name: "get_audit_history", arguments: { limit: 10 } },
+      });
+      const auditMcpBody = (await auditMcpRes.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      expect(auditMcpBody.result.isError).toBe(false);
+      expect(JSON.parse(auditMcpBody.result.content[0]!.text).events.length).toBeGreaterThan(0);
+
+      const setupMcpRes = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 102,
+        method: "tools/call",
+        params: { name: "get_setup_status", arguments: {} },
+      });
+      const setupMcpBody = (await setupMcpRes.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      expect(setupMcpBody.result.isError).toBe(false);
+      expect(JSON.parse(setupMcpBody.result.content[0]!.text).setup.claimed).toBe(true);
+
+      const roHostExec = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 103,
+        method: "tools/call",
+        params: { name: "run_host_command", arguments: { command: "echo nope" } },
+      });
+      expect(
+        ((await roHostExec.json()) as { result: { isError: boolean } }).result
+          .isError,
+      ).toBe(true);
+
+      // Approval-required key queues run_host_command and executes it once owner approves
+      const queuedHostCmd = await postMcp(approvalReq.rawToken, {
+        jsonrpc: "2.0",
+        id: 104,
+        method: "tools/call",
+        params: {
+          name: "run_host_command",
+          arguments: { command: "echo approved-host-ok", cwd: tempDir },
+        },
+      });
+      const queuedHostCmdBody = (await queuedHostCmd.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      expect(queuedHostCmdBody.result.isError).toBe(false);
+      const queuedHostData = JSON.parse(
+        queuedHostCmdBody.result.content[0]!.text,
+      ) as { status: string; approvalId: string };
+      expect(queuedHostData.status).toBe("pending_approval");
+
+      const approveHostCmdRes = await app.request(
+        `/api/approvals/${queuedHostData.approvalId}/approve`,
+        {
+          method: "POST",
+          headers: {
+            cookie: cookieHeader,
+            "content-type": "application/json",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({ note: "Approved host command" }),
+        },
+      );
+      expect(approveHostCmdRes.status).toBe(200);
+
+      // Failed command under approval MUST report HTTP 502, ok=false, status=failed, and isError=true on wait_for_approval
+      const queuedFailCmd = await postMcp(approvalReq.rawToken, {
+        jsonrpc: "2.0",
+        id: 1041,
+        method: "tools/call",
+        params: {
+          name: "run_host_command",
+          arguments: { command: "echo boom >&2 && exit 7", cwd: tempDir },
+        },
+      });
+      const queuedFailData = JSON.parse(
+        ((await queuedFailCmd.json()) as { result: { content: Array<{ text: string }> } })
+          .result.content[0]!.text,
+      ) as { status: string; approvalId: string };
+      const approveFailRes = await app.request(
+        `/api/approvals/${queuedFailData.approvalId}/approve`,
+        {
+          method: "POST",
+          headers: {
+            cookie: cookieHeader,
+            "content-type": "application/json",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({}),
+        },
+      );
+      expect(approveFailRes.status).toBe(502);
+      const approveFailBody = (await approveFailRes.json()) as {
+        ok: boolean;
+        approval: { status: string };
+      };
+      expect(approveFailBody.ok).toBe(false);
+      expect(approveFailBody.approval.status).toBe("failed");
+
+      const waitFailRes = await postMcp(approvalReq.rawToken, {
+        jsonrpc: "2.0",
+        id: 1042,
+        method: "tools/call",
+        params: {
+          name: "wait_for_approval",
+          arguments: { approvalId: queuedFailData.approvalId, timeoutSeconds: 2 },
+        },
+      });
+      const waitFailBody = (await waitFailRes.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      expect(waitFailBody.result.isError).toBe(true);
+      expect(JSON.parse(waitFailBody.result.content[0]!.text).status).toBe(
+        "failed",
+      );
+
+      // Cross-pass isolation: another pass CANNOT read approvalReq's approval via wait_for_approval
+      const crossPassWait = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 1043,
+        method: "tools/call",
+        params: {
+          name: "wait_for_approval",
+          arguments: { approvalId: queuedHostData.approvalId, timeoutSeconds: 1 },
+        },
+      });
+      expect(
+        ((await crossPassWait.json()) as { result: { isError: boolean } }).result
+          .isError,
+      ).toBe(true);
+
+      // Existing auto-approve (app-only) MUST queue host-admin actions instead of running root shell silently
+      const autoHostQueued = await postMcp(autoApprove.rawToken, {
+        jsonrpc: "2.0",
+        id: 1044,
+        method: "tools/call",
+        params: {
+          name: "run_host_command",
+          arguments: { command: "echo should-queue" },
+        },
+      });
+      const autoHostData = JSON.parse(
+        ((await autoHostQueued.json()) as { result: { content: Array<{ text: string }> } })
+          .result.content[0]!.text,
+      ) as { status: string };
+      expect(autoHostData.status).toBe("pending_approval");
+
+      // Explicit host-admin pass runs write_file -> list_files -> read_file -> delete_file inside appsRoot
+      const hostAdminRes = await app.request(
+        "https://vps.example.com/api/mcp/tokens",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie: cookieHeader,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({
+            name: "Root Host Manager",
+            scope: "host-admin",
+          }),
+        },
+      );
+      expect(hostAdminRes.status).toBe(201);
+      const hostAdmin = (await hostAdminRes.json()) as { rawToken: string };
+
+      const managedFilePath = path.join(appsRoot, "vps-manager-dir", "hello.txt");
+      const writeRes = await postMcp(hostAdmin.rawToken, {
+        jsonrpc: "2.0",
+        id: 105,
+        method: "tools/call",
+        params: {
+          name: "write_file",
+          arguments: {
+            path: managedFilePath,
+            content: "hello from vps manager\n",
+            createDirs: true,
+          },
+        },
+      });
+      expect(
+        ((await writeRes.json()) as { result: { isError: boolean } }).result
+          .isError,
+      ).toBe(false);
+
+      const readRes = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 106,
+        method: "tools/call",
+        params: { name: "read_file", arguments: { path: managedFilePath } },
+      });
+      const readBody = (await readRes.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      expect(readBody.result.isError).toBe(false);
+      expect(JSON.parse(readBody.result.content[0]!.text).content).toContain(
+        "hello from vps manager",
+      );
+
+      const listFilesRes = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 107,
+        method: "tools/call",
+        params: {
+          name: "list_files",
+          arguments: { path: path.dirname(managedFilePath) },
+        },
+      });
+      const listFilesBody = (await listFilesRes.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      expect(listFilesBody.result.isError).toBe(false);
+      expect(
+        JSON.parse(listFilesBody.result.content[0]!.text).entries[0].name,
+      ).toBe("hello.txt");
+
+      const deleteFileRes = await postMcp(hostAdmin.rawToken, {
+        jsonrpc: "2.0",
+        id: 108,
+        method: "tools/call",
+        params: { name: "delete_file", arguments: { path: managedFilePath } },
+      });
+      expect(
+        ((await deleteFileRes.json()) as { result: { isError: boolean } }).result
+          .isError,
+      ).toBe(false);
+      expect(fs.existsSync(managedFilePath)).toBe(false);
+
+      const execAppRes = await postMcp(autoApprove.rawToken, {
+        jsonrpc: "2.0",
+        id: 109,
+        method: "tools/call",
+        params: {
+          name: "exec_in_app",
+          arguments: { slug: "landing-site", command: "whoami" },
+        },
+      });
+      const execAppBody = (await execAppRes.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      expect(execAppBody.result.isError).toBe(false);
+      expect(
+        JSON.parse(execAppBody.result.content[0]!.text).result.stdout,
+      ).toContain("exec-ok:vpsagent-landing-site:whoami");
+
+      const stopRes = await postMcp(autoApprove.rawToken, {
+        jsonrpc: "2.0",
+        id: 110,
+        method: "tools/call",
+        params: { name: "stop_app", arguments: { slug: "landing-site" } },
+      });
+      expect(
+        ((await stopRes.json()) as { result: { isError: boolean } }).result
+          .isError,
+      ).toBe(false);
+
+      const startRes = await postMcp(autoApprove.rawToken, {
+        jsonrpc: "2.0",
+        id: 111,
+        method: "tools/call",
+        params: { name: "start_app", arguments: { slug: "landing-site" } },
+      });
+      expect(
+        ((await startRes.json()) as { result: { isError: boolean } }).result
+          .isError,
+      ).toBe(false);
+
+      const cleanupRes = await postMcp(autoApprove.rawToken, {
+        jsonrpc: "2.0",
+        id: 112,
+        method: "tools/call",
+        params: { name: "docker_cleanup", arguments: { pruneVolumes: false } },
+      });
+      const cleanupBody = (await cleanupRes.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      expect(cleanupBody.result.isError).toBe(false);
+      expect(
+        JSON.parse(cleanupBody.result.content[0]!.text).result.reclaimedSummary,
+      ).toContain("12.5MB");
+
+      // 11c. Agent Connection Upgrades: initialize instructions, tool annotations, MCP Resources,
+      // wait_for_approval, DELETE /mcp session close, snippets (T3/AGY/curl), and /api/mcp/test
+      const initUpgraded = await postMcp(approvalReq.rawToken, {
+        jsonrpc: "2.0",
+        id: 120,
+        method: "initialize",
+        params: { protocolVersion: "2025-11-25" },
+      });
+      expect(initUpgraded.headers.get("mcp-session-id")).toBeTruthy();
+      const initUpgradedBody = (await initUpgraded.json()) as {
+        result: {
+          instructions: string;
+          capabilities: { tools: object; resources: object };
+        };
+      };
+      expect(initUpgradedBody.result.instructions).toContain("ASK-FIRST");
+      expect(initUpgradedBody.result.capabilities.resources).toBeDefined();
+
+      // Tool annotations are present (readOnlyHint / destructiveHint)
+      const annotatedTools = (
+        toolsListBody.result.tools as Array<{
+          name: string;
+          annotations?: { readOnlyHint: boolean; destructiveHint: boolean };
+        }>
+      );
+      expect(
+        annotatedTools.find((t) => t.name === "get_host_health")?.annotations
+          ?.readOnlyHint,
+      ).toBe(true);
+      expect(
+        annotatedTools.find((t) => t.name === "run_host_command")?.annotations
+          ?.destructiveHint,
+      ).toBe(true);
+      expect(toolNames).toContain("wait_for_approval");
+
+      // MCP Resources: resources/list & resources/read
+      const resList = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 121,
+        method: "resources/list",
+      });
+      const resListBody = (await resList.json()) as {
+        result: { resources: Array<{ uri: string }> };
+      };
+      expect(resListBody.result.resources.map((r) => r.uri)).toEqual(
+        expect.arrayContaining([
+          "vpsagent://server/overview",
+          "vpsagent://apps/list",
+          "vpsagent://audit/recent",
+        ]),
+      );
+
+      const resRead = await postMcp(readOnly.rawToken, {
+        jsonrpc: "2.0",
+        id: 122,
+        method: "resources/read",
+        params: { uri: "vpsagent://server/overview" },
+      });
+      const resReadBody = (await resRead.json()) as {
+        result: { contents: Array<{ uri: string; text: string }> };
+      };
+      expect(resReadBody.result.contents[0]!.uri).toBe(
+        "vpsagent://server/overview",
+      );
+      expect(JSON.parse(resReadBody.result.contents[0]!.text).appCount).toBeGreaterThan(0);
+
+      // wait_for_approval returns immediately for an already-executed approval
+      const waitRes = await postMcp(approvalReq.rawToken, {
+        jsonrpc: "2.0",
+        id: 123,
+        method: "tools/call",
+        params: {
+          name: "wait_for_approval",
+          arguments: { approvalId: queuedHostData.approvalId, timeoutSeconds: 2 },
+        },
+      });
+      const waitBody = (await waitRes.json()) as {
+        result: { isError: boolean; content: Array<{ text: string }> };
+      };
+      expect(waitBody.result.isError).toBe(false);
+      expect(JSON.parse(waitBody.result.content[0]!.text).done).toBe(true);
+
+      // Real MCP session lifecycle: initialize -> valid ping -> DELETE /mcp -> closed session returns 404
+      const sessionId = initUpgraded.headers.get("mcp-session-id")!;
+      const validPing = await app.request("/mcp", {
+        method: "POST",
+        headers: {
+          host: "vps.example.com",
+          "x-forwarded-host": "vps.example.com",
+          "x-forwarded-proto": "https",
+          "content-type": "application/json",
+          authorization: `Bearer ${approvalReq.rawToken}`,
+          "mcp-session-id": sessionId,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 124, method: "ping" }),
+      });
+      expect(validPing.status).toBe(200);
+
+      const delMcpRes = await app.request("/mcp", {
+        method: "DELETE",
+        headers: {
+          host: "vps.example.com",
+          "x-forwarded-host": "vps.example.com",
+          "x-forwarded-proto": "https",
+          authorization: `Bearer ${approvalReq.rawToken}`,
+          "mcp-session-id": sessionId,
+        },
+      });
+      expect(delMcpRes.status).toBe(204);
+
+      const closedPing = await app.request("/mcp", {
+        method: "POST",
+        headers: {
+          host: "vps.example.com",
+          "x-forwarded-host": "vps.example.com",
+          "x-forwarded-proto": "https",
+          "content-type": "application/json",
+          authorization: `Bearer ${approvalReq.rawToken}`,
+          "mcp-session-id": sessionId,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 125, method: "ping" }),
+      });
+      expect(closedPing.status).toBe(404);
+
+      // Dashboard snippets include T3/AGY & curlTest, and /api/mcp/test reports ready
+      const upgradedSnippetsRes = await app.request("/api/mcp/snippets", {
+        headers: { cookie: cookieHeader, host: "localhost:3002" },
+      });
+      const upgradedSnippetsBody = (await upgradedSnippetsRes.json()) as {
+        t3AndAgy: string;
+        curlTest: string;
+        tokenPlaceholder: string;
+      };
+      expect(upgradedSnippetsBody.t3AndAgy).toContain("serverUrl");
+      expect(upgradedSnippetsBody.curlTest).toContain("curl");
+      expect(upgradedSnippetsBody.tokenPlaceholder).toBe(
+        "vpsmcp_YOUR_TOKEN_HERE",
+      );
+
+      const testConnRes = await app.request("/api/mcp/test", {
+        method: "POST",
+        headers: { cookie: cookieHeader, host: "localhost:3002" },
+      });
+      const testConnBody = (await testConnRes.json()) as {
+        ok: boolean;
+        toolCount: number;
+      };
+      expect(testConnBody.ok).toBe(true);
+      expect(testConnBody.toolCount).toBe(toolsListBody.result.tools.length);
+
       // 12. Bootstrap invariants: zero docker.sock, VPSAgent/vpsagent repo URL, no plaintext public claim URL
       const coreCompose = fs.readFileSync(
         path.join(REPO_ROOT, "bootstrap", "docker-compose.core.yml"),
@@ -1050,5 +1521,5 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       );
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 30_000);
 });

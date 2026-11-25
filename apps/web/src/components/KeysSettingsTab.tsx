@@ -1,8 +1,18 @@
 import { useState } from "react";
-import { Check, Copy, Globe, KeyRound, Lock, Plus, Trash2 } from "lucide-react";
+import {
+  Activity,
+  Check,
+  Copy,
+  Globe,
+  KeyRound,
+  Lock,
+  Plus,
+  Trash2,
+} from "lucide-react";
 import {
   api,
   type AppRecord,
+  type McpConnectionTestResult,
   type McpSnippets,
   type McpTokenRecord,
   type McpTokenScope,
@@ -39,8 +49,13 @@ const SCOPE_LABELS: Record<
   },
   "auto-approve": {
     title: "Trusted Auto-Pass",
-    desc: "Can launch, update, and delete isolated apps right away without waiting.",
+    desc: "Can launch, update, and delete isolated apps right away. Host-level commands, files, and services still ask for your Approve click.",
     badge: "bg-emerald-500/15 text-emerald-300",
+  },
+  "host-admin": {
+    title: "Full Server Admin (Root)",
+    desc: "Full hands-free VPS administration: runs shell commands directly on the server as root, edits allowed files, and manages system services without waiting for approval.",
+    badge: "bg-rose-500/15 text-rose-300",
   },
 };
 
@@ -57,11 +72,18 @@ export function KeysSettingsTab({
   const [restrictApps, setRestrictApps] = useState(false);
   const [selectedSlugs, setSelectedSlugs] = useState<string[]>([]);
   const [customSlugsText, setCustomSlugsText] = useState("");
-  const [newRawToken, setNewRawToken] = useState<string | null>(null);
+  const [newCreatedToken, setNewCreatedToken] = useState<{
+    id: string;
+    rawToken: string;
+  } | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [activeClient, setActiveClient] = useState<
-    "claudeCode" | "cursor" | "codex" | "genericHttp"
+    "claudeCode" | "t3AndAgy" | "cursor" | "codex" | "genericHttp" | "curlTest"
   >("claudeCode");
+  const [testResult, setTestResult] = useState<McpConnectionTestResult | null>(
+    null,
+  );
+  const [testing, setTesting] = useState(false);
   const [domain, setDomain] = useState(setup.domain ?? "");
   const [acmeEmail, setAcmeEmail] = useState(setup.acmeEmail ?? "");
   const [appsBaseDomain, setAppsBaseDomain] = useState(
@@ -103,7 +125,7 @@ export function KeysSettingsTab({
         return;
       }
       const res = await api.createToken(name.trim(), scope, allowedSlugs);
-      setNewRawToken(res.rawToken);
+      setNewCreatedToken({ id: res.token.id, rawToken: res.rawToken });
       setName("");
       setRestrictApps(false);
       setSelectedSlugs([]);
@@ -120,6 +142,9 @@ export function KeysSettingsTab({
     setError(null);
     try {
       await api.revokeToken(id);
+      if (newCreatedToken?.id === id) {
+        setNewCreatedToken(null);
+      }
       setNotice("AI visitor pass turned off.");
       await onRefresh();
     } catch (err) {
@@ -170,7 +195,28 @@ export function KeysSettingsTab({
     }
   };
 
-  const activeSnippet = snippets ? snippets[activeClient] : "";
+  const handleCheckGatewayStatus = async () => {
+    setTesting(true);
+    setError(null);
+    try {
+      const res = await api.testMcpConnection();
+      setTestResult(res);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not check AI doorway status.",
+      );
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const newRawToken = newCreatedToken?.rawToken ?? null;
+  const rawActiveSnippet = snippets ? snippets[activeClient] : "";
+  const placeholder = snippets?.tokenPlaceholder || "vpsmcp_YOUR_TOKEN_HERE";
+  const activeSnippet =
+    newRawToken && rawActiveSnippet
+      ? rawActiveSnippet.split(placeholder).join(newRawToken)
+      : rawActiveSnippet;
 
   return (
     <div className="space-y-8">
@@ -179,8 +225,8 @@ export function KeysSettingsTab({
           AI Keys &amp; Settings
         </h2>
         <p className="text-sm text-slate-400">
-          Create scoped visitor passes for Claude Code, Cursor, Codex, or T3
-          Code, and configure automatic app web addresses.
+          Create scoped visitor passes for Claude Code, T3 Code, Antigravity
+          (AGY), Cursor, or Codex, and configure automatic app web addresses.
         </p>
       </div>
 
@@ -236,7 +282,10 @@ export function KeysSettingsTab({
                 </option>
                 <option value="read-only">Look Only (Read-Only)</option>
                 <option value="auto-approve">
-                  Trusted Auto-Pass (full auto, including delete)
+                  Trusted Auto-Pass (isolated apps auto, host commands ask)
+                </option>
+                <option value="host-admin">
+                  Full Server Admin (Root — unrestricted host commands, no wait)
                 </option>
               </select>
             </div>
@@ -364,22 +413,42 @@ export function KeysSettingsTab({
             </div>
           )}
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <div>
-              <h3 className="text-base font-semibold text-white">
-                Connect Your AI Tool
-              </h3>
-              <p className="text-xs text-slate-400">
-                Doorway URL:{" "}
-                <code className="text-emerald-300">{snippets.mcpUrl}</code>
-              </p>
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className="text-base font-semibold text-white">
+                  Connect Your AI Tool
+                </h3>
+                {newRawToken && (
+                  <span className="rounded-full bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                    New key auto-filled — ready for 1-click copy
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                <span>
+                  Doorway URL:{" "}
+                  <code className="text-emerald-300">{snippets.mcpUrl}</code>
+                </span>
+                <button
+                  type="button"
+                  disabled={testing}
+                  onClick={handleCheckGatewayStatus}
+                  className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-950 px-2 py-0.5 text-[11px] font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50 cursor-pointer"
+                >
+                  <Activity className="h-3 w-3 text-emerald-400" />
+                  {testing ? "Checking..." : "Check Gateway Status"}
+                </button>
+              </div>
             </div>
             <div className="flex flex-wrap gap-1.5">
               {(
                 [
                   ["claudeCode", "Claude Code"],
+                  ["t3AndAgy", "T3 Code / AGY"],
                   ["cursor", "Cursor"],
                   ["codex", "Codex"],
-                  ["genericHttp", "T3 Code / Generic"],
+                  ["genericHttp", "Generic HTTP"],
+                  ["curlTest", "Curl Test"],
                 ] as const
               ).map(([id, label]) => (
                 <button
@@ -397,6 +466,21 @@ export function KeysSettingsTab({
               ))}
             </div>
           </div>
+
+          {testResult && (
+            <div
+              className={`rounded-xl border px-4 py-3 text-xs ${
+                testResult.ok
+                  ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                  : "border-amber-500/30 bg-amber-500/10 text-amber-200"
+              }`}
+            >
+              <span className="font-semibold">
+                {testResult.ok ? "Connection Ready: " : "Attention: "}
+              </span>
+              {testResult.message}
+            </div>
+          )}
 
           <div className="relative">
             <pre className="rounded-xl border border-slate-800 bg-slate-950 p-4 text-xs font-mono text-slate-200 overflow-x-auto">

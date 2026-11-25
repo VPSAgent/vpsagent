@@ -1084,6 +1084,123 @@ sys.exit(1)
         self.assertNotIn("sk-never-leak-build-err-12345", joined_tail)
         self.assertIn("[REDACTED]", joined_tail)
 
+    def test_vps_manager_host_exec_files_and_protections(self) -> None:
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            allow_unauthenticated=True,
+            allowed_file_roots=[self.apps_root],
+        )
+
+        # 1. host_exec runs commands and redacts secrets in stdout
+        res = svc.host_exec(
+            {
+                "command": "echo 'hello-vps' && echo 'API_KEY=sk-live-secret-1234567890'",
+                "cwd": self.tmp,
+                "timeoutSeconds": 10,
+            }
+        )
+        self.assertEqual(res["exitCode"], 0)
+        self.assertIn("hello-vps", res["stdout"])
+        self.assertNotIn("sk-live-secret-1234567890", res["stdout"])
+
+        # 1b. Noisy command output is bounded while streaming (not buffered unbounded)
+        noisy = svc.host_exec(
+            {
+                "command": "python3 -c \"print('A' * 120000)\"",
+                "timeoutSeconds": 10,
+            }
+        )
+        self.assertEqual(noisy["exitCode"], 0)
+        self.assertTrue(noisy["truncated"])
+        self.assertLessEqual(len(noisy["stdout"].encode("utf-8")), rb.MAX_COMMAND_OUTPUT_BYTES + 128)
+
+        # 1c. Timeout kills the subprocess group and returns 504
+        with self.assertRaises(rb.BridgeRequestError) as ctx_to:
+            svc.host_exec({"command": "sleep 30", "timeoutSeconds": 1})
+        self.assertEqual(ctx_to.exception.status_code, 504)
+
+        # 2. write_file -> list_files -> read_file -> delete_file lifecycle inside allowed root
+        nested_file = os.path.join(self.apps_root, "managed", "notes.txt")
+        written = svc.write_file(
+            {
+                "path": nested_file,
+                "content": "line1\nline2\nTOKEN=vpsmcp_secret1234567890123456\n",
+                "createDirs": True,
+            }
+        )
+        self.assertTrue(written["ok"])
+        self.assertGreater(written["bytesWritten"], 0)
+
+        listed = svc.list_files({"path": os.path.join(self.apps_root, "managed")})
+        self.assertEqual(len(listed["entries"]), 1)
+        self.assertEqual(listed["entries"][0]["name"], "notes.txt")
+
+        read_back = svc.read_file({"path": nested_file, "startLine": 1, "endLine": 3})
+        self.assertIn("line1", read_back["content"])
+        self.assertNotIn("vpsmcp_secret1234567890123456", read_back["content"])
+
+        # 2b. Large disposable file (> MAX_READ_SCAN_BYTES) is capped before reading whole file
+        big_file = os.path.join(self.apps_root, "managed", "big.log")
+        Path(big_file).write_text("X" * (rb.MAX_READ_SCAN_BYTES + 4096), encoding="utf-8")
+        big_read = svc.read_file({"path": big_file})
+        self.assertTrue(big_read["truncated"])
+
+        deleted = svc.delete_file({"path": nested_file})
+        self.assertTrue(deleted["ok"])
+        self.assertEqual(deleted["deletedType"], "file")
+        self.assertFalse(os.path.exists(nested_file))
+
+        # 3. Allowlist blocks paths outside allowed roots and symlinks escaping allowed roots
+        outside_file = os.path.join(self.tmp, "outside.txt")
+        Path(outside_file).write_text("outside", encoding="utf-8")
+        with self.assertRaises(rb.BridgeRequestError) as ctx_out:
+            svc.read_file({"path": outside_file})
+        self.assertEqual(ctx_out.exception.status_code, 403)
+
+        escape_link = os.path.join(self.apps_root, "managed", "escape-link")
+        os.symlink(outside_file, escape_link)
+        with self.assertRaises(rb.BridgeRequestError) as ctx_link:
+            svc.read_file({"path": escape_link})
+        self.assertEqual(ctx_link.exception.status_code, 403)
+
+        # 4. Secret files (.env, *.key, registry.db) are blocked, including inside recursive delete
+        secret_dir = os.path.join(self.apps_root, "has-secret")
+        os.makedirs(secret_dir, exist_ok=True)
+        secret_env = os.path.join(secret_dir, ".env")
+        Path(secret_env).write_text("SECRET=123\n", encoding="utf-8")
+        with self.assertRaises(rb.BridgeRequestError) as ctx_read:
+            svc.read_file({"path": secret_env})
+        self.assertEqual(ctx_read.exception.status_code, 403)
+
+        reg_db = os.path.join(self.apps_root, "registry.db")
+        Path(reg_db).write_text("sqlite", encoding="utf-8")
+        with self.assertRaises(rb.BridgeRequestError) as ctx_db:
+            svc.read_file({"path": reg_db})
+        self.assertEqual(ctx_db.exception.status_code, 403)
+
+        with self.assertRaises(rb.BridgeRequestError) as ctx_rec:
+            svc.delete_file({"path": secret_dir, "recursive": True})
+        self.assertEqual(ctx_rec.exception.status_code, 403)
+
+        with self.assertRaises(rb.BridgeRequestError) as ctx_write:
+            svc.write_file({"path": os.path.join(self.apps_root, "server.key"), "content": "nope"})
+        self.assertEqual(ctx_write.exception.status_code, 403)
+
+        # 5. Protected system paths and allowlist roots cannot be deleted
+        with self.assertRaises(rb.BridgeRequestError) as ctx_del:
+            svc.delete_file({"path": "/", "recursive": True})
+        self.assertEqual(ctx_del.exception.status_code, 403)
+        with self.assertRaises(rb.BridgeRequestError) as ctx_root:
+            svc.delete_file({"path": self.apps_root, "recursive": True})
+        self.assertEqual(ctx_root.exception.status_code, 403)
+
+        # 6. Protected vpsagent-runtime service cannot be stopped or disabled
+        with self.assertRaises(rb.BridgeRequestError) as ctx_svc:
+            svc.manage_service({"service": "vpsagent-runtime.service", "action": "stop"})
+        self.assertEqual(ctx_svc.exception.status_code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

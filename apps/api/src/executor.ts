@@ -12,6 +12,12 @@ import {
   type RuntimeBridge,
   RuntimeBridgeError,
   type RuntimeInspectGitResult,
+  type RuntimeCommandResult,
+  type RuntimeDeleteFileResult,
+  type RuntimeDockerCleanupResult,
+  type RuntimeManageServiceResult,
+  RuntimeServiceActionSchema,
+  type RuntimeWriteFileResult,
   generateApartmentBlueprint,
   redactSecrets,
   resolveScopedAppDir,
@@ -72,6 +78,56 @@ export interface StartDeploymentResult {
   readinessAttempts?: number | undefined;
   missingEnvKeys: string[];
 }
+
+export const ExecInAppInputSchema = z.object({
+  slug: z.string().min(2).max(48),
+  command: z.string().trim().min(1).max(8000),
+  service: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9_-]{0,47}$/)
+    .optional(),
+  timeoutSeconds: z.number().int().min(1).max(180).optional(),
+});
+export type ExecInAppInput = z.input<typeof ExecInAppInputSchema>;
+
+export const RunHostCommandInputSchema = z.object({
+  command: z.string().trim().min(1).max(8000),
+  cwd: z.string().trim().min(1).max(512).optional(),
+  timeoutSeconds: z.number().int().min(1).max(180).optional(),
+});
+export type RunHostCommandInput = z.input<typeof RunHostCommandInputSchema>;
+
+export const WriteHostFileInputSchema = z.object({
+  path: z.string().trim().min(1).max(1024),
+  content: z.string().max(262144),
+  append: z.boolean().default(false),
+  createDirs: z.boolean().default(false),
+});
+export type WriteHostFileInput = z.input<typeof WriteHostFileInputSchema>;
+
+export const DeleteHostFileInputSchema = z.object({
+  path: z.string().trim().min(1).max(1024),
+  recursive: z.boolean().default(false),
+});
+export type DeleteHostFileInput = z.input<typeof DeleteHostFileInputSchema>;
+
+export const ManageHostServiceInputSchema = z.object({
+  service: z
+    .string()
+    .trim()
+    .regex(/^[A-Za-z0-9@._-]{1,128}$/),
+  action: RuntimeServiceActionSchema,
+});
+export type ManageHostServiceInput = z.input<
+  typeof ManageHostServiceInputSchema
+>;
+
+export const DockerCleanupInputSchema = z.object({
+  pruneImages: z.boolean().default(true),
+  pruneBuildCache: z.boolean().default(true),
+  pruneVolumes: z.boolean().default(false),
+});
+export type DockerCleanupInput = z.input<typeof DockerCleanupInputSchema>;
 
 export interface AppExecutorOptions {
   store: RegistryStore;
@@ -1105,6 +1161,131 @@ export class AppExecutor {
     });
   }
 
+  async execInApp(
+    rawInput: ExecInAppInput,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<RuntimeCommandResult> {
+    const input = ExecInAppInputSchema.parse(rawInput);
+    const slug = validateAppSlug(input.slug);
+    const existing = this.store.getApp(slug);
+    if (!existing) {
+      throw new RuntimeBridgeError(404, `App "${slug}" not found.`);
+    }
+
+    const result = await this.bridge.execInApp({
+      slug,
+      command: input.command,
+      service: input.service,
+      timeoutSeconds: input.timeoutSeconds,
+    });
+    const cmdPreview = redactSecrets(input.command).slice(0, 120);
+    this.store.recordAudit({
+      actor,
+      actorTokenId: actorTokenId ?? null,
+      action: "exec_in_app",
+      targetSlug: slug,
+      summary: `Ran command in "${slug}" (${input.service ?? "app"}, exit ${result.exitCode}): ${cmdPreview}`,
+      riskLevel: "medium",
+    });
+    return result;
+  }
+
+  async runHostCommand(
+    rawInput: RunHostCommandInput,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<RuntimeCommandResult> {
+    const input = RunHostCommandInputSchema.parse(rawInput);
+    const result = await this.bridge.runHostCommand({
+      command: input.command,
+      cwd: input.cwd,
+      timeoutSeconds: input.timeoutSeconds,
+    });
+    const cmdPreview = redactSecrets(input.command).slice(0, 140);
+    this.store.recordAudit({
+      actor,
+      actorTokenId: actorTokenId ?? null,
+      action: "run_host_command",
+      targetSlug: null,
+      summary: `Ran host command (exit ${result.exitCode}): ${cmdPreview}`,
+      riskLevel: "high",
+    });
+    return result;
+  }
+
+  async writeHostFile(
+    rawInput: WriteHostFileInput,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<RuntimeWriteFileResult> {
+    const input = WriteHostFileInputSchema.parse(rawInput);
+    const result = await this.bridge.writeHostFile(input);
+    this.store.recordAudit({
+      actor,
+      actorTokenId: actorTokenId ?? null,
+      action: "write_file",
+      targetSlug: null,
+      summary: `${result.appended ? "Appended to" : "Wrote"} ${result.path} (${result.bytesWritten} bytes)`,
+      riskLevel: "high",
+    });
+    return result;
+  }
+
+  async deleteHostFile(
+    rawInput: DeleteHostFileInput,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<RuntimeDeleteFileResult> {
+    const input = DeleteHostFileInputSchema.parse(rawInput);
+    const result = await this.bridge.deleteHostFile(input);
+    this.store.recordAudit({
+      actor,
+      actorTokenId: actorTokenId ?? null,
+      action: "delete_file",
+      targetSlug: null,
+      summary: `Deleted ${result.deletedType} ${result.path}`,
+      riskLevel: "high",
+    });
+    return result;
+  }
+
+  async manageHostService(
+    rawInput: ManageHostServiceInput,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<RuntimeManageServiceResult> {
+    const input = ManageHostServiceInputSchema.parse(rawInput);
+    const result = await this.bridge.manageHostService(input);
+    this.store.recordAudit({
+      actor,
+      actorTokenId: actorTokenId ?? null,
+      action: "manage_service",
+      targetSlug: null,
+      summary: `Ran systemctl ${input.action} on ${input.service} (state: ${result.activeState})`,
+      riskLevel: input.action === "status" ? "low" : "high",
+    });
+    return result;
+  }
+
+  async dockerCleanup(
+    rawInput: DockerCleanupInput,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<RuntimeDockerCleanupResult> {
+    const input = DockerCleanupInputSchema.parse(rawInput);
+    const result = await this.bridge.dockerCleanup(input);
+    this.store.recordAudit({
+      actor,
+      actorTokenId: actorTokenId ?? null,
+      action: "docker_cleanup",
+      targetSlug: null,
+      summary: `Docker cleanup: ${result.reclaimedSummary.slice(0, 200)}`,
+      riskLevel: "medium",
+    });
+    return result;
+  }
+
   /**
    * Atomically claims an approved request and runs its underlying action strictly
    * from its sealed encrypted execution payload (never falling back to the redacted preview).
@@ -1222,6 +1403,13 @@ export class AppExecutor {
             : `Removed domain from "${app.slug}"`;
           break;
         }
+        case "start_app": {
+          const slug = String(execPayload.slug ?? claimed.targetSlug ?? "");
+          const app = await this.lifecycleApp(slug, "start", "agent", tokenId);
+          data = app;
+          summary = `Started "${app.slug}" (${app.status})`;
+          break;
+        }
         case "restart_app": {
           const slug = String(execPayload.slug ?? claimed.targetSlug ?? "");
           const app = await this.lifecycleApp(slug, "restart", "agent", tokenId);
@@ -1242,6 +1430,94 @@ export class AppExecutor {
           const res = await this.deleteApp(slug, removeFiles, "agent", tokenId);
           data = res;
           summary = `Deleted "${slug}"`;
+          break;
+        }
+        case "exec_in_app": {
+          const res = await this.execInApp(
+            execPayload as ExecInAppInput,
+            "agent",
+            tokenId,
+          );
+          data = res;
+          const slug = String(execPayload.slug ?? claimed.targetSlug ?? "");
+          if (res.exitCode !== 0) {
+            const detail = redactSecrets(
+              (res.stderr || res.stdout || "").trim(),
+            ).slice(0, 300);
+            throw new Error(
+              `Command in "${slug}" failed (exit ${res.exitCode})${detail ? `: ${detail}` : ""}`,
+            );
+          }
+          const outSnippet = redactSecrets(res.stdout.trim()).slice(0, 200);
+          summary = `Ran command in "${slug}" (exit 0)${outSnippet ? `: ${outSnippet}` : ""}`;
+          break;
+        }
+        case "run_host_command": {
+          const res = await this.runHostCommand(
+            execPayload as RunHostCommandInput,
+            "agent",
+            tokenId,
+          );
+          data = res;
+          if (res.exitCode !== 0) {
+            const detail = redactSecrets(
+              (res.stderr || res.stdout || "").trim(),
+            ).slice(0, 300);
+            throw new Error(
+              `Host command failed (exit ${res.exitCode})${detail ? `: ${detail}` : ""}`,
+            );
+          }
+          const outSnippet = redactSecrets(res.stdout.trim()).slice(0, 200);
+          summary = `Ran host command (exit 0)${outSnippet ? `: ${outSnippet}` : ""}`;
+          break;
+        }
+        case "write_file": {
+          const res = await this.writeHostFile(
+            execPayload as WriteHostFileInput,
+            "agent",
+            tokenId,
+          );
+          data = res;
+          summary = `${res.appended ? "Appended to" : "Wrote"} ${res.path} (${res.bytesWritten} bytes)`;
+          break;
+        }
+        case "delete_file": {
+          const res = await this.deleteHostFile(
+            execPayload as DeleteHostFileInput,
+            "agent",
+            tokenId,
+          );
+          data = res;
+          summary = `Deleted ${res.deletedType} ${res.path}`;
+          break;
+        }
+        case "manage_service": {
+          const res = await this.manageHostService(
+            execPayload as ManageHostServiceInput,
+            "agent",
+            tokenId,
+          );
+          data = res;
+          if (!res.ok) {
+            const detail = redactSecrets(res.output.trim()).slice(0, 300);
+            throw new Error(
+              `Service action ${res.action} on ${res.service} failed (state: ${res.activeState})${detail ? `: ${detail}` : ""}`,
+            );
+          }
+          summary = `Ran ${res.action} on ${res.service} (state: ${res.activeState})`;
+          break;
+        }
+        case "docker_cleanup": {
+          const res = await this.dockerCleanup(
+            execPayload as DockerCleanupInput,
+            "agent",
+            tokenId,
+          );
+          data = res;
+          if (!res.ok) {
+            throw new Error(res.reclaimedSummary || "Docker cleanup failed.");
+          }
+          summary = res.reclaimedSummary;
           break;
         }
         default: {

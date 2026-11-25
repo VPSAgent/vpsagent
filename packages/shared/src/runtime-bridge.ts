@@ -215,6 +215,166 @@ export type RuntimeReadinessResult = z.infer<
   typeof RuntimeReadinessResultSchema
 >;
 
+export const RuntimeCommandResultSchema = z.object({
+  exitCode: z.number().int(),
+  stdout: z.string(),
+  stderr: z.string(),
+  durationMs: z.number().nonnegative(),
+  truncated: z.boolean().default(false),
+});
+export type RuntimeCommandResult = z.infer<typeof RuntimeCommandResultSchema>;
+
+export const RuntimeFileEntrySchema = z.object({
+  name: z.string(),
+  path: z.string(),
+  type: z.enum(["file", "dir", "symlink", "other"]),
+  sizeBytes: z.number().int().nonnegative(),
+  modifiedAt: z.string().nullable(),
+});
+export type RuntimeFileEntry = z.infer<typeof RuntimeFileEntrySchema>;
+
+export const RuntimeListFilesResultSchema = z.object({
+  path: z.string(),
+  entries: z.array(RuntimeFileEntrySchema),
+  truncated: z.boolean().default(false),
+});
+export type RuntimeListFilesResult = z.infer<
+  typeof RuntimeListFilesResultSchema
+>;
+
+export const RuntimeReadFileResultSchema = z.object({
+  path: z.string(),
+  content: z.string(),
+  sizeBytes: z.number().int().nonnegative(),
+  totalLines: z.number().int().nonnegative(),
+  startLine: z.number().int().positive(),
+  endLine: z.number().int().nonnegative(),
+  truncated: z.boolean().default(false),
+});
+export type RuntimeReadFileResult = z.infer<typeof RuntimeReadFileResultSchema>;
+
+export const RuntimeWriteFileResultSchema = z.object({
+  ok: z.boolean(),
+  path: z.string(),
+  bytesWritten: z.number().int().nonnegative(),
+  appended: z.boolean().default(false),
+});
+export type RuntimeWriteFileResult = z.infer<
+  typeof RuntimeWriteFileResultSchema
+>;
+
+export const RuntimeDeleteFileResultSchema = z.object({
+  ok: z.boolean(),
+  path: z.string(),
+  deletedType: z.enum(["file", "dir", "symlink"]),
+});
+export type RuntimeDeleteFileResult = z.infer<
+  typeof RuntimeDeleteFileResultSchema
+>;
+
+export const RuntimeServiceEntrySchema = z.object({
+  name: z.string(),
+  loadState: z.string(),
+  activeState: z.string(),
+  subState: z.string(),
+  description: z.string(),
+});
+export type RuntimeServiceEntry = z.infer<typeof RuntimeServiceEntrySchema>;
+
+export const RuntimeListServicesResultSchema = z.object({
+  services: z.array(RuntimeServiceEntrySchema),
+  truncated: z.boolean().default(false),
+});
+export type RuntimeListServicesResult = z.infer<
+  typeof RuntimeListServicesResultSchema
+>;
+
+export const RuntimeServiceActionSchema = z.enum([
+  "start",
+  "stop",
+  "restart",
+  "reload",
+  "enable",
+  "disable",
+  "status",
+]);
+export type RuntimeServiceAction = z.infer<typeof RuntimeServiceActionSchema>;
+
+export const RuntimeManageServiceResultSchema = z.object({
+  ok: z.boolean(),
+  service: z.string(),
+  action: RuntimeServiceActionSchema,
+  activeState: z.string(),
+  output: z.string(),
+});
+export type RuntimeManageServiceResult = z.infer<
+  typeof RuntimeManageServiceResultSchema
+>;
+
+export const RuntimeDockerCleanupResultSchema = z.object({
+  ok: z.boolean(),
+  output: z.string(),
+  reclaimedSummary: z.string(),
+});
+export type RuntimeDockerCleanupResult = z.infer<
+  typeof RuntimeDockerCleanupResultSchema
+>;
+
+export interface RuntimeExecInAppInput {
+  slug: string;
+  command: string;
+  service?: string | undefined;
+  timeoutSeconds?: number | undefined;
+}
+
+export interface RuntimeHostCommandInput {
+  command: string;
+  cwd?: string | undefined;
+  timeoutSeconds?: number | undefined;
+}
+
+export interface RuntimeListFilesInput {
+  path: string;
+  showHidden?: boolean | undefined;
+  maxEntries?: number | undefined;
+}
+
+export interface RuntimeReadFileInput {
+  path: string;
+  startLine?: number | undefined;
+  endLine?: number | undefined;
+  maxBytes?: number | undefined;
+}
+
+export interface RuntimeWriteFileInput {
+  path: string;
+  content: string;
+  append?: boolean | undefined;
+  createDirs?: boolean | undefined;
+}
+
+export interface RuntimeDeleteFileInput {
+  path: string;
+  recursive?: boolean | undefined;
+}
+
+export interface RuntimeListServicesInput {
+  filter?: string | undefined;
+  state?: "all" | "running" | "failed" | undefined;
+  limit?: number | undefined;
+}
+
+export interface RuntimeManageServiceInput {
+  service: string;
+  action: RuntimeServiceAction;
+}
+
+export interface RuntimeDockerCleanupInput {
+  pruneImages?: boolean | undefined;
+  pruneBuildCache?: boolean | undefined;
+  pruneVolumes?: boolean | undefined;
+}
+
 export interface RuntimeInspectOptions {
   probeHttp?: boolean | undefined;
   internalPort?: number | undefined;
@@ -280,6 +440,23 @@ export interface RuntimeBridge {
     slug: string,
     options: RuntimeReadinessOptions,
   ): Promise<RuntimeReadinessResult>;
+  execInApp(input: RuntimeExecInAppInput): Promise<RuntimeCommandResult>;
+  runHostCommand(input: RuntimeHostCommandInput): Promise<RuntimeCommandResult>;
+  listHostFiles(input: RuntimeListFilesInput): Promise<RuntimeListFilesResult>;
+  readHostFile(input: RuntimeReadFileInput): Promise<RuntimeReadFileResult>;
+  writeHostFile(input: RuntimeWriteFileInput): Promise<RuntimeWriteFileResult>;
+  deleteHostFile(
+    input: RuntimeDeleteFileInput,
+  ): Promise<RuntimeDeleteFileResult>;
+  listHostServices(
+    input?: RuntimeListServicesInput,
+  ): Promise<RuntimeListServicesResult>;
+  manageHostService(
+    input: RuntimeManageServiceInput,
+  ): Promise<RuntimeManageServiceResult>;
+  dockerCleanup(
+    input?: RuntimeDockerCleanupInput,
+  ): Promise<RuntimeDockerCleanupResult>;
 }
 
 export class RuntimeBridgeError extends Error {
@@ -673,6 +850,239 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       httpTimeoutMs,
     );
     return RuntimeReadinessResultSchema.parse(raw);
+  }
+
+  async execInApp(
+    input: RuntimeExecInAppInput,
+  ): Promise<RuntimeCommandResult> {
+    const safeSlug = validateAppSlug(input.slug);
+    const command = z.string().trim().min(1).max(8000).parse(input.command);
+    const service =
+      input.service !== undefined
+        ? z
+            .string()
+            .regex(/^[a-z0-9][a-z0-9_-]{0,47}$/)
+            .parse(input.service)
+        : undefined;
+    const timeoutSeconds =
+      input.timeoutSeconds !== undefined
+        ? z.number().int().min(1).max(180).parse(input.timeoutSeconds)
+        : undefined;
+    const httpTimeoutMs = Math.max(
+      SHORT_TIMEOUT_MS,
+      ((timeoutSeconds ?? 30) + 15) * 1000,
+    );
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/exec",
+      {
+        slug: safeSlug,
+        command,
+        ...(service !== undefined ? { service } : {}),
+        ...(timeoutSeconds !== undefined ? { timeoutSeconds } : {}),
+      },
+      httpTimeoutMs,
+    );
+    const parsed = RuntimeCommandResultSchema.parse(raw);
+    return {
+      ...parsed,
+      stdout: redactSecrets(parsed.stdout),
+      stderr: redactSecrets(parsed.stderr),
+    };
+  }
+
+  async runHostCommand(
+    input: RuntimeHostCommandInput,
+  ): Promise<RuntimeCommandResult> {
+    const command = z.string().trim().min(1).max(8000).parse(input.command);
+    const cwd =
+      input.cwd !== undefined
+        ? z.string().trim().min(1).max(512).parse(input.cwd)
+        : undefined;
+    const timeoutSeconds =
+      input.timeoutSeconds !== undefined
+        ? z.number().int().min(1).max(180).parse(input.timeoutSeconds)
+        : undefined;
+    const httpTimeoutMs = Math.max(
+      SHORT_TIMEOUT_MS,
+      ((timeoutSeconds ?? 30) + 15) * 1000,
+    );
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/host/exec",
+      {
+        command,
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(timeoutSeconds !== undefined ? { timeoutSeconds } : {}),
+      },
+      httpTimeoutMs,
+    );
+    const parsed = RuntimeCommandResultSchema.parse(raw);
+    return {
+      ...parsed,
+      stdout: redactSecrets(parsed.stdout),
+      stderr: redactSecrets(parsed.stderr),
+    };
+  }
+
+  async listHostFiles(
+    input: RuntimeListFilesInput,
+  ): Promise<RuntimeListFilesResult> {
+    const targetPath = z.string().trim().min(1).max(1024).parse(input.path);
+    const maxEntries =
+      input.maxEntries !== undefined
+        ? z.number().int().min(1).max(500).parse(input.maxEntries)
+        : undefined;
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/host/files/list",
+      {
+        path: targetPath,
+        ...(input.showHidden !== undefined
+          ? { showHidden: Boolean(input.showHidden) }
+          : {}),
+        ...(maxEntries !== undefined ? { maxEntries } : {}),
+      },
+      SHORT_TIMEOUT_MS,
+    );
+    return RuntimeListFilesResultSchema.parse(raw);
+  }
+
+  async readHostFile(
+    input: RuntimeReadFileInput,
+  ): Promise<RuntimeReadFileResult> {
+    const targetPath = z.string().trim().min(1).max(1024).parse(input.path);
+    const startLine =
+      input.startLine !== undefined
+        ? z.number().int().min(1).parse(input.startLine)
+        : undefined;
+    const endLine =
+      input.endLine !== undefined
+        ? z.number().int().min(1).parse(input.endLine)
+        : undefined;
+    const maxBytes =
+      input.maxBytes !== undefined
+        ? z.number().int().min(256).max(131072).parse(input.maxBytes)
+        : undefined;
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/host/files/read",
+      {
+        path: targetPath,
+        ...(startLine !== undefined ? { startLine } : {}),
+        ...(endLine !== undefined ? { endLine } : {}),
+        ...(maxBytes !== undefined ? { maxBytes } : {}),
+      },
+      SHORT_TIMEOUT_MS,
+    );
+    const parsed = RuntimeReadFileResultSchema.parse(raw);
+    return {
+      ...parsed,
+      content: redactSecrets(parsed.content),
+    };
+  }
+
+  async writeHostFile(
+    input: RuntimeWriteFileInput,
+  ): Promise<RuntimeWriteFileResult> {
+    const targetPath = z.string().trim().min(1).max(1024).parse(input.path);
+    const content = z.string().max(262144).parse(input.content);
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/host/files/write",
+      {
+        path: targetPath,
+        content,
+        append: Boolean(input.append),
+        createDirs: Boolean(input.createDirs),
+      },
+      SHORT_TIMEOUT_MS,
+    );
+    return RuntimeWriteFileResultSchema.parse(raw);
+  }
+
+  async deleteHostFile(
+    input: RuntimeDeleteFileInput,
+  ): Promise<RuntimeDeleteFileResult> {
+    const targetPath = z.string().trim().min(1).max(1024).parse(input.path);
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/host/files/delete",
+      {
+        path: targetPath,
+        recursive: Boolean(input.recursive),
+      },
+      SHORT_TIMEOUT_MS,
+    );
+    return RuntimeDeleteFileResultSchema.parse(raw);
+  }
+
+  async listHostServices(
+    input?: RuntimeListServicesInput,
+  ): Promise<RuntimeListServicesResult> {
+    const filter = input?.filter?.trim() || undefined;
+    const state =
+      input?.state !== undefined
+        ? z.enum(["all", "running", "failed"]).parse(input.state)
+        : undefined;
+    const limit =
+      input?.limit !== undefined
+        ? z.number().int().min(1).max(300).parse(input.limit)
+        : undefined;
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/host/services/list",
+      {
+        ...(filter !== undefined ? { filter } : {}),
+        ...(state !== undefined ? { state } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+      },
+      SHORT_TIMEOUT_MS,
+    );
+    return RuntimeListServicesResultSchema.parse(raw);
+  }
+
+  async manageHostService(
+    input: RuntimeManageServiceInput,
+  ): Promise<RuntimeManageServiceResult> {
+    const service = z
+      .string()
+      .trim()
+      .regex(/^[A-Za-z0-9@._-]{1,128}$/)
+      .parse(input.service);
+    const action = RuntimeServiceActionSchema.parse(input.action);
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/host/services/manage",
+      { service, action },
+      this.defaultTimeoutMs,
+    );
+    const parsed = RuntimeManageServiceResultSchema.parse(raw);
+    return {
+      ...parsed,
+      output: redactSecrets(parsed.output),
+    };
+  }
+
+  async dockerCleanup(
+    input?: RuntimeDockerCleanupInput,
+  ): Promise<RuntimeDockerCleanupResult> {
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/host/docker/cleanup",
+      {
+        pruneImages: input?.pruneImages !== false,
+        pruneBuildCache: input?.pruneBuildCache !== false,
+        pruneVolumes: Boolean(input?.pruneVolumes),
+      },
+      this.defaultTimeoutMs,
+    );
+    const parsed = RuntimeDockerCleanupResultSchema.parse(raw);
+    return {
+      ...parsed,
+      output: redactSecrets(parsed.output),
+      reclaimedSummary: redactSecrets(parsed.reclaimedSummary),
+    };
   }
 
   private async requestJson(

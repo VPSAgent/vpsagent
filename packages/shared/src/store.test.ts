@@ -284,6 +284,17 @@ describe("RegistryStore (SQLite WAL)", () => {
           riskLevel: "high",
         });
         expect(apr.tokenScope).toBe("safe-auto-deploy");
+        const hostAdmin = upgraded.createMcpToken({
+          name: "Root Host Pass",
+          scope: "host-admin",
+        });
+        expect(hostAdmin.record.scope).toBe("host-admin");
+        expect(upgraded.verifyMcpToken(created.rawToken)?.scope).toBe(
+          "safe-auto-deploy",
+        );
+        expect(upgraded.verifyMcpToken(hostAdmin.rawToken)?.scope).toBe(
+          "host-admin",
+        );
       } finally {
         upgraded.close();
       }

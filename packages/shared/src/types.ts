@@ -136,9 +136,16 @@ export const ApprovalActionTypeSchema = z.enum([
   "rebuild_app",
   "update_env",
   "set_domain",
+  "start_app",
   "restart_app",
   "stop_app",
   "delete_app",
+  "exec_in_app",
+  "run_host_command",
+  "write_file",
+  "delete_file",
+  "manage_service",
+  "docker_cleanup",
 ]);
 export type ApprovalActionType = z.infer<typeof ApprovalActionTypeSchema>;
 

@@ -48,7 +48,61 @@ from http.server import BaseHTTPRequestHandler
 from typing import Any, Callable, Iterator
 from urllib.parse import urlparse
 
-MAX_BODY_BYTES = 64 * 1024
+MAX_BODY_BYTES = 512 * 1024
+MAX_COMMAND_OUTPUT_BYTES = 48 * 1024
+MAX_HOST_CMD_TIMEOUT_S = 180
+DEFAULT_HOST_CMD_TIMEOUT_S = 30
+MAX_READ_FILE_BYTES = 128 * 1024
+MAX_WRITE_FILE_BYTES = 256 * 1024
+
+SERVICE_UNIT_PATTERN = re.compile(r"^[A-Za-z0-9@._-]{1,128}$")
+ALLOWED_SERVICE_ACTIONS = frozenset(
+    {"start", "stop", "restart", "reload", "enable", "disable", "status"}
+)
+PROTECTED_SERVICES = frozenset({"vpsagent-runtime", "vpsagent-runtime.service"})
+PROTECTED_DELETE_PATHS = frozenset(
+    {
+        "/",
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/home",
+        "/lib",
+        "/lib64",
+        "/opt",
+        "/proc",
+        "/root",
+        "/run",
+        "/sbin",
+        "/srv",
+        "/sys",
+        "/tmp",
+        "/usr",
+        "/var",
+        "/var/lib",
+        "/var/lib/vpsagent",
+    }
+)
+SECRET_FILE_BASENAMES = frozenset(
+    {
+        ".env",
+        "shadow",
+        "gshadow",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        "id_dsa",
+        "runtime.token",
+        "registry.db",
+        "registry.db-wal",
+        "registry.db-shm",
+        "registry.sqlite",
+        "registry.sqlite-wal",
+        "registry.sqlite-shm",
+    }
+)
+MAX_READ_SCAN_BYTES = 256 * 1024
 MAX_COMPOSE_BYTES = 512 * 1024
 MAX_ENV_BYTES = 64 * 1024
 MAX_LOG_LINE_CHARS = 2000
@@ -2285,6 +2339,7 @@ class RuntimeService:
         health_retries: int = DEFAULT_HEALTH_RETRIES,
         dns_resolver: DnsResolver | None = None,
         tls_checker: TlsChecker | None = None,
+        allowed_file_roots: list[str] | None = None,
     ) -> None:
         if not CONTAINER_NAME_PATTERN.match(caddy_container):
             raise ValueError(f"Invalid caddy container name: {caddy_container}")
@@ -2312,6 +2367,18 @@ class RuntimeService:
         self.health_retries = max(1, int(health_retries))
         self.dns_resolver = dns_resolver
         self.tls_checker = tls_checker or default_tls_checker
+        if allowed_file_roots is not None:
+            raw_roots = allowed_file_roots
+        else:
+            env_roots = os.environ.get("VPSAGENT_ALLOWED_FILE_ROOTS", "").strip()
+            raw_roots = (
+                [p.strip() for p in env_roots.split(":") if p.strip()]
+                if env_roots
+                else [apps_root, "/srv", "/opt/apps", "/tmp/vpsagent-work"]
+            )
+        self.allowed_file_roots: list[str] = [
+            os.path.realpath(r) for r in raw_roots if os.path.isabs(r)
+        ]
         self._locks_guard = threading.Lock()
         self._slug_locks: dict[str, _SlugLockEntry] = {}
         self._caddy_lock = threading.Lock()
@@ -3928,6 +3995,618 @@ class RuntimeService:
 
             time.sleep(min(poll_s, remaining_after))
 
+    # -------------------------------------------------------------------------
+    # VPS Manager Endpoints (Command Exec, File Management, Services, Cleanup)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _truncate_redacted_output(
+        text: str, max_bytes: int = MAX_COMMAND_OUTPUT_BYTES
+    ) -> tuple[str, bool]:
+        redacted = redact_secrets(text)
+        encoded = redacted.encode("utf-8", errors="replace")
+        if len(encoded) <= max_bytes:
+            return redacted, False
+        clipped = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        return clipped + "\n...[output truncated]", True
+
+    @staticmethod
+    def _validate_abs_path(raw: Any, field: str = "path") -> str:
+        if not isinstance(raw, str) or not raw.strip():
+            raise BridgeRequestError(400, f"Field '{field}' must be a non-empty string.")
+        cleaned = raw.strip()
+        if "\x00" in cleaned or len(cleaned) > 1024:
+            raise BridgeRequestError(400, f"Field '{field}' is invalid.")
+        if not os.path.isabs(cleaned):
+            raise BridgeRequestError(400, f"Field '{field}' must be an absolute path.")
+        return os.path.normpath(cleaned)
+
+    @staticmethod
+    def _is_secret_path(target_path: str) -> bool:
+        for candidate in (target_path, os.path.realpath(target_path)):
+            base = os.path.basename(candidate)
+            lower_base = base.lower()
+            if (
+                base in SECRET_FILE_BASENAMES
+                or lower_base == ".env"
+                or lower_base.startswith(".env.")
+                or lower_base.endswith(".pem")
+                or lower_base.endswith(".key")
+                or lower_base.endswith(".sqlite")
+                or lower_base.endswith(".sqlite-wal")
+                or lower_base.endswith(".sqlite-shm")
+                or lower_base == "registry.db"
+                or lower_base.startswith("registry.db-")
+            ):
+                return True
+            if (
+                candidate in ("/etc/shadow", "/etc/gshadow")
+                or candidate.startswith("/var/lib/vpsagent/run/")
+                or candidate == "/var/lib/vpsagent/run"
+                or candidate.startswith("/var/lib/vpsagent/data/")
+                or candidate == "/var/lib/vpsagent/data"
+            ):
+                return True
+        return False
+
+    def _assert_not_secret_file(self, abs_path: str) -> None:
+        if self._is_secret_path(abs_path):
+            raise BridgeRequestError(
+                403,
+                "Access to sensitive secret or credential files is blocked for safety.",
+            )
+
+    def _is_within_allowed_roots(self, resolved_path: str) -> bool:
+        for root in self.allowed_file_roots:
+            try:
+                if os.path.commonpath([resolved_path, root]) == root:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _assert_allowed_file_path(
+        self, abs_path: str, *, allow_root_self: bool = True
+    ) -> str:
+        resolved = os.path.realpath(abs_path)
+        if not self._is_within_allowed_roots(resolved):
+            raise BridgeRequestError(
+                403,
+                f"Path '{abs_path}' is outside the allowed file directories ({', '.join(self.allowed_file_roots)}).",
+            )
+        if not allow_root_self and resolved in self.allowed_file_roots:
+            raise BridgeRequestError(
+                403, f"Refusing to delete an allowed root directory: {abs_path}"
+            )
+        self._assert_not_secret_file(abs_path)
+        return resolved
+
+    def _run_cmd_bounded(
+        self,
+        cmd: list[str],
+        *,
+        label: str,
+        timeout: float,
+        cwd: str | None = None,
+        max_bytes: int = MAX_COMMAND_OUTPUT_BYTES,
+    ) -> tuple[int, str, str, bool]:
+        """Run a subprocess in its own process group, streaming output with a hard memory cap."""
+        buf_cap = max_bytes + 4096
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                shell=False,
+                env=_sanitized_subprocess_env(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+        except FileNotFoundError as exc:
+            raise BridgeRequestError(
+                503, f"{label} CLI binary not found ({cmd[0]})."
+            ) from exc
+
+        out_chunks: list[bytes] = []
+        err_chunks: list[bytes] = []
+        trunc_flags = [False, False]
+
+        def _drain(stream: Any, bucket: list[bytes], flag_idx: int) -> None:
+            kept = 0
+            try:
+                while True:
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    if kept < buf_cap:
+                        take = min(len(chunk), buf_cap - kept)
+                        bucket.append(chunk[:take])
+                        kept += take
+                        if take < len(chunk):
+                            trunc_flags[flag_idx] = True
+                    else:
+                        trunc_flags[flag_idx] = True
+            finally:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+        t_out = threading.Thread(
+            target=_drain, args=(proc.stdout, out_chunks, 0), daemon=True
+        )
+        t_err = threading.Thread(
+            target=_drain, args=(proc.stderr, err_chunks, 1), daemon=True
+        )
+        t_out.start()
+        t_err.start()
+
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            t_out.join(timeout=2)
+            t_err.join(timeout=2)
+            raise BridgeRequestError(
+                504, f"{label} command timed out after {int(timeout)}s."
+            ) from exc
+
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
+        raw_out = b"".join(out_chunks).decode("utf-8", errors="replace")
+        raw_err = b"".join(err_chunks).decode("utf-8", errors="replace")
+        stdout, out_trunc = self._truncate_redacted_output(raw_out, max_bytes=max_bytes)
+        stderr, err_trunc = self._truncate_redacted_output(raw_err, max_bytes=max_bytes)
+        return (
+            int(proc.returncode or 0),
+            stdout,
+            stderr,
+            out_trunc or err_trunc or trunc_flags[0] or trunc_flags[1],
+        )
+
+    def exec_in_app(self, payload: dict[str, Any]) -> dict[str, Any]:
+        slug = validate_slug(payload.get("slug"))
+        command = payload.get("command")
+        if not isinstance(command, str) or not command.strip() or len(command) > 8000:
+            raise BridgeRequestError(
+                400, "Field 'command' must be a non-empty string (max 8000 chars)."
+            )
+        service = payload.get("service", "app")
+        if not isinstance(service, str) or not SERVICE_NAME_PATTERN.fullmatch(service):
+            raise BridgeRequestError(400, "Field 'service' is invalid.")
+        raw_timeout = payload.get("timeoutSeconds", DEFAULT_HOST_CMD_TIMEOUT_S)
+        if not isinstance(raw_timeout, (int, float)) or isinstance(raw_timeout, bool):
+            raise BridgeRequestError(400, "Field 'timeoutSeconds' must be a number.")
+        timeout_s = max(1, min(int(raw_timeout), MAX_HOST_CMD_TIMEOUT_S))
+
+        with self._lock_for(slug):
+            app_dir = resolve_scoped_app_dir(self.apps_root, slug)
+            with self._validated_compose_context(app_dir, slug) as (
+                compose_path,
+                project_dir,
+            ):
+                base = self._compose_cmd_base(slug, project_dir, compose_path)
+                t0 = time.monotonic()
+                rc, stdout, stderr, truncated = self._run_cmd_bounded(
+                    [self.docker_bin, *base, "exec", "-T", service, "sh", "-lc", command],
+                    label="Docker exec",
+                    timeout=timeout_s,
+                )
+                elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+                return {
+                    "exitCode": rc,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "durationMs": elapsed_ms,
+                    "truncated": truncated,
+                }
+
+    def host_exec(self, payload: dict[str, Any]) -> dict[str, Any]:
+        command = payload.get("command")
+        if not isinstance(command, str) or not command.strip() or len(command) > 8000:
+            raise BridgeRequestError(
+                400, "Field 'command' must be a non-empty string (max 8000 chars)."
+            )
+        cwd_raw = payload.get("cwd")
+        cwd: str | None = None
+        if cwd_raw is not None:
+            cwd = self._validate_abs_path(cwd_raw, "cwd")
+            if not os.path.isdir(cwd):
+                raise BridgeRequestError(
+                    400, f"Working directory does not exist: {cwd}"
+                )
+        raw_timeout = payload.get("timeoutSeconds", DEFAULT_HOST_CMD_TIMEOUT_S)
+        if not isinstance(raw_timeout, (int, float)) or isinstance(raw_timeout, bool):
+            raise BridgeRequestError(400, "Field 'timeoutSeconds' must be a number.")
+        timeout_s = max(1, min(int(raw_timeout), MAX_HOST_CMD_TIMEOUT_S))
+
+        shell_bin = "/bin/bash" if os.path.exists("/bin/bash") else "/bin/sh"
+        t0 = time.monotonic()
+        rc, stdout, stderr, truncated = self._run_cmd_bounded(
+            [shell_bin, "-lc", command],
+            label="Host shell",
+            timeout=timeout_s,
+            cwd=cwd,
+        )
+        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+        return {
+            "exitCode": rc,
+            "stdout": stdout,
+            "stderr": stderr,
+            "durationMs": elapsed_ms,
+            "truncated": truncated,
+        }
+
+    def list_files(self, payload: dict[str, Any]) -> dict[str, Any]:
+        target_path = self._validate_abs_path(payload.get("path"))
+        self._assert_allowed_file_path(target_path)
+        show_hidden = bool(payload.get("showHidden", False))
+        raw_max = payload.get("maxEntries", 200)
+        if not isinstance(raw_max, int) or isinstance(raw_max, bool):
+            raise BridgeRequestError(400, "Field 'maxEntries' must be an integer.")
+        max_entries = max(1, min(raw_max, 500))
+
+        if not os.path.exists(target_path):
+            raise BridgeRequestError(404, f"Directory not found: {target_path}")
+        if not os.path.isdir(target_path):
+            raise BridgeRequestError(400, f"Path is not a directory: {target_path}")
+
+        try:
+            with os.scandir(target_path) as it:
+                raw_entries = list(it)
+        except OSError as exc:
+            raise BridgeRequestError(500, redact_secrets(str(exc))) from exc
+
+        entries: list[dict[str, Any]] = []
+        for item in raw_entries:
+            if not show_hidden and item.name.startswith("."):
+                continue
+            try:
+                st = item.stat(follow_symlinks=False)
+                if stat.S_ISLNK(st.st_mode):
+                    entry_type = "symlink"
+                elif stat.S_ISDIR(st.st_mode):
+                    entry_type = "dir"
+                elif stat.S_ISREG(st.st_mode):
+                    entry_type = "file"
+                else:
+                    entry_type = "other"
+                size_bytes = int(st.st_size) if entry_type == "file" else 0
+                mod_at = datetime.fromtimestamp(
+                    st.st_mtime, tz=timezone.utc
+                ).isoformat()
+            except OSError:
+                entry_type = "other"
+                size_bytes = 0
+                mod_at = None
+            entries.append(
+                {
+                    "name": item.name,
+                    "path": os.path.join(target_path, item.name),
+                    "type": entry_type,
+                    "sizeBytes": size_bytes,
+                    "modifiedAt": mod_at,
+                }
+            )
+
+        entries.sort(key=lambda e: (0 if e["type"] == "dir" else 1, e["name"].lower()))
+        truncated = len(entries) > max_entries
+        return {
+            "path": target_path,
+            "entries": entries[:max_entries],
+            "truncated": truncated,
+        }
+
+    def read_file(self, payload: dict[str, Any]) -> dict[str, Any]:
+        target_path = self._validate_abs_path(payload.get("path"))
+        self._assert_allowed_file_path(target_path)
+
+        if not os.path.exists(target_path):
+            raise BridgeRequestError(404, f"File not found: {target_path}")
+        if not os.path.isfile(target_path):
+            raise BridgeRequestError(400, f"Path is not a regular file: {target_path}")
+
+        raw_start = payload.get("startLine", 1)
+        raw_end = payload.get("endLine")
+        raw_max_bytes = payload.get("maxBytes", 65536)
+        if not isinstance(raw_start, int) or isinstance(raw_start, bool) or raw_start < 1:
+            raise BridgeRequestError(400, "Field 'startLine' must be an integer >= 1.")
+        if raw_end is not None and (
+            not isinstance(raw_end, int)
+            or isinstance(raw_end, bool)
+            or raw_end < raw_start
+        ):
+            raise BridgeRequestError(
+                400, "Field 'endLine' must be an integer >= startLine."
+            )
+        if not isinstance(raw_max_bytes, int) or isinstance(raw_max_bytes, bool):
+            raise BridgeRequestError(400, "Field 'maxBytes' must be an integer.")
+        max_bytes = max(256, min(raw_max_bytes, MAX_READ_FILE_BYTES))
+
+        try:
+            size_bytes = os.path.getsize(target_path)
+            with open(target_path, "rb") as fh:
+                raw_chunk = fh.read(MAX_READ_SCAN_BYTES + 1)
+        except OSError as exc:
+            raise BridgeRequestError(500, redact_secrets(str(exc))) from exc
+
+        scan_truncated = len(raw_chunk) > MAX_READ_SCAN_BYTES
+        if scan_truncated:
+            raw_chunk = raw_chunk[:MAX_READ_SCAN_BYTES]
+        decoded = raw_chunk.decode("utf-8", errors="replace")
+        all_lines = decoded.splitlines()
+
+        total_lines = len(all_lines)
+        start_idx = raw_start - 1
+        end_idx = raw_end if raw_end is not None else total_lines
+        selected = all_lines[start_idx:end_idx]
+        joined = "\n".join(selected)
+        content, truncated = self._truncate_redacted_output(joined, max_bytes=max_bytes)
+        actual_end = min(end_idx, total_lines)
+        return {
+            "path": target_path,
+            "content": content,
+            "sizeBytes": int(size_bytes),
+            "totalLines": total_lines,
+            "startLine": raw_start,
+            "endLine": actual_end,
+            "truncated": scan_truncated or truncated or (actual_end < total_lines),
+        }
+
+    def write_file(self, payload: dict[str, Any]) -> dict[str, Any]:
+        target_path = self._validate_abs_path(payload.get("path"))
+        self._assert_allowed_file_path(target_path)
+
+        content = payload.get("content")
+        if not isinstance(content, str):
+            raise BridgeRequestError(400, "Field 'content' must be a string.")
+        encoded = content.encode("utf-8")
+        if len(encoded) > MAX_WRITE_FILE_BYTES:
+            raise BridgeRequestError(
+                413,
+                f"File content exceeds maximum size ({MAX_WRITE_FILE_BYTES} bytes).",
+            )
+        append = bool(payload.get("append", False))
+        create_dirs = bool(payload.get("createDirs", False))
+
+        parent_dir = os.path.dirname(target_path)
+        if parent_dir and not os.path.exists(parent_dir):
+            if create_dirs:
+                os.makedirs(parent_dir, exist_ok=True)
+            else:
+                raise BridgeRequestError(
+                    400, f"Parent directory does not exist: {parent_dir}"
+                )
+        # Re-verify resolved path after optional parent creation
+        self._assert_allowed_file_path(target_path)
+
+        mode = "a" if append else "w"
+        try:
+            with open(target_path, mode, encoding="utf-8") as fh:
+                fh.write(content)
+        except OSError as exc:
+            raise BridgeRequestError(500, redact_secrets(str(exc))) from exc
+
+        return {
+            "ok": True,
+            "path": target_path,
+            "bytesWritten": len(encoded),
+            "appended": append,
+        }
+
+    def delete_file(self, payload: dict[str, Any]) -> dict[str, Any]:
+        target_path = self._validate_abs_path(payload.get("path"))
+        if target_path in PROTECTED_DELETE_PATHS or os.path.realpath(
+            target_path
+        ) in PROTECTED_DELETE_PATHS:
+            raise BridgeRequestError(
+                403, f"Refusing to delete protected system path: {target_path}"
+            )
+        self._assert_allowed_file_path(target_path, allow_root_self=False)
+
+        recursive = bool(payload.get("recursive", False))
+        if not os.path.lexists(target_path):
+            raise BridgeRequestError(404, f"Path not found: {target_path}")
+
+        if os.path.isdir(target_path) and not os.path.islink(target_path) and recursive:
+            for dirpath, dirnames, filenames in os.walk(target_path, followlinks=False):
+                for entry_name in (*dirnames, *filenames):
+                    entry_path = os.path.join(dirpath, entry_name)
+                    if self._is_secret_path(entry_path):
+                        raise BridgeRequestError(
+                            403,
+                            f"Refusing recursive delete because directory contains protected file: {entry_name}",
+                        )
+                    if not self._is_within_allowed_roots(os.path.realpath(entry_path)):
+                        raise BridgeRequestError(
+                            403,
+                            f"Refusing recursive delete because entry resolves outside allowed directories: {entry_name}",
+                        )
+
+        try:
+            if os.path.islink(target_path):
+                os.unlink(target_path)
+                deleted_type = "symlink"
+            elif os.path.isdir(target_path):
+                if recursive:
+                    shutil.rmtree(target_path)
+                else:
+                    os.rmdir(target_path)
+                deleted_type = "dir"
+            else:
+                os.unlink(target_path)
+                deleted_type = "file"
+        except OSError as exc:
+            raise BridgeRequestError(400, redact_secrets(str(exc))) from exc
+
+        return {
+            "ok": True,
+            "path": target_path,
+            "deletedType": deleted_type,
+        }
+
+    def list_services(self, payload: dict[str, Any]) -> dict[str, Any]:
+        filter_str = payload.get("filter")
+        if filter_str is not None and not isinstance(filter_str, str):
+            raise BridgeRequestError(400, "Field 'filter' must be a string.")
+        filter_lower = filter_str.strip().lower() if filter_str else ""
+
+        state = payload.get("state", "all")
+        if state not in ("all", "running", "failed"):
+            raise BridgeRequestError(
+                400, "Field 'state' must be one of: all, running, failed."
+            )
+
+        raw_limit = payload.get("limit", 100)
+        if not isinstance(raw_limit, int) or isinstance(raw_limit, bool):
+            raise BridgeRequestError(400, "Field 'limit' must be an integer.")
+        limit = max(1, min(raw_limit, 300))
+
+        cmd = [
+            "systemctl",
+            "list-units",
+            "--type=service",
+            "--all",
+            "--no-pager",
+            "--no-legend",
+            "--plain",
+        ]
+        if state == "running":
+            cmd.append("--state=running")
+        elif state == "failed":
+            cmd.append("--state=failed")
+
+        proc = self._run_cmd(cmd, label="systemd", timeout=20, check=False)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "systemctl failed").strip()
+            raise BridgeRequestError(502, redact_secrets(detail))
+
+        services: list[dict[str, str]] = []
+        for line in (proc.stdout or "").splitlines():
+            parts = line.strip().split(None, 4)
+            if len(parts) < 4:
+                continue
+            name, load_state, active_state, sub_state = parts[:4]
+            description = parts[4] if len(parts) > 4 else ""
+            if filter_lower and filter_lower not in name.lower() and filter_lower not in description.lower():
+                continue
+            services.append(
+                {
+                    "name": name,
+                    "loadState": load_state,
+                    "activeState": active_state,
+                    "subState": sub_state,
+                    "description": redact_secrets(description),
+                }
+            )
+
+        truncated = len(services) > limit
+        return {
+            "services": services[:limit],
+            "truncated": truncated,
+        }
+
+    def manage_service(self, payload: dict[str, Any]) -> dict[str, Any]:
+        service = payload.get("service")
+        if not isinstance(service, str) or not SERVICE_UNIT_PATTERN.fullmatch(
+            service.strip()
+        ):
+            raise BridgeRequestError(400, "Field 'service' is invalid.")
+        service = service.strip()
+        action = payload.get("action")
+        if not isinstance(action, str) or action not in ALLOWED_SERVICE_ACTIONS:
+            raise BridgeRequestError(
+                400,
+                "Field 'action' must be one of: start, stop, restart, reload, enable, disable, status.",
+            )
+        if service in PROTECTED_SERVICES and action in ("stop", "disable"):
+            raise BridgeRequestError(
+                403,
+                f"Cannot {action} protected service '{service}' because it would disconnect VPSAgent.",
+            )
+
+        cmd = ["systemctl", action, service]
+        if action == "status":
+            cmd.insert(1, "--no-pager")
+        proc = self._run_cmd(cmd, label="systemd", timeout=60, check=False)
+        state_proc = self._run_cmd(
+            ["systemctl", "is-active", service],
+            label="systemd",
+            timeout=10,
+            check=False,
+        )
+        active_state = (state_proc.stdout or state_proc.stderr or "unknown").strip()
+        raw_out = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+        output, _ = self._truncate_redacted_output(raw_out.strip(), max_bytes=16 * 1024)
+        ok = proc.returncode == 0 or (action == "status" and proc.returncode in (0, 3))
+        return {
+            "ok": ok,
+            "service": service,
+            "action": action,
+            "activeState": active_state,
+            "output": output,
+        }
+
+    def docker_cleanup(self, payload: dict[str, Any]) -> dict[str, Any]:
+        prune_images = payload.get("pruneImages", True) is not False
+        prune_build_cache = payload.get("pruneBuildCache", True) is not False
+        prune_volumes = bool(payload.get("pruneVolumes", False))
+
+        outputs: list[str] = []
+        reclaimed_lines: list[str] = []
+
+        steps: list[tuple[str, list[str]]] = [
+            ("containers", ["container", "prune", "-f"]),
+        ]
+        if prune_images:
+            steps.append(("images", ["image", "prune", "-af"]))
+        if prune_build_cache:
+            steps.append(("build-cache", ["builder", "prune", "-f"]))
+        if prune_volumes:
+            steps.append(("volumes", ["volume", "prune", "-f"]))
+
+        all_ok = True
+        failed_steps: list[str] = []
+        for label, docker_args in steps:
+            proc = self._run_docker(docker_args, timeout=120, check=False)
+            if proc.returncode != 0:
+                all_ok = False
+                failed_steps.append(f"{label} (exit {proc.returncode})")
+            combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+            outputs.append(f"[{label}] (exit {proc.returncode})\n{combined}")
+            for line in combined.splitlines():
+                if "reclaimed" in line.lower() or "total" in line.lower():
+                    reclaimed_lines.append(f"{label}: {line.strip()}")
+
+        full_output, _ = self._truncate_redacted_output(
+            "\n\n".join(outputs), max_bytes=32 * 1024
+        )
+        if not all_ok:
+            reclaimed_summary = (
+                f"Docker cleanup failed on: {', '.join(failed_steps)}"
+                + (f"; {'; '.join(reclaimed_lines)}" if reclaimed_lines else "")
+            )
+        else:
+            reclaimed_summary = (
+                "; ".join(reclaimed_lines)
+                if reclaimed_lines
+                else "Docker cleanup completed."
+            )
+        return {
+            "ok": all_ok,
+            "output": full_output,
+            "reclaimedSummary": redact_secrets(reclaimed_summary),
+        }
+
 
 def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
     class RuntimeBridgeHandler(BaseHTTPRequestHandler):
@@ -4046,6 +4725,24 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(200, service.inspect_workload(payload))
                 elif self.path == "/v1/apps/readiness":
                     self._send_json(200, service.check_readiness(payload))
+                elif self.path == "/v1/apps/exec":
+                    self._send_json(200, service.exec_in_app(payload))
+                elif self.path == "/v1/host/exec":
+                    self._send_json(200, service.host_exec(payload))
+                elif self.path == "/v1/host/files/list":
+                    self._send_json(200, service.list_files(payload))
+                elif self.path == "/v1/host/files/read":
+                    self._send_json(200, service.read_file(payload))
+                elif self.path == "/v1/host/files/write":
+                    self._send_json(200, service.write_file(payload))
+                elif self.path == "/v1/host/files/delete":
+                    self._send_json(200, service.delete_file(payload))
+                elif self.path == "/v1/host/services/list":
+                    self._send_json(200, service.list_services(payload))
+                elif self.path == "/v1/host/services/manage":
+                    self._send_json(200, service.manage_service(payload))
+                elif self.path == "/v1/host/docker/cleanup":
+                    self._send_json(200, service.docker_cleanup(payload))
                 else:
                     self._send_json(404, {"error": "Not found."})
             except BridgeRequestError as exc:

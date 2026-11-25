@@ -9,8 +9,21 @@ export const McpTokenScopeSchema = z.enum([
   "approval-required",
   "safe-auto-deploy",
   "auto-approve",
+  "host-admin",
 ]);
 export type McpTokenScope = z.infer<typeof McpTokenScopeSchema>;
+
+export const HOST_ADMIN_ACTIONS = new Set([
+  "run_host_command",
+  "write_file",
+  "delete_file",
+  "manage_service",
+]);
+
+/** Returns true when an action operates directly on the VPS host rather than an isolated app. */
+export function isHostAdminAction(action?: string): boolean {
+  return Boolean(action && HOST_ADMIN_ACTIONS.has(action));
+}
 
 export const McpTokenRecordSchema = z.object({
   id: z.string().min(1),
@@ -59,14 +72,17 @@ export function canScopeMutate(scope: McpTokenScope): boolean {
   return (
     scope === "approval-required" ||
     scope === "safe-auto-deploy" ||
-    scope === "auto-approve"
+    scope === "auto-approve" ||
+    scope === "host-admin"
   );
 }
 
 /**
  * Returns true when a mutating action must wait for human approval in the dashboard.
- * For `safe-auto-deploy`, normal deploy/rebuild/restart/env/domain actions run right away,
- * while destructive `delete_app` ALWAYS requires human approval.
+ * - `approval-required`: every mutation waits for approval.
+ * - `safe-auto-deploy`: app deploy/rebuild/restart/env/domain run right away; `delete_app` and host-admin actions require approval.
+ * - `auto-approve`: all isolated app actions run right away; host-admin actions STILL require approval unless the pass has explicit `host-admin` scope.
+ * - `host-admin`: explicit full server admin; runs both app and host actions without waiting.
  */
 export function requiresApprovalForScope(
   scope: McpTokenScope,
@@ -79,7 +95,10 @@ export function requiresApprovalForScope(
     return true;
   }
   if (scope === "safe-auto-deploy") {
-    return action === "delete_app";
+    return action === "delete_app" || isHostAdminAction(action);
+  }
+  if (scope === "auto-approve") {
+    return isHostAdminAction(action);
   }
   return false;
 }
