@@ -888,7 +888,7 @@ def _inspect_cloned_repo(
             [
                 "FROM nginxinc/nginx-unprivileged:alpine",
                 "COPY . /usr/share/nginx/html",
-                "RUN printf '%s\\n' 'server {' '  listen 8080;' '  server_name _;' '  root /usr/share/nginx/html;' '  index index.html;' '  location ~ /\\.(?!well-known(/|$)) {' '    deny all;' '    return 404;' '  }' '  location / {' '    try_files $uri $uri/ =404;' '  }' '}' > /etc/nginx/conf.d/default.conf",
+                "RUN printf '%s\\n' 'server {' '  listen 8080;' '  server_name _;' '  root /usr/share/nginx/html;' '  index index.html;' '  location ~ (^/\\.(?!well-known(/|$))|.+/\\.) {' '    deny all;' '    return 404;' '  }' '  location / {' '    try_files $uri $uri/ =404;' '  }' '}' > /etc/nginx/conf.d/default.conf",
                 "EXPOSE 8080",
                 "",
             ]
@@ -2365,6 +2365,44 @@ class _SlugLockEntry:
         self.refs = 0
 
 
+def _dockerfile_needs_git_dir(dockerfile_path: str) -> bool:
+    """Return True only if a repository-supplied Dockerfile explicitly invokes git or copies .git."""
+    try:
+        with open(dockerfile_path, "r", encoding="utf-8", errors="ignore") as fh:
+            raw = fh.read(65536)
+    except OSError:
+        return False
+    lines = [line for line in raw.splitlines() if not line.lstrip().startswith("#")]
+    unfolded = re.sub(r"\\\s*\n", " ", "\n".join(lines))
+    for line in unfolded.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        upper = stripped.upper()
+        if upper.startswith(("RUN ", "RUN\t", "RUN[")):
+            if re.search(r"(?<![.\w/-])git(?=\s|\"|'|$)", stripped) or re.search(
+                r"(?:^|[\s/\"'])\.git(?:/|\s|\"|'|$)", stripped
+            ):
+                return True
+        elif upper.startswith(("COPY ", "COPY\t", "COPY[", "ADD ", "ADD\t", "ADD[")):
+            if re.search(r"(?:^|[\s/\"'])\.git(?:/|\s|\"|'|$)", stripped):
+                return True
+    return False
+
+
+def _strip_git_metadata_dir(clone_dir: str) -> None:
+    git_meta_dir = os.path.join(clone_dir, ".git")
+    if not os.path.lexists(git_meta_dir):
+        return
+    if os.path.isdir(git_meta_dir) and not os.path.islink(git_meta_dir):
+        shutil.rmtree(git_meta_dir, ignore_errors=True)
+    else:
+        try:
+            os.unlink(git_meta_dir)
+        except OSError:
+            pass
+
+
 class RuntimeService:
     def __init__(
         self,
@@ -3122,21 +3160,13 @@ class RuntimeService:
                         f"Git build timed out after {int(total_timeout_s)}s before Docker build.",
                     )
 
-                # For auto-generated Dockerfiles, strip .git metadata so private repo history never enters images.
-                # Preserve .git when the repository supplies its own Dockerfile (e.g. version-stamping multi-stage builds).
-                if used_auto_dockerfile:
-                    git_meta_dir = os.path.join(real_clone_dir, ".git")
-                    if os.path.lexists(git_meta_dir):
-                        if os.path.isdir(git_meta_dir) and not os.path.islink(git_meta_dir):
-                            shutil.rmtree(git_meta_dir, ignore_errors=True)
-                        else:
-                            try:
-                                os.unlink(git_meta_dir)
-                            except OSError:
-                                pass
+                # Strip .git metadata before docker build so private repo history never leaks into images.
+                # Only preserve .git when a repository-supplied Dockerfile explicitly runs git or copies .git.
+                if used_auto_dockerfile or not _dockerfile_needs_git_dir(real_dockerfile):
+                    _strip_git_metadata_dir(real_clone_dir)
 
-                # For auto-detected static sites without a custom .dockerignore, exclude dotfiles (except /.well-known)
-                # and non-site repository metadata files.
+                # For auto-detected static sites without a custom .dockerignore, exclude all dotfiles/dotdirs
+                # at every depth (except non-hidden files under root /.well-known) and repo metadata files.
                 if used_auto_dockerfile and inspected["detectedRuntime"] == "static":
                     dockerignore_path = os.path.join(real_clone_dir, ".dockerignore")
                     if not os.path.lexists(dockerignore_path):
@@ -3147,8 +3177,13 @@ class RuntimeService:
                                         ".git",
                                         ".*",
                                         ".*/**",
+                                        "**/.*",
+                                        "**/.*/**",
                                         "!.well-known",
                                         "!.well-known/**",
+                                        ".well-known/.*",
+                                        ".well-known/**/.*/**",
+                                        ".well-known/**/.*",
                                         "**/.env*",
                                         "*.pem",
                                         "*.key",

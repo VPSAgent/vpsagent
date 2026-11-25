@@ -7,8 +7,10 @@ import http.server
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -2077,12 +2079,100 @@ sys.exit(0)
         self.assertFalse(seen["hasGitDir"])
         self.assertIn(".git", seen["dockerignore"])
         self.assertIn(".*", seen["dockerignore"])
+        self.assertIn("**/.*", seen["dockerignore"])
+        self.assertIn("**/.*/**", seen["dockerignore"])
         self.assertIn("!.well-known", seen["dockerignore"])
         self.assertIn("!.well-known/**", seen["dockerignore"])
+        self.assertIn(".well-known/.*", seen["dockerignore"])
+        self.assertIn(".well-known/**/.*", seen["dockerignore"])
         self.assertIn("README*", seen["dockerignore"])
-        self.assertIn("location ~ /\\.(?!well-known(/|$))", seen["dockerfile"])
 
-        # Repository-supplied Dockerfile must preserve `.git` for version-stamping builds
+        # Execute the generated Dockerfile's `printf` command to render the real nginx config
+        # and verify its dotfile location regex against root /.well-known vs nested/hidden paths.
+        run_lines = [
+            line[len("RUN ") :].strip()
+            for line in seen["dockerfile"].splitlines()
+            if line.startswith("RUN printf ")
+        ]
+        self.assertEqual(len(run_lines), 1)
+        printf_cmd = run_lines[0].split(" > ", 1)[0]
+        rendered_conf = subprocess.run(
+            ["/bin/sh", "-c", printf_cmd],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        m = re.search(r"location\s+~\s+(\S+)\s+\{", rendered_conf)
+        self.assertIsNotNone(m, f"Expected location regex in rendered nginx config: {rendered_conf!r}")
+        deny_re = re.compile(m.group(1))
+        for allowed_path in (
+            "/index.html",
+            "/assets/v1.2/app.js",
+            "/.well-known/assetlinks.json",
+            "/.well-known/apple-app-site-association",
+            "/.well-known/acme-challenge/token123",
+        ):
+            self.assertIsNone(deny_re.search(allowed_path), f"Should allow {allowed_path}")
+        for blocked_path in (
+            "/.git/HEAD",
+            "/.env",
+            "/sub/.env",
+            "/nested/.well-known/secret.txt",
+            "/a/b/.well-known/assetlinks.json",
+            "/.well-known/.env",
+            "/.well-known/sub/.hidden",
+            "/.well-known-fake/file.txt",
+        ):
+            self.assertIsNotNone(deny_re.search(blocked_path), f"Should block {blocked_path}")
+
+        # Custom static Dockerfile that does NOT use git must still strip `.git` to prevent leaks
+        static_df_git_py = os.path.join(static_dir, "fake_static_df_git.py")
+        Path(static_df_git_py).write_text(
+            """import os, sys
+args = sys.argv[1:]
+if "clone" in args:
+    dst = args[-1]
+    os.makedirs(os.path.join(dst, ".git"), exist_ok=True)
+    with open(os.path.join(dst, ".git", "HEAD"), "w", encoding="utf-8") as fh:
+        fh.write("ref: refs/heads/main\\n")
+    with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as fh:
+        fh.write("FROM nginx:alpine\\nCOPY . /usr/share/nginx/html\\nEXPOSE 80\\n")
+    sys.exit(0)
+if "rev-parse" in args:
+    print("main" if "--abbrev-ref" in args else "cccccccccccccccccccccccccccccccccccccccc")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        static_df_git_sh = os.path.join(static_dir, "fake-static-df-git")
+        Path(static_df_git_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{static_df_git_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(static_df_git_sh, 0o755)
+        svc_static_df = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=static_df_git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+        built_static_df = svc_static_df.build_git(
+            {
+                "slug": "custom-static-df",
+                "gitRepoUrl": "https://github.com/acme/custom-static",
+                "gitToken": "github_pat_11STATIC_TEST_TOKEN_1234",
+            }
+        )
+        self.assertTrue(built_static_df["ok"])
+        self.assertFalse(built_static_df["usedAutoDockerfile"])
+        seen_static_df = json.loads(Path(docker_seen_file).read_text(encoding="utf-8"))
+        self.assertFalse(seen_static_df["hasGitDir"])
+
+        # Repository-supplied Dockerfile that explicitly copies .git / invokes git preserves `.git`
         df_git_py = os.path.join(static_dir, "fake_df_git.py")
         Path(df_git_py).write_text(
             """import os, sys
@@ -2093,7 +2183,7 @@ if "clone" in args:
     with open(os.path.join(dst, ".git", "HEAD"), "w", encoding="utf-8") as fh:
         fh.write("ref: refs/heads/main\\n")
     with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as fh:
-        fh.write("FROM alpine:3.20\\nCOPY .git /tmp/.git\\nEXPOSE 8080\\n")
+        fh.write("FROM alpine:3.20\\nCOPY .git /tmp/.git\\nRUN git rev-parse --short HEAD > /version.txt\\nEXPOSE 8080\\n")
     sys.exit(0)
 if "rev-parse" in args:
     print("main" if "--abbrev-ref" in args else "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")

@@ -872,9 +872,9 @@ export function AppsTab({
                       </div>
                       {reposHasMore && (
                         <p className="text-[11px] text-[#9CA3AF]">
-                          Showing matches from the 500 most recently updated
-                          repositories — paste any GitHub URL below if yours is
-                          older.
+                          {repoFilter.trim()
+                            ? `Showing up to ${githubRepos.length} recent matches — refine your search or paste any GitHub URL below if you don't see your repo.`
+                            : `Showing the ${githubRepos.length} most recently updated repositories — search above or paste any GitHub URL below.`}
                         </p>
                       )}
                     </>
