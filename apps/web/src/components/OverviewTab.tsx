@@ -280,8 +280,9 @@ export function OverviewTab({
                 No apps deployed yet
               </p>
               <p className="text-xs text-[#9CA3AF] max-w-sm mx-auto">
-                Deploy a public GitHub repository or Docker image in an isolated
-                container, or let your connected AI agent launch one for you.
+                Deploy a public or private GitHub repository or Docker image in
+                an isolated container, or let your connected AI agent launch one
+                for you.
               </p>
               <button
                 type="button"

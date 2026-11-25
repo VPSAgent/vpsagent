@@ -7,8 +7,10 @@ import http.server
 import importlib.util
 import json
 import os
+import re
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -1734,6 +1736,485 @@ sys.exit(0)
             "# original v1 caddyfile\n",
         )
         self.assertEqual(svc.core_update_status(check_remote=False)["state"], "failed")
+
+    def test_private_github_clone_auth_pinning_cleanup_and_redaction(self) -> None:
+        import base64
+
+        priv_dir = os.path.join(self.tmp, "private-git")
+        os.makedirs(priv_dir, exist_ok=True)
+        record_file = os.path.join(priv_dir, "git_seen.json")
+        docker_seen_file = os.path.join(priv_dir, "docker_seen.json")
+
+        token = "github_pat_11PRIVATETOKEN_99887766"
+        expected_b64 = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+
+        git_py = os.path.join(priv_dir, "fake_git.py")
+        Path(git_py).write_text(
+            f"""import json, os, stat, sys
+args = sys.argv[1:]
+if "clone" in args:
+    cfg_path = os.environ.get("GIT_CONFIG_GLOBAL", "")
+    cfg_text = ""
+    cfg_mode = None
+    if cfg_path and os.path.exists(cfg_path):
+        cfg_mode = stat.S_IMODE(os.stat(cfg_path).st_mode)
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            cfg_text = fh.read()
+    dst = args[-1]
+    os.makedirs(dst, exist_ok=True)
+    with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as df:
+        df.write("FROM alpine:3.20\\nEXPOSE 8080\\n")
+    with open({record_file!r}, "w", encoding="utf-8") as out:
+        json.dump({{
+            "args": args,
+            "cfgPath": cfg_path,
+            "cfgInsideClone": bool(cfg_path and os.path.abspath(cfg_path).startswith(os.path.abspath(dst))),
+            "cfgMode": cfg_mode,
+            "cfgText": cfg_text,
+            "envVals": list(os.environ.values()),
+        }}, out)
+    sys.exit(0)
+if "rev-parse" in args:
+    if "--abbrev-ref" in args:
+        print("main")
+    else:
+        print("11223344556677889900aabbccddeeff00112233")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        git_sh = os.path.join(priv_dir, "fake-git")
+        Path(git_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{git_py}" "$@"\n', encoding="utf-8")
+        os.chmod(git_sh, 0o755)
+
+        docker_py = os.path.join(priv_dir, "fake_docker.py")
+        Path(docker_py).write_text(
+            f"""import json, os, sys
+args = sys.argv[1:]
+if args[:1] == ["build"]:
+    ctx_dir = args[-1]
+    parent_dir = os.path.dirname(ctx_dir)
+    auth_conf_exists = os.path.exists(os.path.join(parent_dir, "git-auth.conf"))
+    with open({docker_seen_file!r}, "w", encoding="utf-8") as out:
+        json.dump({{"authConfStillPresent": auth_conf_exists, "filesInCtx": os.listdir(ctx_dir)}}, out)
+    print("Built private app image")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        docker_sh = os.path.join(priv_dir, "fake-docker")
+        Path(docker_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n', encoding="utf-8")
+        os.chmod(docker_sh, 0o755)
+
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+
+        inspected = svc.inspect_git(
+            {"gitRepoUrl": "https://github.com/acme/private-demo", "gitToken": token}
+        )
+        self.assertTrue(inspected["usedAuth"])
+        self.assertEqual(inspected["detectedRuntime"], "dockerfile")
+        seen = json.loads(Path(record_file).read_text(encoding="utf-8"))
+        self.assertFalse(seen["cfgInsideClone"])
+        self.assertEqual(seen["cfgMode"], 0o600)
+        self.assertIn('[http "https://github.com/"]', seen["cfgText"])
+        self.assertIn(f"Authorization: Basic {expected_b64}", seen["cfgText"])
+        self.assertFalse(any(token in a for a in seen["args"]))
+        self.assertFalse(any(token in v for v in seen["envVals"]))
+
+        built = svc.build_git(
+            {
+                "slug": "priv-demo",
+                "gitRepoUrl": "https://github.com/acme/private-demo",
+                "gitToken": token,
+            }
+        )
+        self.assertTrue(built["ok"])
+        self.assertTrue(built["usedAuth"])
+        docker_seen = json.loads(Path(docker_seen_file).read_text(encoding="utf-8"))
+        self.assertFalse(docker_seen["authConfStillPresent"])
+        self.assertNotIn("git-auth.conf", docker_seen["filesInCtx"])
+
+        # Token cannot be sent to non-github.com hosts or non-443 ports
+        for bad_url in (
+            "https://gitlab.com/acme/private-demo",
+            "https://github.com:8443/acme/private-demo",
+        ):
+            with self.assertRaises(rb.BridgeRequestError) as host_ctx:
+                svc.inspect_git({"gitRepoUrl": bad_url, "gitToken": token})
+            self.assertEqual(host_ctx.exception.status_code, 400)
+
+        # Invalid token characters (newlines / quotes / spaces) rejected
+        for bad_tok in ("bad token\n[http]", 'ghp_1234"quote', "short"):
+            with self.assertRaises(rb.BridgeRequestError) as tok_ctx:
+                svc.inspect_git(
+                    {"gitRepoUrl": "https://github.com/acme/private-demo", "gitToken": bad_tok}
+                )
+            self.assertEqual(tok_ctx.exception.status_code, 400)
+
+        # Git 401/403 errors return HTTP 401 and scrub both raw token and basic base64
+        fail_git_py = os.path.join(priv_dir, "fail_git.py")
+        Path(fail_git_py).write_text(
+            f"""import sys
+sys.stderr.write("remote: Repository not found. fatal: Authentication failed for token={token} basic={expected_b64}\\n")
+sys.exit(128)
+""",
+            encoding="utf-8",
+        )
+        fail_git_sh = os.path.join(priv_dir, "fail-git")
+        Path(fail_git_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{fail_git_py}" "$@"\n', encoding="utf-8")
+        os.chmod(fail_git_sh, 0o755)
+        svc_fail = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=fail_git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+        with self.assertRaises(rb.BridgeRequestError) as anon_ctx:
+            svc_fail.inspect_git({"gitRepoUrl": "https://github.com/acme/private-demo"})
+        self.assertEqual(anon_ctx.exception.status_code, 401)
+
+        with self.assertRaises(rb.BridgeRequestError) as auth_ctx:
+            svc_fail.inspect_git(
+                {"gitRepoUrl": "https://github.com/acme/private-demo", "gitToken": token}
+            )
+        self.assertEqual(auth_ctx.exception.status_code, 401)
+        self.assertNotIn(token, str(auth_ctx.exception))
+        self.assertNotIn(expected_b64, str(auth_ctx.exception))
+
+        # Docker build output also scrubs raw token and basic base64
+        leak_docker_py = os.path.join(priv_dir, "leak_docker.py")
+        Path(leak_docker_py).write_text(
+            f"""import sys
+print("Step 1: token={token}")
+sys.stderr.write("ERROR basic={expected_b64}\\n")
+sys.exit(1)
+""",
+            encoding="utf-8",
+        )
+        leak_docker_sh = os.path.join(priv_dir, "leak-docker")
+        Path(leak_docker_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{leak_docker_py}" "$@"\n', encoding="utf-8")
+        os.chmod(leak_docker_sh, 0o755)
+        svc_leak = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=leak_docker_sh,
+            git_bin=git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+        with self.assertRaises(rb.BridgeRequestError) as leak_ctx:
+            svc_leak.build_git(
+                {
+                    "slug": "priv-demo",
+                    "gitRepoUrl": "https://github.com/acme/private-demo",
+                    "gitToken": token,
+                }
+            )
+        self.assertEqual(leak_ctx.exception.status_code, 502)
+        joined = "\n".join([str(leak_ctx.exception), *leak_ctx.exception.build_log_tail])
+        self.assertNotIn(token, joined)
+        self.assertNotIn(expected_b64, joined)
+
+    def test_real_git_sends_basic_auth_header_from_git_config_global(self) -> None:
+        """
+        Verify the real system `git` binary reads our GIT_CONFIG_GLOBAL file format
+        and transmits the expected `Authorization: Basic ...` header over HTTP(S).
+        """
+        import base64
+        import shutil
+        import subprocess
+
+        git_bin = shutil.which("git")
+        if not git_bin:
+            self.skipTest("git binary not available")
+
+        token = "github_pat_11REALGIT_AUTH_TEST_9999"
+        expected_b64 = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+        captured: dict[str, str | None] = {"auth": None, "path": None}
+
+        class _GitAuthHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                captured["auth"] = self.headers.get("Authorization")
+                captured["path"] = self.path
+                # Return 401 so git stops cleanly right after sending the request
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _GitAuthHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            cfg_path = os.path.join(self.tmp, "real-git-auth.conf")
+            base_url = f"http://127.0.0.1:{port}/"
+            fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(
+                    fd,
+                    (
+                        f'[http "{base_url}"]\n'
+                        f"\textraHeader = Authorization: Basic {expected_b64}\n"
+                    ).encode("utf-8"),
+                )
+            finally:
+                os.close(fd)
+
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": self.tmp,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": cfg_path,
+            }
+            subprocess.run(
+                [git_bin, "ls-remote", f"{base_url}acme/private-demo.git"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(captured["auth"], f"Basic {expected_b64}")
+            self.assertIn("/acme/private-demo.git/info/refs", captured["path"] or "")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_static_build_strips_git_dir_and_blocks_dotfiles(self) -> None:
+        """
+        Static auto-detected deployments must strip `.git`, create a protective `.dockerignore`
+        excluding dotfiles/repo metadata, and configure Nginx to deny dotfile requests.
+        """
+        static_dir = os.path.join(self.tmp, "static-sec-test")
+        os.makedirs(static_dir, exist_ok=True)
+        docker_seen_file = os.path.join(static_dir, "docker_seen.json")
+
+        git_py = os.path.join(static_dir, "fake_static_git.py")
+        Path(git_py).write_text(
+            """import os, sys
+args = sys.argv[1:]
+if "clone" in args:
+    dst = args[-1]
+    os.makedirs(os.path.join(dst, ".git"), exist_ok=True)
+    with open(os.path.join(dst, ".git", "config"), "w", encoding="utf-8") as fh:
+        fh.write("[core]\\n")
+    with open(os.path.join(dst, "index.html"), "w", encoding="utf-8") as fh:
+        fh.write("<h1>Hello</h1>\\n")
+    with open(os.path.join(dst, ".env"), "w", encoding="utf-8") as fh:
+        fh.write("SECRET=should-not-ship\\n")
+    with open(os.path.join(dst, "README.md"), "w", encoding="utf-8") as fh:
+        fh.write("# Private Repo Notes\\n")
+    sys.exit(0)
+if "rev-parse" in args:
+    print("main" if "--abbrev-ref" in args else "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        git_sh = os.path.join(static_dir, "fake-static-git")
+        Path(git_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{git_py}" "$@"\n', encoding="utf-8")
+        os.chmod(git_sh, 0o755)
+
+        docker_py = os.path.join(static_dir, "fake_static_docker.py")
+        Path(docker_py).write_text(
+            f"""import json, os, sys
+args = sys.argv[1:]
+if args[:1] == ["build"]:
+    ctx_dir = args[-1]
+    df_path = args[args.index("-f") + 1]
+    dockerignore_path = os.path.join(ctx_dir, ".dockerignore")
+    with open({docker_seen_file!r}, "w", encoding="utf-8") as out:
+        json.dump({{
+            "hasGitDir": os.path.exists(os.path.join(ctx_dir, ".git")),
+            "dockerignore": open(dockerignore_path, "r", encoding="utf-8").read() if os.path.exists(dockerignore_path) else "",
+            "dockerfile": open(df_path, "r", encoding="utf-8").read(),
+        }}, out)
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        docker_sh = os.path.join(static_dir, "fake-static-docker")
+        Path(docker_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n', encoding="utf-8")
+        os.chmod(docker_sh, 0o755)
+
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+
+        built = svc.build_git(
+            {
+                "slug": "static-private",
+                "gitRepoUrl": "https://github.com/acme/static-site",
+                "gitToken": "github_pat_11STATIC_TEST_TOKEN_1234",
+            }
+        )
+        self.assertTrue(built["ok"])
+        self.assertEqual(built["detectedRuntime"], "static")
+        seen = json.loads(Path(docker_seen_file).read_text(encoding="utf-8"))
+        self.assertFalse(seen["hasGitDir"])
+        self.assertIn(".git", seen["dockerignore"])
+        self.assertIn(".*", seen["dockerignore"])
+        self.assertIn("**/.*", seen["dockerignore"])
+        self.assertIn("**/.*/**", seen["dockerignore"])
+        self.assertIn("!.well-known", seen["dockerignore"])
+        self.assertIn("!.well-known/**", seen["dockerignore"])
+        self.assertIn(".well-known/.*", seen["dockerignore"])
+        self.assertIn(".well-known/**/.*", seen["dockerignore"])
+        self.assertIn("README*", seen["dockerignore"])
+
+        # Execute the generated Dockerfile's `printf` command to render the real nginx config
+        # and verify its dotfile location regex against root /.well-known vs nested/hidden paths.
+        run_lines = [
+            line[len("RUN ") :].strip()
+            for line in seen["dockerfile"].splitlines()
+            if line.startswith("RUN printf ")
+        ]
+        self.assertEqual(len(run_lines), 1)
+        printf_cmd = run_lines[0].split(" > ", 1)[0]
+        rendered_conf = subprocess.run(
+            ["/bin/sh", "-c", printf_cmd],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        m = re.search(r"location\s+~\s+(\S+)\s+\{", rendered_conf)
+        self.assertIsNotNone(m, f"Expected location regex in rendered nginx config: {rendered_conf!r}")
+        deny_re = re.compile(m.group(1))
+        for allowed_path in (
+            "/index.html",
+            "/assets/v1.2/app.js",
+            "/.well-known/assetlinks.json",
+            "/.well-known/apple-app-site-association",
+            "/.well-known/acme-challenge/token123",
+        ):
+            self.assertIsNone(deny_re.search(allowed_path), f"Should allow {allowed_path}")
+        for blocked_path in (
+            "/.git/HEAD",
+            "/.env",
+            "/sub/.env",
+            "/nested/.well-known/secret.txt",
+            "/a/b/.well-known/assetlinks.json",
+            "/.well-known/.env",
+            "/.well-known/sub/.hidden",
+            "/.well-known-fake/file.txt",
+        ):
+            self.assertIsNotNone(deny_re.search(blocked_path), f"Should block {blocked_path}")
+
+        # Custom static Dockerfile that does NOT use git must still strip `.git` to prevent leaks
+        static_df_git_py = os.path.join(static_dir, "fake_static_df_git.py")
+        Path(static_df_git_py).write_text(
+            """import os, sys
+args = sys.argv[1:]
+if "clone" in args:
+    dst = args[-1]
+    os.makedirs(os.path.join(dst, ".git"), exist_ok=True)
+    with open(os.path.join(dst, ".git", "HEAD"), "w", encoding="utf-8") as fh:
+        fh.write("ref: refs/heads/main\\n")
+    with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as fh:
+        fh.write("FROM nginx:alpine\\nCOPY . /usr/share/nginx/html\\nEXPOSE 80\\n")
+    sys.exit(0)
+if "rev-parse" in args:
+    print("main" if "--abbrev-ref" in args else "cccccccccccccccccccccccccccccccccccccccc")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        static_df_git_sh = os.path.join(static_dir, "fake-static-df-git")
+        Path(static_df_git_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{static_df_git_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(static_df_git_sh, 0o755)
+        svc_static_df = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=static_df_git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+        built_static_df = svc_static_df.build_git(
+            {
+                "slug": "custom-static-df",
+                "gitRepoUrl": "https://github.com/acme/custom-static",
+                "gitToken": "github_pat_11STATIC_TEST_TOKEN_1234",
+            }
+        )
+        self.assertTrue(built_static_df["ok"])
+        self.assertFalse(built_static_df["usedAutoDockerfile"])
+        seen_static_df = json.loads(Path(docker_seen_file).read_text(encoding="utf-8"))
+        self.assertFalse(seen_static_df["hasGitDir"])
+
+        # Repository-supplied Dockerfile that explicitly copies .git / invokes git preserves `.git`
+        df_git_py = os.path.join(static_dir, "fake_df_git.py")
+        Path(df_git_py).write_text(
+            """import os, sys
+args = sys.argv[1:]
+if "clone" in args:
+    dst = args[-1]
+    os.makedirs(os.path.join(dst, ".git"), exist_ok=True)
+    with open(os.path.join(dst, ".git", "HEAD"), "w", encoding="utf-8") as fh:
+        fh.write("ref: refs/heads/main\\n")
+    with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as fh:
+        fh.write("FROM alpine:3.20\\nCOPY .git /tmp/.git\\nRUN git rev-parse --short HEAD > /version.txt\\nEXPOSE 8080\\n")
+    sys.exit(0)
+if "rev-parse" in args:
+    print("main" if "--abbrev-ref" in args else "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        df_git_sh = os.path.join(static_dir, "fake-df-git")
+        Path(df_git_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{df_git_py}" "$@"\n', encoding="utf-8")
+        os.chmod(df_git_sh, 0o755)
+        svc_df = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=df_git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+        built_df = svc_df.build_git(
+            {
+                "slug": "custom-df-version",
+                "gitRepoUrl": "https://github.com/acme/versioned-app",
+                "gitToken": "github_pat_11STATIC_TEST_TOKEN_1234",
+            }
+        )
+        self.assertTrue(built_df["ok"])
+        self.assertFalse(built_df["usedAutoDockerfile"])
+        seen_df = json.loads(Path(docker_seen_file).read_text(encoding="utf-8"))
+        self.assertTrue(seen_df["hasGitDir"])
 
 
 if __name__ == "__main__":

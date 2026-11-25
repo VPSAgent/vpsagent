@@ -22,6 +22,31 @@ export interface CompanionService {
   envKey?: string;
 }
 
+export interface GitCredentialRecord {
+  id: string;
+  provider: "github";
+  label: string;
+  accountLogin: string | null;
+  tokenHint: string;
+  isDefault: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastUsedAt: string | null;
+}
+
+export interface GithubRepoSummary {
+  fullName: string;
+  name: string;
+  owner: string;
+  private: boolean;
+  defaultBranch: string | null;
+  htmlUrl: string;
+  description: string | null;
+  updatedAt: string | null;
+  credentialId: string;
+  credentialLabel: string;
+}
+
 export interface AppRecord {
   slug: string;
   name: string;
@@ -40,6 +65,7 @@ export interface AppRecord {
   lastCommitSha: string | null;
   detectedRuntime: string | null;
   envExampleKeys: string[];
+  gitCredentialId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -89,6 +115,8 @@ export interface GitInspectResult {
   suggestedCompanions: Array<"postgres" | "redis">;
   buildPlanSummary: string;
   notes: string[];
+  usedAuth?: boolean;
+  gitCredentialId?: string | null;
 }
 
 export interface AppEnvEntry {
@@ -124,6 +152,7 @@ export interface OverviewResponse {
   apps: AppRecord[];
   pendingApprovals: number;
   activeMcpTokens: number;
+  githubConnected?: boolean;
   setup: SetupState;
 }
 
@@ -325,6 +354,7 @@ export const api = {
     gitRepoUrl: string,
     gitBranch?: string | null,
     dockerfilePath?: string,
+    gitCredentialId?: string | null,
   ) =>
     apiFetch<{ inspect: GitInspectResult }>("/api/git/inspect", {
       method: "POST",
@@ -332,8 +362,65 @@ export const api = {
         gitRepoUrl,
         ...(gitBranch ? { gitBranch } : {}),
         ...(dockerfilePath ? { dockerfilePath } : {}),
+        ...(gitCredentialId ? { gitCredentialId } : {}),
       }),
     }),
+  listGitCredentials: () =>
+    apiFetch<{ credentials: GitCredentialRecord[] }>("/api/git/credentials"),
+  createGitCredential: (body: {
+    label?: string;
+    token: string;
+    isDefault?: boolean;
+  }) =>
+    apiFetch<{
+      credential: GitCredentialRecord;
+      accountLogin: string | null;
+      accessibleRepoCount: number;
+      warning: string | null;
+    }>("/api/git/credentials", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  setDefaultGitCredential: (id: string) =>
+    apiFetch<{ ok: true; credential: GitCredentialRecord }>(
+      `/api/git/credentials/${encodeURIComponent(id)}/default`,
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+    ),
+  testGitCredential: (id: string) =>
+    apiFetch<{
+      ok: true;
+      credential: GitCredentialRecord;
+      accountLogin: string | null;
+      accessibleRepoCount: number;
+      warning: string | null;
+    }>(`/api/git/credentials/${encodeURIComponent(id)}/test`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  deleteGitCredential: (id: string) =>
+    apiFetch<{ ok: true }>(`/api/git/credentials/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
+  listGithubRepos: (options?: {
+    credentialId?: string;
+    query?: string;
+    limit?: number;
+  }) => {
+    const params = new URLSearchParams();
+    if (options?.credentialId) params.set("credentialId", options.credentialId);
+    if (options?.query) params.set("query", options.query);
+    if (options?.limit) params.set("limit", String(options.limit));
+    const qs = params.toString();
+    return apiFetch<{
+      connected: boolean;
+      repos: GithubRepoSummary[];
+      hasMore?: boolean;
+      errors: Array<{ credentialId: string; label: string; error: string }>;
+    }>(`/api/git/repos${qs ? `?${qs}` : ""}`);
+  },
   listDeployments: (slug?: string, limit = 15) =>
     apiFetch<{ deployments: DeploymentRecord[] }>(
       `/api/deployments?limit=${limit}${slug ? `&slug=${encodeURIComponent(slug)}` : ""}`,
@@ -352,6 +439,7 @@ export const api = {
       image?: string | null;
       gitRepoUrl?: string | null;
       gitBranch?: string | null;
+      gitCredentialId?: string | null;
       dockerfilePath?: string;
       domain?: string | null;
       noDomain?: boolean;
@@ -360,6 +448,7 @@ export const api = {
       memoryLimitMb: number;
       companions: CompanionService[];
       envVars: Record<string, string>;
+      createOnly?: boolean;
     },
     asyncMode = true,
   ) =>

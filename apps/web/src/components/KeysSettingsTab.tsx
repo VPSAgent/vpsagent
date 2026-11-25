@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   ArrowDownToLine,
@@ -6,16 +6,21 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  ExternalLink,
+  GitBranch,
   Globe,
   KeyRound,
+  Loader2,
   Lock,
   Plus,
   RefreshCw,
+  Star,
   Trash2,
 } from "lucide-react";
 import {
   api,
   type AppRecord,
+  type GitCredentialRecord,
   type McpConnectionTestResult,
   type McpSnippets,
   type McpTokenRecord,
@@ -27,9 +32,12 @@ import {
 interface KeysSettingsTabProps {
   tokens: McpTokenRecord[];
   apps: AppRecord[];
+  gitCredentials: GitCredentialRecord[];
   snippets: McpSnippets | null;
   setup: SetupState;
   publicIp: string | null;
+  focusSection?: "github" | null;
+  onConsumeFocusSection?: () => void;
   onRefresh: () => Promise<void>;
 }
 
@@ -72,9 +80,12 @@ const SCOPE_LABELS: Record<
 export function KeysSettingsTab({
   tokens,
   apps,
+  gitCredentials,
   snippets,
   setup,
   publicIp,
+  focusSection,
+  onConsumeFocusSection,
   onRefresh,
 }: KeysSettingsTabProps) {
   const [name, setName] = useState("");
@@ -111,6 +122,22 @@ export function KeysSettingsTab({
   const [reconnectingUpdate, setReconnectingUpdate] = useState(false);
   const [updateLoadError, setUpdateLoadError] = useState<string | null>(null);
   const [showUpdateLogs, setShowUpdateLogs] = useState(false);
+
+  const githubSectionRef = useRef<HTMLElement | null>(null);
+  const [githubToken, setGithubToken] = useState("");
+  const [githubLabel, setGithubLabel] = useState("");
+  const [githubBusy, setGithubBusy] = useState(false);
+  const [testingCredId, setTestingCredId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (focusSection === "github") {
+      githubSectionRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+      onConsumeFocusSection?.();
+    }
+  }, [focusSection, onConsumeFocusSection]);
 
   const loadUpdateStatus = useCallback(async () => {
     try {
@@ -326,6 +353,94 @@ export function KeysSettingsTab({
       );
     } finally {
       setTesting(false);
+    }
+  };
+
+  const handleAddGithubToken = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!githubToken.trim()) return;
+    setGithubBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.createGitCredential({
+        label: githubLabel.trim() || undefined,
+        token: githubToken.trim(),
+      });
+      setGithubToken("");
+      setGithubLabel("");
+      const baseMsg = `Connected ${res.accountLogin ? `@${res.accountLogin}` : "GitHub"} (${res.accessibleRepoCount} ${res.accessibleRepoCount === 1 ? "repo" : "repos"} visible).`;
+      setNotice(res.warning ? `${baseMsg} ${res.warning}` : baseMsg);
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not verify or save GitHub token.",
+      );
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
+  const handleTestGithubCred = async (id: string) => {
+    setTestingCredId(id);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.testGitCredential(id);
+      const baseMsg = `GitHub token verified${res.accountLogin ? ` for @${res.accountLogin}` : ""}: ${res.accessibleRepoCount} ${res.accessibleRepoCount === 1 ? "repo" : "repos"} accessible.`;
+      setNotice(res.warning ? `${baseMsg} ${res.warning}` : baseMsg);
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "GitHub token check failed.",
+      );
+    } finally {
+      setTestingCredId(null);
+    }
+  };
+
+  const handleSetDefaultGithubCred = async (id: string) => {
+    setGithubBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.setDefaultGitCredential(id);
+      setNotice(`Set "${res.credential.label}" as the default GitHub token.`);
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not update default GitHub token.",
+      );
+    } finally {
+      setGithubBusy(false);
+    }
+  };
+
+  const handleDeleteGithubCred = async (id: string, label: string) => {
+    if (
+      !window.confirm(
+        `Remove GitHub token "${label}"? Apps already built stay running, but future rebuilds of private repos using this token will need another token.`,
+      )
+    ) {
+      return;
+    }
+    setGithubBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.deleteGitCredential(id);
+      setNotice(`Removed GitHub token "${label}".`);
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not remove GitHub token.",
+      );
+    } finally {
+      setGithubBusy(false);
     }
   };
 
@@ -740,6 +855,185 @@ export function KeysSettingsTab({
                 </div>
               );
             })}
+          </div>
+        )}
+      </section>
+
+      {/* Private GitHub Repositories */}
+      <section
+        id="github-access"
+        ref={githubSectionRef}
+        className="surface-panel rounded-xl p-6 space-y-5"
+      >
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <GitBranch className="h-4 w-4 text-emerald-400" />
+              <h2 className="text-sm font-semibold text-white">
+                Private GitHub repositories
+              </h2>
+              {gitCredentials.length > 0 ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                  Connected ({gitCredentials.length})
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.1] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-[#9CA3AF]">
+                  Not connected
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-[#9CA3AF] leading-relaxed">
+              Connect a read-only GitHub token so you and your AI can browse and
+              deploy private GitHub repos. Your token is encrypted at rest and
+              never shown again or sent to AI chats.
+            </p>
+          </div>
+          <a
+            href="https://github.com/settings/personal-access-tokens/new"
+            target="_blank"
+            rel="noreferrer"
+            className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.12] bg-[#0C0E12] px-3 py-1.5 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] shrink-0"
+          >
+            <span>Create token on GitHub</span>
+            <ExternalLink className="h-3.5 w-3.5 text-emerald-400" />
+          </a>
+        </div>
+
+        <div className="surface-well rounded-lg px-4 py-3 text-xs text-[#D1D5DB] space-y-1">
+          <p className="font-medium text-white">
+            Quick 3-step setup on GitHub (recommended fine-grained token):
+          </p>
+          <ol className="list-decimal list-inside space-y-0.5 text-[#9CA3AF]">
+            <li>
+              Choose <strong className="text-[#E5E7EB]">Only select repositories</strong> (or All repositories).
+            </li>
+            <li>
+              Under <strong className="text-[#E5E7EB]">Repository permissions</strong>, set{" "}
+              <strong className="text-emerald-300">Contents</strong> to{" "}
+              <strong className="text-emerald-300">Read-only</strong> (Metadata is included automatically).
+            </li>
+            <li>
+              Click <strong className="text-[#E5E7EB]">Generate token</strong>, copy it, and paste it below.
+            </li>
+          </ol>
+        </div>
+
+        <form
+          onSubmit={handleAddGithubToken}
+          className="grid grid-cols-1 md:grid-cols-12 gap-3.5 items-end"
+        >
+          <div className="md:col-span-5">
+            <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              GitHub personal access token
+            </label>
+            <input
+              type="password"
+              value={githubToken}
+              onChange={(e) => setGithubToken(e.target.value)}
+              placeholder="github_pat_... or ghp_..."
+              required
+              autoComplete="off"
+              className="field-input w-full rounded-lg px-3.5 py-2 text-sm font-mono"
+            />
+          </div>
+          <div className="md:col-span-4">
+            <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              Label (optional)
+            </label>
+            <input
+              type="text"
+              value={githubLabel}
+              onChange={(e) => setGithubLabel(e.target.value)}
+              placeholder="Personal GitHub or Work Org"
+              className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
+            />
+          </div>
+          <div className="md:col-span-3">
+            <button
+              type="submit"
+              disabled={githubBusy || !githubToken.trim()}
+              className="btn-press w-full inline-flex items-center justify-center gap-1.5 rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+            >
+              {githubBusy ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Lock className="h-3.5 w-3.5" />
+              )}
+              {githubBusy ? "Verifying..." : "Verify & connect"}
+            </button>
+          </div>
+        </form>
+
+        {gitCredentials.length > 0 && (
+          <div className="divide-y divide-white/[0.06] rounded-lg border border-white/[0.08] bg-[#090A0C]">
+            {gitCredentials.map((cred) => (
+              <div
+                key={cred.id}
+                className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"
+              >
+                <div className="space-y-1 min-w-0">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium text-white">
+                      {cred.label}
+                    </span>
+                    {cred.accountLogin && (
+                      <span className="text-xs font-mono text-sky-300">
+                        @{cred.accountLogin}
+                      </span>
+                    )}
+                    {cred.isDefault && (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-300">
+                        <Star className="h-2.5 w-2.5" />
+                        Default
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs font-mono text-[#6B7280] tabular-nums">
+                    {cred.tokenHint} &middot;{" "}
+                    {cred.lastUsedAt
+                      ? `Last used ${new Date(cred.lastUsedAt).toLocaleString()}`
+                      : `Added ${new Date(cred.createdAt).toLocaleDateString()}`}
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={githubBusy || testingCredId === cred.id}
+                    onClick={() => void handleTestGithubCred(cred.id)}
+                    className="btn-press inline-flex items-center gap-1 rounded-lg border border-white/[0.1] bg-[#111317] px-2.5 py-1.5 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] disabled:opacity-50 cursor-pointer"
+                  >
+                    {testingCredId === cred.id ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Check className="h-3 w-3 text-emerald-400" />
+                    )}
+                    Test
+                  </button>
+                  {!cred.isDefault && (
+                    <button
+                      type="button"
+                      disabled={githubBusy}
+                      onClick={() => void handleSetDefaultGithubCred(cred.id)}
+                      className="btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-2.5 py-1.5 text-xs font-medium text-[#D1D5DB] hover:text-white disabled:opacity-50 cursor-pointer"
+                    >
+                      Set default
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={githubBusy}
+                    onClick={() =>
+                      void handleDeleteGithubCred(cred.id, cred.label)
+                    }
+                    className="btn-press inline-flex items-center gap-1 rounded-lg border border-rose-500/30 bg-rose-500/[0.05] px-2.5 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/15 disabled:opacity-50 cursor-pointer"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    Remove
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </section>

@@ -7,6 +7,7 @@ import {
   type RegistryStore,
   type RiskLevel,
   type RuntimeBridge,
+  RuntimeBridgeError,
   canScopeMutate,
   isSlugAllowedForToken,
   redactSecrets,
@@ -44,12 +45,13 @@ const DEFAULT_MCP_DEPLOY_GRACE_MS = 10_000;
 
 export const MCP_SERVER_INSTRUCTIONS = [
   "VPSAgent runs every app inside an isolated Locked Apartment container (no root capabilities, no Docker socket, isolated network, automatic HTTPS via Caddy).",
-  "Recommended workflow for deploying a public GitHub repo:",
-  "1. Call get_server_info to check available server resources, default apps base domain (if configured), and your pass permissions / allowed apps.",
-  "2. Call inspect_git_repo first to preview the repo's detected runtime (Dockerfile, Next.js, Vite, Node.js, Python, or static HTML), suggested port, database companion hints, and .env.example key names.",
-  "3. Call deploy_app (sourceType: 'git'). If no Dockerfile exists, VPSAgent auto-generates a safe non-root build recipe and detects the internal port automatically. If an appsBaseDomain is configured and you omit domain, VPSAgent assigns https://<slug>.<appsBaseDomain> automatically (pass noDomain: true or domain: null for a private app).",
-  "4. Long builds continue safely in the background and return status 'deploying' with a deploymentId so your tool call never times out. Poll get_deployment(deploymentId) until status is 'succeeded' or 'failed' and inspect buildLogs if anything fails.",
-  "5. Security rule for secrets: NEVER ask the user to paste secret API keys or passwords into chat if envSettingsUrl is provided. Share envSettingsUrl so the user can enter secrets directly into the encrypted VPSAgent dashboard.",
+  "Recommended workflow for deploying a public or private GitHub repo:",
+  "1. Call get_server_info to check available server resources, default apps base domain (if configured), whether private GitHub access is connected, and your pass permissions / allowed apps.",
+  "2. If deploying a private GitHub repo, call list_github_repos first to find the exact repo URL, default branch, and gitCredentialId. If githubConnected is false, share githubSettingsUrl so the owner can paste a read-only GitHub token directly into the encrypted dashboard.",
+  "3. Call inspect_git_repo first to preview the repo's detected runtime (Dockerfile, Next.js, Vite, Node.js, Python, or static HTML), suggested port, database companion hints, and .env.example key names.",
+  "4. Call deploy_app (sourceType: 'git'). If no Dockerfile exists, VPSAgent auto-generates a safe non-root build recipe and detects the internal port automatically. If an appsBaseDomain is configured and you omit domain, VPSAgent assigns https://<slug>.<appsBaseDomain> automatically (pass noDomain: true or domain: null for a private app).",
+  "5. Long builds continue safely in the background and return status 'deploying' with a deploymentId so your tool call never times out. Poll get_deployment(deploymentId) until status is 'succeeded' or 'failed' and inspect buildLogs if anything fails.",
+  "6. Security rule for secrets: NEVER ask the user to paste secret API keys, database passwords, or GitHub tokens into chat when envSettingsUrl or githubSettingsUrl is provided. Share those encrypted dashboard links instead.",
 ].join("\n");
 
 const JsonRpcRequestSchema = z.object({
@@ -81,6 +83,13 @@ const TOOL_ANNOTATIONS: Record<string, McpToolAnnotations> = {
     destructiveHint: false,
     idempotentHint: true,
     openWorldHint: false,
+  },
+  list_github_repos: {
+    title: "List Accessible GitHub Repositories",
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
   },
   list_apps: {
     title: "List Managed Apps",
@@ -288,19 +297,49 @@ const RAW_MCP_TOOLS: McpToolDefinition[] = [
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
+    name: "list_github_repos",
+    description:
+      "List public and private GitHub repositories accessible via the owner's saved GitHub access token(s) in VPSAgent (never exposes raw tokens).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "Optional text filter matching repository name or description",
+        },
+        credentialId: {
+          type: "string",
+          description:
+            "Optional saved GitHub credential ID (ghc_...) to list repos for",
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 100,
+          default: 30,
+        },
+      },
+    },
+  },
+  {
     name: "inspect_git_repo",
     description:
-      "Inspect a public HTTPS GitHub repository before deploying. Detects Dockerfile or auto-build runtime (Next.js, Vite, Node.js, Python, static HTML), suggested port, slug/name, database hints, preview domain, and .env.example key names (never values).",
+      "Inspect a public or private HTTPS GitHub repository before deploying. Automatically uses saved GitHub access tokens when needed (or an optional gitCredentialId). Detects Dockerfile or auto-build runtime (Next.js, Vite, Node.js, Python, static HTML), suggested port, slug/name, database hints, preview domain, and .env.example key names (never values).",
     inputSchema: {
       type: "object",
       properties: {
         gitRepoUrl: {
           type: "string",
-          description: "Public HTTPS GitHub repository URL",
+          description: "HTTPS GitHub repository URL (public or private)",
         },
         gitBranch: {
           type: "string",
           description: "Optional branch name (defaults to repository default branch)",
+        },
+        gitCredentialId: {
+          type: "string",
+          description:
+            "Optional saved GitHub credential ID (ghc_...) to use for private repos",
         },
         dockerfilePath: {
           type: "string",
@@ -397,7 +436,7 @@ const RAW_MCP_TOOLS: McpToolDefinition[] = [
   {
     name: "deploy_app",
     description:
-      "Deploy a prebuilt Docker image or a public HTTPS GitHub repo (with a Dockerfile OR auto-detected Next.js/Vite/Node/Python/static site) into a Locked Apartment. Long builds continue in the background and return a deploymentId to poll via get_deployment.",
+      "Deploy a prebuilt Docker image or a public/private HTTPS GitHub repo (with a Dockerfile OR auto-detected Next.js/Vite/Node/Python/static site) into a Locked Apartment. Long builds continue in the background and return a deploymentId to poll via get_deployment.",
     inputSchema: {
       type: "object",
       properties: {
@@ -407,6 +446,11 @@ const RAW_MCP_TOOLS: McpToolDefinition[] = [
         image: { type: "string" },
         gitRepoUrl: { type: "string" },
         gitBranch: { type: "string" },
+        gitCredentialId: {
+          type: "string",
+          description:
+            "Optional saved GitHub credential ID (ghc_...) to use when cloning a private GitHub repository",
+        },
         dockerfilePath: {
           type: "string",
           default: "auto",
@@ -1125,6 +1169,38 @@ function buildDeploymentsUrl(store: RegistryStore, slug: string): string {
   return base ? `${base}${hash}` : hash;
 }
 
+function buildGithubSettingsUrl(store: RegistryStore): string {
+  const base = buildDashboardBaseUrl(store);
+  const hash = "/#keys/github";
+  return base ? `${base}${hash}` : hash;
+}
+
+function normalizeGitUrlForComparison(rawUrl: string): string {
+  return rawUrl
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\.git$/i, "")
+    .toLowerCase();
+}
+
+function isRepoBoundToAllowedApp(
+  store: RegistryStore,
+  token: McpTokenRecord,
+  rawRepoUrl: string,
+): boolean {
+  const target = normalizeGitUrlForComparison(rawRepoUrl);
+  for (const allowedSlug of token.allowedSlugs) {
+    const existing = store.getApp(allowedSlug);
+    if (
+      existing?.gitRepoUrl &&
+      normalizeGitUrlForComparison(existing.gitRepoUrl) === target
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function enforceMcpBoundary(
   c: Context,
   store: RegistryStore,
@@ -1480,6 +1556,8 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             isSlugAllowedForToken(token, a.slug),
           );
           const setup = store.getSetupState();
+          const gitCredentials = store.listGitCredentials();
+          const isAppLocked = token.allowedSlugs.length > 0;
           callResult = toolOk({
             server: {
               dashboardUrl: buildDashboardBaseUrl(store),
@@ -1487,7 +1565,17 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
               httpsActive: setup.httpsActive,
               tlsStatus: setup.tlsStatus,
               publicReposSupported: true,
-              privateReposSupported: false,
+              privateReposSupported: true,
+              githubConnected: gitCredentials.length > 0,
+              githubCredentials: isAppLocked
+                ? []
+                : gitCredentials.map((c) => ({
+                    id: c.id,
+                    label: c.label,
+                    accountLogin: c.accountLogin,
+                    isDefault: c.isDefault,
+                  })),
+              githubSettingsUrl: buildGithubSettingsUrl(store),
               autoDetectedRuntimes: [
                 "dockerfile",
                 "nextjs",
@@ -1533,19 +1621,107 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           break;
         }
 
+        case "list_github_repos": {
+          if (token.allowedSlugs.length > 0) {
+            store.recordAudit({
+              actor: "agent",
+              actorTokenId: token.id,
+              action: "mcp.blocked_app_scope",
+              targetSlug: null,
+              summary: `Blocked AI pass "${token.name}" from listing GitHub repos (locked to ${token.allowedSlugs.join(", ")})`,
+              riskLevel: "high",
+            });
+            callResult = toolErr(
+              `Permission denied: visitor pass "${token.name}" is locked to [${token.allowedSlugs.join(", ")}] and cannot list the owner's GitHub repositories.`,
+            );
+            break;
+          }
+          const query =
+            typeof args.query === "string" && args.query.trim()
+              ? args.query.trim()
+              : undefined;
+          const credentialId =
+            typeof args.credentialId === "string" && args.credentialId.trim()
+              ? args.credentialId.trim()
+              : undefined;
+          const limit =
+            typeof args.limit === "number"
+              ? Math.min(Math.max(Math.trunc(args.limit), 1), 100)
+              : 30;
+          const res = await executor.listGithubRepos({
+            ...(credentialId ? { credentialId } : {}),
+            ...(query ? { query } : {}),
+            limit,
+          });
+          const githubSettingsUrl = buildGithubSettingsUrl(store);
+          if (!res.connected) {
+            callResult = toolOk({
+              connected: false,
+              repos: [],
+              githubSettingsUrl,
+              message:
+                "No GitHub access token is connected yet. Share githubSettingsUrl with the owner so they can paste a Read-only Contents token directly into the encrypted VPSAgent dashboard.",
+            });
+            break;
+          }
+          callResult = toolOk({
+            connected: true,
+            repos: res.repos,
+            hasMore: res.hasMore,
+            errors: res.errors,
+            githubSettingsUrl,
+          });
+          break;
+        }
+
         case "inspect_git_repo": {
           const parsedInput = InspectGitInputSchema.parse(args);
-          const inspected = await executor.inspectGitRepo(parsedInput);
-          callResult = toolOk({
-            ...inspected,
-            canDeployWithCurrentPass:
-              canScopeMutate(token.scope) &&
-              isSlugAllowedForToken(token, inspected.suggestedSlug),
-            secretHandlingHint:
-              inspected.envExampleKeys.length > 0
-                ? "This repository lists settings in .env.example. After deploying, share the returned envSettingsUrl with the server owner so they can enter private API keys directly in the encrypted dashboard instead of pasting secrets into chat."
-                : null,
-          });
+          const allowSavedGitCredentials =
+            token.allowedSlugs.length === 0 ||
+            isRepoBoundToAllowedApp(store, token, parsedInput.gitRepoUrl);
+          if (!allowSavedGitCredentials && parsedInput.gitCredentialId) {
+            store.recordAudit({
+              actor: "agent",
+              actorTokenId: token.id,
+              action: "mcp.blocked_app_scope",
+              targetSlug: null,
+              summary: `Blocked app-locked pass "${token.name}" from inspecting unrelated repo with saved GitHub credentials`,
+              riskLevel: "high",
+            });
+            callResult = toolErr(
+              `Permission denied: visitor pass "${token.name}" is locked to [${token.allowedSlugs.join(", ")}] and cannot use saved GitHub credentials for an unrelated repository.`,
+            );
+            break;
+          }
+          try {
+            const inspected = await executor.inspectGitRepo(parsedInput, {
+              allowSavedGitCredentials,
+            });
+            callResult = toolOk({
+              ...inspected,
+              canDeployWithCurrentPass:
+                canScopeMutate(token.scope) &&
+                isSlugAllowedForToken(token, inspected.suggestedSlug),
+              secretHandlingHint:
+                inspected.envExampleKeys.length > 0
+                  ? "This repository lists settings in .env.example. After deploying, share the returned envSettingsUrl with the server owner so they can enter private API keys directly in the encrypted dashboard instead of pasting secrets into chat."
+                  : null,
+            });
+          } catch (err) {
+            if (err instanceof RuntimeBridgeError && err.statusCode === 401) {
+              if (!allowSavedGitCredentials) {
+                callResult = toolErr(
+                  `Permission denied: visitor pass "${token.name}" is locked to [${token.allowedSlugs.join(", ")}] and cannot access unrelated private repositories using the owner's saved GitHub credentials.`,
+                );
+                break;
+              }
+              callResult = toolErr(
+                `${err.message} Connect or update a GitHub token at ${buildGithubSettingsUrl(store)}.`,
+              );
+              break;
+            }
+            throw err;
+          }
           break;
         }
 
@@ -1697,6 +1873,30 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
         case "deploy_app": {
           const input = DeployAppInputSchema.parse(args);
           const slug = validateAppSlug(input.slug);
+          let allowSavedGitCredentials = true;
+          if (token.allowedSlugs.length > 0 && input.sourceType === "git") {
+            const existingForSlug = store.getApp(slug);
+            allowSavedGitCredentials = Boolean(
+              existingForSlug?.gitRepoUrl &&
+                input.gitRepoUrl &&
+                normalizeGitUrlForComparison(existingForSlug.gitRepoUrl) ===
+                  normalizeGitUrlForComparison(input.gitRepoUrl),
+            );
+            if (!allowSavedGitCredentials && input.gitCredentialId) {
+              store.recordAudit({
+                actor: "agent",
+                actorTokenId: token.id,
+                action: "mcp.blocked_app_scope",
+                targetSlug: slug,
+                summary: `Blocked app-locked pass "${token.name}" from deploying unrelated private repo into "${slug}"`,
+                riskLevel: "high",
+              });
+              callResult = toolErr(
+                `Permission denied: visitor pass "${token.name}" is locked to [${token.allowedSlugs.join(", ")}] and cannot deploy an unrelated private repository using the owner's saved GitHub credentials.`,
+              );
+              break;
+            }
+          }
           callResult = await handleMutation(token, {
             action: "deploy_app",
             targetSlug: slug,
@@ -1708,6 +1908,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
                 actorTokenId: token.id,
                 waitMs: deployGraceMs,
                 throwOnImmediateFailure: true,
+                allowSavedGitCredentials,
               });
               if (!started.done) {
                 return {

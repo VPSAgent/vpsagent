@@ -35,7 +35,7 @@ const RESERVED_SLUGS = new Set([
 ]);
 
 const ENV_OR_YAML_SECRET_PATTERN =
-  /\b([A-Za-z0-9_]*(?:key|token|secret|password|passwd|pass|passphrase|credential|auth)[A-Za-z0-9_]*)\s*([:=])\s*("[^"]*"|'[^']*'|[^\s,;]+)/gi;
+  /\b([A-Za-z0-9_]*(?:key|token|secret|password|passwd|pass|passphrase|credential|auth)[A-Za-z0-9_]*)\s*([:=])\s*(?!\[REDACTED\]@)("[^"]*"|'[^']*'|[^\s,;]+)/gi;
 const JSON_SECRET_PATTERN =
   /"([A-Za-z0-9_]*(?:key|token|secret|password|passwd|pass|passphrase|credential|auth)[A-Za-z0-9_]*)"\s*:\s*"([^"]*)"/gi;
 const AUTH_HEADER_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi;
@@ -43,6 +43,9 @@ const KNOWN_TOKEN_PREFIX_PATTERN =
   /\b(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|vpsmcp_[A-Za-z0-9_-]{16,}|\d{6,12}:AA[A-Za-z0-9_-]{25,})\b/g;
 const PEM_KEY_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+const URL_CREDENTIALS_PATTERN = /\b(https?:\/\/)([^:@\s/]+):([^@\s/]+)@/gi;
+const GIT_TOKEN_PATTERN = /^[A-Za-z0-9_.-]{8,512}$/;
+const GITHUB_OWNER_REPO_SEGMENT = /^[A-Za-z0-9._-]+$/;
 
 const BLOCKED_METADATA_HOSTS = new Set([
   "169.254.169.254",
@@ -52,7 +55,7 @@ const BLOCKED_METADATA_HOSTS = new Set([
 ]);
 
 const SENSITIVE_FIELD_KEY_PATTERN =
-  /^(?:.*(?:secret|password|passwd|passphrase|credential|private[_-]?key|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|bot[_-]?token|bearer[_-]?token|session[_-]?token|authorization|database_url|redis_url)|token)$/i;
+  /^(?:.*(?:secret|password|passwd|passphrase|credential|private[_-]?key|api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|bot[_-]?token|bearer[_-]?token|session[_-]?token|git[_-]?token|github[_-]?token|authorization|database_url|redis_url)|token)$/i;
 
 /**
  * Validates that an application slug is safe for folder names,
@@ -600,12 +603,96 @@ export async function validateGitRepoUrl(
 }
 
 /**
- * Redacts common secret patterns (env/YAML/JSON keys, auth headers, bearer tokens
+ * Returns true strictly for credential-free `https://github.com` URLs on default HTTPS port 443.
+ */
+export function isGithubHttpsRepoUrl(rawUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== "https:") {
+    return false;
+  }
+  if (parsed.username || parsed.password) {
+    return false;
+  }
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, "");
+  if (host !== "github.com") {
+    return false;
+  }
+  return parsed.port === "" || parsed.port === "443";
+}
+
+/**
+ * Extracts `{ owner, repo }` from a valid `https://github.com/<owner>/<repo>` URL, or returns null.
+ */
+export function parseGithubRepoOwnerAndName(
+  rawUrl: string,
+): { owner: string; repo: string } | null {
+  if (!isGithubHttpsRepoUrl(rawUrl)) {
+    return null;
+  }
+  const parsed = new URL(rawUrl.trim());
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (segments.length < 2) {
+    return null;
+  }
+  const owner = segments[0]!;
+  let repo = segments[1]!;
+  if (repo.toLowerCase().endsWith(".git")) {
+    repo = repo.slice(0, -4);
+  }
+  if (
+    !owner ||
+    !repo ||
+    !GITHUB_OWNER_REPO_SEGMENT.test(owner) ||
+    !GITHUB_OWNER_REPO_SEGMENT.test(repo)
+  ) {
+    return null;
+  }
+  return { owner, repo };
+}
+
+/**
+ * Validates a GitHub Personal Access Token (blocks whitespace, newlines, quotes, colons,
+ * brackets, and control characters so tokens can never inject Git config directives).
+ */
+export function validateGitAccessToken(rawToken: string): string {
+  const trimmed = rawToken.trim();
+  if (!GIT_TOKEN_PATTERN.test(trimmed)) {
+    throw new Error(
+      "Invalid GitHub access token format: expected 8-512 characters using letters, numbers, '_', '-', or '.'.",
+    );
+  }
+  return trimmed;
+}
+
+/**
+ * Formats a safe display hint for a stored GitHub token without exposing the secret.
+ */
+export function formatGitTokenHint(rawToken: string): string {
+  const trimmed = rawToken.trim();
+  const last4 = trimmed.slice(-4);
+  if (trimmed.startsWith("github_pat_")) {
+    return `github_pat_••••${last4}`;
+  }
+  const classicMatch = trimmed.match(/^(gh[pousr]_)/);
+  if (classicMatch) {
+    return `${classicMatch[1]}••••${last4}`;
+  }
+  return `••••${last4}`;
+}
+
+/**
+ * Redacts common secret patterns (env/YAML/JSON keys, auth headers, URL credentials, bearer tokens
  * including `vpsmcp_*`, and PEM private key blocks) before logging or returning to clients.
  */
 export function redactSecrets(input: string): string {
   return input
     .replace(PEM_KEY_PATTERN, "[REDACTED_PRIVATE_KEY]")
+    .replace(URL_CREDENTIALS_PATTERN, "$1$2:[REDACTED]@")
     .replace(AUTH_HEADER_PATTERN, "$1 [REDACTED]")
     .replace(JSON_SECRET_PATTERN, '"$1":"[REDACTED]"')
     .replace(
@@ -614,6 +701,28 @@ export function redactSecrets(input: string): string {
         `${key}${sep}${sep === ":" ? " " : ""}[REDACTED]`,
     )
     .replace(KNOWN_TOKEN_PREFIX_PATTERN, "[REDACTED]");
+}
+
+/**
+ * Redacts standard secret patterns AND any exact occurrences of a specific raw token
+ * or its HTTP Basic base64 (`x-access-token:<token>`) representation.
+ */
+export function scrubTokenFromText(
+  text: string,
+  token?: string | null,
+): string {
+  let out = redactSecrets(text);
+  const clean = token?.trim();
+  if (clean) {
+    out = out.split(clean).join("[REDACTED]");
+    const basicB64 = Buffer.from(`x-access-token:${clean}`, "utf8").toString(
+      "base64",
+    );
+    if (basicB64) {
+      out = out.split(basicB64).join("[REDACTED]");
+    }
+  }
+  return out;
 }
 
 /**

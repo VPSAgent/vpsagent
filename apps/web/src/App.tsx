@@ -12,6 +12,7 @@ import {
   api,
   type ApprovalRequest,
   type AuditEvent,
+  type GitCredentialRecord,
   type InspectResult,
   type McpSnippets,
   type McpTokenRecord,
@@ -45,17 +46,33 @@ function parseAppDeepLink(hash: string): AppDeepLink | null {
   };
 }
 
+function isGithubKeysDeepLink(hash: string): boolean {
+  return /^#?\/?keys\/github$/i.test(hash.trim());
+}
+
 export function App() {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [connectError, setConnectError] = useState<string | null>(null);
-  const [tab, setTab] = useState<TabId>("overview");
+  const [tab, setTab] = useState<TabId>(() => {
+    if (typeof window !== "undefined") {
+      if (isGithubKeysDeepLink(window.location.hash)) return "keys";
+      if (parseAppDeepLink(window.location.hash)) return "apps";
+    }
+    return "overview";
+  });
   const [deepLink, setDeepLink] = useState<AppDeepLink | null>(() =>
     typeof window !== "undefined" ? parseAppDeepLink(window.location.hash) : null,
+  );
+  const [keysFocusSection, setKeysFocusSection] = useState<"github" | null>(() =>
+    typeof window !== "undefined" && isGithubKeysDeepLink(window.location.hash)
+      ? "github"
+      : null,
   );
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [tokens, setTokens] = useState<McpTokenRecord[]>([]);
+  const [gitCredentials, setGitCredentials] = useState<GitCredentialRecord[]>([]);
   const [snippets, setSnippets] = useState<McpSnippets | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -65,6 +82,11 @@ export function App() {
       if (parsed) {
         setTab("apps");
         setDeepLink(parsed);
+        return;
+      }
+      if (isGithubKeysDeepLink(window.location.hash)) {
+        setTab("keys");
+        setKeysFocusSection("github");
       }
     };
     syncFromHash();
@@ -79,18 +101,20 @@ export function App() {
       const sess = await api.getSession();
       setSession(sess);
       if (sess.claimed && sess.authenticated) {
-        const [ov, appr, aud, toks, snips] = await Promise.all([
+        const [ov, appr, aud, toks, snips, gitCreds] = await Promise.all([
           api.getOverview(),
           api.listApprovals(),
           api.listAudit(auditQuery),
           api.listTokens(),
           api.getSnippets(),
+          api.listGitCredentials(),
         ]);
         setOverview(ov);
         setApprovals(appr.approvals);
         setAuditEvents(aud.events);
         setTokens(toks.tokens);
         setSnippets(snips);
+        setGitCredentials(gitCreds.credentials);
       }
     } catch (err) {
       setConnectError(
@@ -306,8 +330,13 @@ export function App() {
           <AppsTab
             apps={overview?.apps ?? []}
             appsBaseDomain={session.setup.appsBaseDomain}
+            gitCredentials={gitCredentials}
             deepLink={deepLink}
             onConsumeDeepLink={() => setDeepLink(null)}
+            onOpenGithubSettings={() => {
+              setKeysFocusSection("github");
+              setTab("keys");
+            }}
             onRefresh={() => loadAll()}
             onInspectSync={handleInspectSync}
           />
@@ -327,9 +356,12 @@ export function App() {
           <KeysSettingsTab
             tokens={tokens}
             apps={overview?.apps ?? []}
+            gitCredentials={gitCredentials}
             snippets={snippets}
             setup={session.setup}
             publicIp={session.publicIp}
+            focusSection={keysFocusSection}
+            onConsumeFocusSection={() => setKeysFocusSection(null)}
             onRefresh={() => loadAll()}
           />
         )}
