@@ -1524,6 +1524,19 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       expect(authUpdateBody.status.state).toBe("idle");
       expect(typeof authUpdateBody.status.canUpdate).toBe("boolean");
 
+      // Sibling-site / cross-origin POST to /api/system/update/apply must be blocked (CSRF)
+      const siblingApplyRes = await app.request("/api/system/update/apply", {
+        method: "POST",
+        headers: {
+          cookie: cookieHeader,
+          host: "localhost:3002",
+          origin: "https://evil-app.example.com",
+          "sec-fetch-site": "same-site",
+          "content-type": "application/json",
+        },
+      });
+      expect(siblingApplyRes.status).toBe(403);
+
       // 12. Bootstrap invariants: zero docker.sock, VPSAgent/vpsagent repo URL, no plaintext public claim URL
       const coreCompose = fs.readFileSync(
         path.join(REPO_ROOT, "bootstrap", "docker-compose.core.yml"),

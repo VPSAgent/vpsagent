@@ -31,6 +31,10 @@ import ipaddress
 import json
 import os
 import platform
+try:
+    import pwd
+except ImportError:  # pragma: no cover - non-POSIX
+    pwd = None  # type: ignore[assignment]
 import re
 import select
 import shutil
@@ -4742,6 +4746,60 @@ class RuntimeService:
             return None
         return None
 
+    def _run_repo_git(
+        self,
+        repo_dir: str,
+        git_args: list[str],
+        *,
+        timeout: float = 30,
+    ) -> subprocess.CompletedProcess[str]:
+        """
+        Runs Git inside `repo_dir`. When the bridge runs as root on a user-owned
+        checkout (e.g. `/home/ubuntu/vpsagent`), drops privileges to the checkout
+        owner so Git trusts the repository, uses the owner's SSH/Git credentials,
+        and never parses user-controlled `.git/config` as root.
+        """
+        extra_env: dict[str, str] = {"GIT_TERMINAL_PROMPT": "0"}
+        run_kwargs: dict[str, Any] = {}
+        try:
+            st = os.stat(repo_dir)
+            if (
+                pwd is not None
+                and hasattr(os, "geteuid")
+                and os.geteuid() == 0
+                and st.st_uid != 0
+            ):
+                pw = pwd.getpwuid(st.st_uid)
+                extra_env["HOME"] = pw.pw_dir
+                extra_env["USER"] = pw.pw_name
+                extra_env["LOGNAME"] = pw.pw_name
+                run_kwargs["user"] = st.st_uid
+                run_kwargs["group"] = st.st_gid
+        except (OSError, KeyError):
+            pass
+
+        cmd = [self.git_bin, "-C", repo_dir, *git_args]
+        try:
+            return subprocess.run(
+                cmd,
+                shell=False,
+                env=_sanitized_subprocess_env(extra_env),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout,
+                **run_kwargs,
+            )
+        except FileNotFoundError as exc:
+            raise BridgeRequestError(
+                503, f"git CLI binary not found ({self.git_bin})."
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise BridgeRequestError(
+                504, f"git command timed out after {int(timeout)}s."
+            ) from exc
+
     def _inspect_core_repo(self) -> dict[str, Any]:
         repo_dir = self.repo_dir
         if not repo_dir or not os.path.isdir(repo_dir):
@@ -4753,6 +4811,7 @@ class RuntimeService:
                 "currentVersion": None,
                 "currentCommit": None,
                 "dirtyWorkingTree": False,
+                "divergedBranch": False,
             }
         git_dir = os.path.join(repo_dir, ".git")
         if not os.path.exists(git_dir):
@@ -4764,24 +4823,29 @@ class RuntimeService:
                 "currentVersion": self._read_repo_package_version(repo_dir),
                 "currentCommit": None,
                 "dirtyWorkingTree": False,
+                "divergedBranch": False,
             }
 
         version = self._read_repo_package_version(repo_dir)
-        head_proc = self._run_cmd(
-            [self.git_bin, "-C", repo_dir, "rev-parse", "HEAD"],
-            label="git",
-            timeout=10,
-            check=False,
-        )
+        head_proc = self._run_repo_git(repo_dir, ["rev-parse", "HEAD"], timeout=10)
+        head_err = (head_proc.stderr or "").strip()
+        if head_proc.returncode != 0 and "dubious ownership" in head_err.lower():
+            return {
+                "canUpdate": False,
+                "unavailableReason": "Git refused access to the VPSAgent folder due to directory ownership mismatch.",
+                "repoDir": repo_dir,
+                "branch": None,
+                "currentVersion": version,
+                "currentCommit": None,
+                "dirtyWorkingTree": False,
+                "divergedBranch": False,
+            }
         current_commit = (
             (head_proc.stdout or "").strip() if head_proc.returncode == 0 else None
         ) or None
 
-        branch_proc = self._run_cmd(
-            [self.git_bin, "-C", repo_dir, "rev-parse", "--abbrev-ref", "HEAD"],
-            label="git",
-            timeout=10,
-            check=False,
+        branch_proc = self._run_repo_git(
+            repo_dir, ["rev-parse", "--abbrev-ref", "HEAD"], timeout=10
         )
         raw_branch = (
             (branch_proc.stdout or "").strip() if branch_proc.returncode == 0 else ""
@@ -4791,44 +4855,73 @@ class RuntimeService:
         else:
             branch = raw_branch
 
-        status_proc = self._run_cmd(
-            [self.git_bin, "-C", repo_dir, "status", "--porcelain"],
-            label="git",
-            timeout=10,
-            check=False,
+        status_proc = self._run_repo_git(
+            repo_dir, ["status", "--porcelain"], timeout=10
         )
-        dirty = bool((status_proc.stdout or "").strip()) if status_proc.returncode == 0 else False
+        dirty = (
+            bool((status_proc.stdout or "").strip())
+            if status_proc.returncode == 0
+            else False
+        )
 
-        remote_proc = self._run_cmd(
-            [self.git_bin, "-C", repo_dir, "remote", "get-url", "origin"],
-            label="git",
-            timeout=10,
-            check=False,
+        remote_proc = self._run_repo_git(
+            repo_dir, ["remote", "get-url", "origin"], timeout=10
         )
         if remote_proc.returncode != 0 or not (remote_proc.stdout or "").strip():
+            remote_err = (remote_proc.stderr or "").strip()
+            if "dubious ownership" in remote_err.lower():
+                reason = "Git refused access to the VPSAgent folder due to directory ownership mismatch."
+            elif "permission denied" in remote_err.lower():
+                reason = "Permission denied while inspecting the VPSAgent Git repository."
+            else:
+                reason = "No 'origin' Git remote is configured for VPSAgent."
             return {
                 "canUpdate": False,
-                "unavailableReason": "No 'origin' Git remote is configured for VPSAgent.",
+                "unavailableReason": reason,
                 "repoDir": repo_dir,
                 "branch": branch,
                 "currentVersion": version,
                 "currentCommit": current_commit,
                 "dirtyWorkingTree": dirty,
+                "divergedBranch": False,
             }
 
-        unavailable_reason = (
-            "Local edits exist in the VPSAgent source folder. Clean or commit them before updating."
-            if dirty
-            else None
-        )
+        diverged = False
+        if current_commit:
+            remote_ref = f"origin/{branch}"
+            ref_exists = self._run_repo_git(
+                repo_dir, ["rev-parse", "--verify", remote_ref], timeout=10
+            )
+            if ref_exists.returncode == 0:
+                anc_proc = self._run_repo_git(
+                    repo_dir,
+                    ["merge-base", "--is-ancestor", "HEAD", remote_ref],
+                    timeout=10,
+                )
+                if anc_proc.returncode == 1:
+                    diverged = True
+
+        if dirty:
+            unavailable_reason: str | None = (
+                "Local edits exist in the VPSAgent source folder. Clean or commit them before updating."
+            )
+        elif diverged:
+            unavailable_reason = (
+                f"Local commits on '{branch}' have diverged from origin/{branch}. "
+                "Reconcile the branch before using one-click updates."
+            )
+        else:
+            unavailable_reason = None
+
         return {
-            "canUpdate": not dirty,
+            "canUpdate": not dirty and not diverged,
             "unavailableReason": unavailable_reason,
             "repoDir": repo_dir,
             "branch": branch,
             "currentVersion": version,
             "currentCommit": current_commit,
             "dirtyWorkingTree": dirty,
+            "divergedBranch": diverged,
         }
 
     def _build_update_status_response(
@@ -4873,11 +4966,8 @@ class RuntimeService:
         if check_remote and not is_updating and repo_info["repoDir"] and repo_info["branch"]:
             repo_dir = repo_info["repoDir"]
             branch = repo_info["branch"]
-            fetch_proc = self._run_cmd(
-                [self.git_bin, "-C", repo_dir, "fetch", "--prune", "origin", branch],
-                label="git",
-                timeout=45,
-                check=False,
+            fetch_proc = self._run_repo_git(
+                repo_dir, ["fetch", "--prune", "origin", branch], timeout=45
             )
             if fetch_proc.returncode != 0:
                 detail = (
@@ -4888,12 +4978,12 @@ class RuntimeService:
                     f"Could not check for updates: {redact_secrets(detail)}",
                 )
 
+            # Re-inspect after fetch so diverged-branch status reflects the latest origin/<branch>
+            repo_info = self._inspect_core_repo()
+
             remote_ref = f"origin/{branch}"
-            latest_proc = self._run_cmd(
-                [self.git_bin, "-C", repo_dir, "rev-parse", remote_ref],
-                label="git",
-                timeout=10,
-                check=False,
+            latest_proc = self._run_repo_git(
+                repo_dir, ["rev-parse", remote_ref], timeout=10
             )
             latest_commit = (
                 (latest_proc.stdout or "").strip()
@@ -4901,19 +4991,8 @@ class RuntimeService:
                 else None
             ) or None
 
-            meta_proc = self._run_cmd(
-                [
-                    self.git_bin,
-                    "-C",
-                    repo_dir,
-                    "show",
-                    "-s",
-                    "--format=%s%n%cI",
-                    remote_ref,
-                ],
-                label="git",
-                timeout=10,
-                check=False,
+            meta_proc = self._run_repo_git(
+                repo_dir, ["show", "-s", "--format=%s%n%cI", remote_ref], timeout=10
             )
             latest_subject: str | None = None
             latest_date: str | None = None
@@ -4926,18 +5005,10 @@ class RuntimeService:
 
             commits_behind = 0
             if repo_info["currentCommit"] and latest_commit:
-                count_proc = self._run_cmd(
-                    [
-                        self.git_bin,
-                        "-C",
-                        repo_dir,
-                        "rev-list",
-                        "--count",
-                        f"HEAD..{remote_ref}",
-                    ],
-                    label="git",
+                count_proc = self._run_repo_git(
+                    repo_dir,
+                    ["rev-list", "--count", f"HEAD..{remote_ref}"],
                     timeout=10,
-                    check=False,
                 )
                 if count_proc.returncode == 0:
                     try:
@@ -4947,8 +5018,10 @@ class RuntimeService:
                     except ValueError:
                         commits_behind = 0
 
+            can_fast_forward = not repo_info.get("divergedBranch", False)
             update_available = bool(
-                latest_commit
+                can_fast_forward
+                and latest_commit
                 and repo_info["currentCommit"]
                 and latest_commit != repo_info["currentCommit"]
                 and commits_behind > 0
@@ -4963,11 +5036,14 @@ class RuntimeService:
                     self._update_state["commitsBehind"] = commits_behind
                     self._update_state["updateAvailable"] = update_available
                     if self._update_state.get("state") in ("idle", "succeeded", "failed"):
-                        self._update_state["message"] = (
-                            f"{commits_behind} new update{'s' if commits_behind != 1 else ''} ready to install."
-                            if update_available
-                            else "VPSAgent is up to date."
-                        )
+                        if not can_fast_forward:
+                            self._update_state["message"] = repo_info["unavailableReason"]
+                        elif update_available:
+                            self._update_state["message"] = (
+                                f"{commits_behind} new update{'s' if commits_behind != 1 else ''} ready to install."
+                            )
+                        else:
+                            self._update_state["message"] = "VPSAgent is up to date."
                     self._persist_update_state(self._update_state)
                 snapshot = dict(self._update_state)
 
@@ -5030,57 +5106,61 @@ class RuntimeService:
 
     def _run_core_update_worker(self, repo_dir: str, branch: str) -> None:
         bridge_changed = False
+        prev_commit: str | None = None
+        merged_new_commit = False
         try:
+            # Record current HEAD so we can roll back cleanly if Docker build fails
+            prev_proc = self._run_repo_git(repo_dir, ["rev-parse", "HEAD"], timeout=10)
+            if prev_proc.returncode == 0 and (prev_proc.stdout or "").strip():
+                prev_commit = (prev_proc.stdout or "").strip()
+
             # Step 1: Fetch and fast-forward checkout
             self._append_update_log(
                 f"Fetching origin/{branch}...",
                 phase="fetching",
                 message="Downloading the latest VPSAgent code...",
             )
-            fetch_proc = self._run_cmd(
-                [self.git_bin, "-C", repo_dir, "fetch", "--prune", "origin", branch],
-                label="git",
-                timeout=60,
-                check=False,
+            fetch_proc = self._run_repo_git(
+                repo_dir, ["fetch", "--prune", "origin", branch], timeout=60
             )
             if fetch_proc.returncode != 0:
                 detail = (fetch_proc.stderr or fetch_proc.stdout or "git fetch failed").strip()
                 raise RuntimeError(f"Could not download updates from Git: {detail}")
 
-            status_proc = self._run_cmd(
-                [self.git_bin, "-C", repo_dir, "status", "--porcelain"],
-                label="git",
-                timeout=10,
-                check=False,
+            status_proc = self._run_repo_git(
+                repo_dir, ["status", "--porcelain"], timeout=10
             )
             if status_proc.returncode == 0 and (status_proc.stdout or "").strip():
                 raise RuntimeError(
                     "Local edits exist in the VPSAgent source folder. Clean or commit them before updating."
                 )
 
-            merge_proc = self._run_cmd(
-                [
-                    self.git_bin,
-                    "-C",
-                    repo_dir,
-                    "merge",
-                    "--ff-only",
-                    f"origin/{branch}",
-                ],
-                label="git",
-                timeout=30,
-                check=False,
+            merge_proc = self._run_repo_git(
+                repo_dir, ["merge", "--ff-only", f"origin/{branch}"], timeout=30
             )
             if merge_proc.returncode != 0:
                 detail = (merge_proc.stderr or merge_proc.stdout or "git merge failed").strip()
                 raise RuntimeError(
                     f"Could not fast-forward VPSAgent cleanly: {detail}"
                 )
+            after_merge_proc = self._run_repo_git(
+                repo_dir, ["rev-parse", "HEAD"], timeout=10
+            )
+            after_commit = (
+                (after_merge_proc.stdout or "").strip()
+                if after_merge_proc.returncode == 0
+                else None
+            )
+            merged_new_commit = bool(
+                prev_commit and after_commit and after_commit != prev_commit
+            )
             for line in ((merge_proc.stdout or "") + "\n" + (merge_proc.stderr or "")).splitlines():
                 if line.strip():
                     self._append_update_log(line)
 
-            # Step 2: Sync bootstrap configs into VPSAGENT_ROOT
+            # Step 2: Sync core bootstrap configs into VPSAGENT_ROOT
+            # Note: Never overwrite caddy/apps.d/00-default.caddy during updates so an app
+            # with slug "00-default" never loses its live HTTPS route.
             self._append_update_log(
                 "Syncing VPSAgent configuration files...",
                 phase="syncing",
@@ -5091,21 +5171,11 @@ class RuntimeService:
             compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
             caddyfile_src = os.path.join(bootstrap_dir, "Caddyfile")
             caddyfile_dst = os.path.join(self.vpsagent_root, "Caddyfile")
-            default_app_caddy_src = os.path.join(
-                bootstrap_dir, "caddy", "apps.d", "00-default.caddy"
-            )
-            default_app_caddy_dst = os.path.join(
-                self.vpsagent_root, "caddy", "apps.d", "00-default.caddy"
-            )
 
             if os.path.isfile(caddyfile_src) and os.path.isdir(self.vpsagent_root):
                 shutil.copyfile(caddyfile_src, caddyfile_dst)
             if os.path.isfile(compose_src) and os.path.isdir(self.vpsagent_root):
                 shutil.copyfile(compose_src, compose_dst)
-            if os.path.isfile(default_app_caddy_src) and os.path.isdir(
-                os.path.dirname(default_app_caddy_dst)
-            ):
-                shutil.copyfile(default_app_caddy_src, default_app_caddy_dst)
 
             # Step 3: Rebuild and restart vpsagent-core stack
             env_file = os.path.join(self.vpsagent_root, ".env")
@@ -5231,8 +5301,21 @@ class RuntimeService:
                     pass
         except Exception as exc:
             err_text = redact_secrets(str(exc))
+            rollback_note: str | None = None
+            if merged_new_commit and prev_commit:
+                try:
+                    rb_proc = self._run_repo_git(
+                        repo_dir, ["reset", "--hard", prev_commit], timeout=20
+                    )
+                    if rb_proc.returncode == 0:
+                        rollback_note = f"Rolled source checkout back to running commit {prev_commit[:7]}."
+                except Exception:
+                    pass
             finished_iso = datetime.now(timezone.utc).isoformat()
             with self._update_lock:
+                extra_logs = [f"ERROR: {err_text}"]
+                if rollback_note:
+                    extra_logs.append(rollback_note)
                 self._update_state = {
                     **self._update_state,
                     "state": "failed",
@@ -5241,8 +5324,7 @@ class RuntimeService:
                     "error": err_text,
                     "message": "VPSAgent update failed.",
                     "logs": (
-                        list(self._update_state.get("logs") or [])
-                        + [f"ERROR: {err_text}"]
+                        list(self._update_state.get("logs") or []) + extra_logs
                     )[-MAX_BUILD_LOG_LINES:],
                 }
                 self._persist_update_state(self._update_state)

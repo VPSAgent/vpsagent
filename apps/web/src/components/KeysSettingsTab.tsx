@@ -109,6 +109,7 @@ export function KeysSettingsTab({
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [startingUpdate, setStartingUpdate] = useState(false);
   const [reconnectingUpdate, setReconnectingUpdate] = useState(false);
+  const [updateLoadError, setUpdateLoadError] = useState<string | null>(null);
   const [showUpdateLogs, setShowUpdateLogs] = useState(false);
 
   const loadUpdateStatus = useCallback(async () => {
@@ -116,8 +117,14 @@ export function KeysSettingsTab({
       const res = await api.getSystemUpdateStatus();
       setUpdateStatus(res.status);
       setReconnectingUpdate(false);
-    } catch {
-      // Keep previous status if the server is restarting mid-update
+      setUpdateLoadError(null);
+    } catch (err) {
+      // Keep previous status if the server is restarting mid-update; otherwise surface why updates are unavailable
+      setUpdateLoadError(
+        err instanceof Error
+          ? err.message
+          : "Could not load VPSAgent update status from the server.",
+      );
     } finally {
       setUpdateLoading(false);
     }
@@ -856,6 +863,7 @@ export function KeysSettingsTab({
                   </span>
                 )}
               {updateStatus?.state !== "updating" &&
+                updateStatus?.state !== "failed" &&
                 updateStatus?.checkedAt &&
                 !updateStatus.updateAvailable &&
                 updateStatus.canUpdate && (
@@ -984,6 +992,12 @@ export function KeysSettingsTab({
               {updateStatus.unavailableReason}
             </p>
           )}
+
+        {!updateLoading && !updateStatus && updateLoadError && (
+          <p className="text-xs text-amber-300">
+            Could not check update availability: {updateLoadError}
+          </p>
+        )}
 
         {updateStatus && updateStatus.logs.length > 0 && (
           <div className="space-y-2">

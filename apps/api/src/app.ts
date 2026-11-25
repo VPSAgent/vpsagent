@@ -956,15 +956,61 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
 
   // ---------------------------------------------------------------------------
-  // VPSAgent Self-Update (Owner-only)
+  // VPSAgent Self-Update (Owner-only + strict same-origin CSRF guard)
   // ---------------------------------------------------------------------------
+
+  const assertSameOriginPost = (
+    c: Parameters<Parameters<typeof app.use>[1]>[0],
+  ): Response | null => {
+    const fetchSite = c.req.header("sec-fetch-site")?.trim().toLowerCase();
+    if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+      return c.json(
+        { error: "Cross-origin or sibling-site update request blocked." },
+        403,
+      );
+    }
+    const origin = c.req.header("origin")?.trim();
+    if (origin) {
+      let parsedOrigin: URL;
+      try {
+        parsedOrigin = new URL(origin);
+      } catch {
+        return c.json({ error: "Invalid Origin header." }, 403);
+      }
+      const expectedHost = (getRequestHost(c, trustProxy) || "").toLowerCase();
+      if (!expectedHost || parsedOrigin.host.toLowerCase() !== expectedHost) {
+        return c.json(
+          { error: "Cross-origin update request blocked." },
+          403,
+        );
+      }
+      const expectedProto = getRequestProtocol(c, trustProxy);
+      if (
+        expectedProto === "https" &&
+        parsedOrigin.protocol.toLowerCase() !== "https:"
+      ) {
+        return c.json(
+          { error: "HTTPS Origin is required for update requests." },
+          403,
+        );
+      }
+    }
+    const contentType = (c.req.header("content-type") || "").toLowerCase();
+    if (!contentType.includes("application/json")) {
+      return c.json(
+        { error: "Content-Type: application/json is required." },
+        415,
+      );
+    }
+    return null;
+  };
 
   const unavailableUpdateStatus = {
     state: "idle" as const,
     phase: null,
     canUpdate: false,
     unavailableReason:
-      "Automatic updates are not supported by the connected runtime bridge.",
+      "The host Runtime Bridge needs a one-time update before dashboard updates can run. Re-run the installer once on your server.",
     repoDir: null,
     branch: null,
     currentVersion: null,
@@ -991,12 +1037,19 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       const status = await bridge.getCoreUpdateStatus();
       return c.json({ status });
     } catch (err) {
+      if (err instanceof RuntimeBridgeError && err.statusCode === 404) {
+        return c.json({ status: unavailableUpdateStatus });
+      }
       const { status, error } = handleError(err);
       return c.json({ error }, status);
     }
   });
 
   app.post("/api/system/update/check", async (c) => {
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
     try {
       if (!bridge.checkCoreUpdate) {
         return c.json({ status: unavailableUpdateStatus });
@@ -1004,12 +1057,19 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       const status = await bridge.checkCoreUpdate();
       return c.json({ status });
     } catch (err) {
+      if (err instanceof RuntimeBridgeError && err.statusCode === 404) {
+        return c.json({ status: unavailableUpdateStatus });
+      }
       const { status, error } = handleError(err);
       return c.json({ error }, status);
     }
   });
 
   app.post("/api/system/update/apply", async (c) => {
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
     try {
       if (!bridge.applyCoreUpdate) {
         return c.json(
@@ -1028,6 +1088,12 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       });
       return c.json(result, 202);
     } catch (err) {
+      if (err instanceof RuntimeBridgeError && err.statusCode === 404) {
+        return c.json(
+          { error: unavailableUpdateStatus.unavailableReason },
+          501,
+        );
+      }
       const { status, error } = handleError(err);
       return c.json({ error }, status);
     }

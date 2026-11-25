@@ -1334,6 +1334,12 @@ sys.exit(0)
         Path(os.path.join(vpsagent_root, "runtime-bridge.py")).write_text(
             "# bridge v1\n", encoding="utf-8"
         )
+        # Seed a live per-app route for slug "00-default" to ensure updates never overwrite it
+        app_default_route = os.path.join(vpsagent_root, "caddy", "apps.d", "00-default.caddy")
+        Path(app_default_route).write_text(
+            "default.example.com {\n  reverse_proxy vpsagent-app-00-default:8080\n}\n",
+            encoding="utf-8",
+        )
 
         # Push a newer commit to remote
         Path(os.path.join(work_dir, "package.json")).write_text(
@@ -1352,13 +1358,17 @@ sys.exit(0)
         subprocess.run(["git", "-C", work_dir, "push", "origin", "main"], check=True, env=git_env)
 
         docker_log = os.path.join(self.tmp, "docker-calls.log")
+        docker_fail_flag = os.path.join(self.tmp, "docker-fail.flag")
         systemctl_log = os.path.join(self.tmp, "systemctl-calls.log")
 
         fake_docker_py = os.path.join(self.tmp, "update_fake_docker.py")
         Path(fake_docker_py).write_text(
-            f"""import sys
+            f"""import os, sys
 with open({docker_log!r}, "a", encoding="utf-8") as fh:
     fh.write(" ".join(sys.argv[1:]) + "\\n")
+if os.path.exists({docker_fail_flag!r}):
+    sys.stderr.write("simulated docker build failure\\n")
+    sys.exit(1)
 print("Rebuilt vpsagent-core ok")
 sys.exit(0)
 """,
@@ -1408,7 +1418,25 @@ sys.exit(0)
         self.assertEqual(checked["currentVersion"], "2.0.0-alpha.1")
         self.assertEqual(checked["latestCommitSubject"], "feat: add self-update v2")
 
-        # 2. Apply update runs asynchronously and succeeds
+        # 1b. Failed Docker build rolls back checkout so update remains available (not falsely "Up to date")
+        Path(docker_fail_flag).write_text("fail", encoding="utf-8")
+        failed_start = svc.start_core_update({})
+        self.assertTrue(failed_start["ok"])
+        deadline = time.monotonic() + 10.0
+        failed_status = failed_start["status"]
+        while time.monotonic() < deadline:
+            failed_status = svc.core_update_status(check_remote=False)
+            if failed_status["state"] in ("succeeded", "failed"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(failed_status["state"], "failed")
+        self.assertEqual(failed_status["currentVersion"], "2.0.0-alpha.1")
+        rechecked_after_fail = svc.core_update_status(check_remote=True)
+        self.assertTrue(rechecked_after_fail["updateAvailable"])
+        self.assertEqual(rechecked_after_fail["commitsBehind"], 1)
+        os.unlink(docker_fail_flag)
+
+        # 2. Apply update succeeds, preserves 00-default.caddy, and survives bridge restart recovery
         started = svc.start_core_update({})
         self.assertTrue(started["ok"])
         self.assertTrue(started["started"])
@@ -1430,6 +1458,11 @@ sys.exit(0)
             Path(os.path.join(vpsagent_root, "runtime-bridge.py")).read_text(encoding="utf-8"),
             "# bridge v2\n",
         )
+        # Live app route for slug "00-default" must be untouched!
+        self.assertIn(
+            "default.example.com",
+            Path(app_default_route).read_text(encoding="utf-8"),
+        )
         # Wait briefly for the post-success --no-block systemctl restart
         time.sleep(0.4)
         self.assertIn(
@@ -1437,15 +1470,55 @@ sys.exit(0)
             Path(systemctl_log).read_text(encoding="utf-8"),
         )
 
-        # 3. Dirty working tree blocks self-update safely
+        # Simulate restarted bridge loading persisted update state cleanly
+        restarted_svc = rb.RuntimeService(
+            apps_root=os.path.join(vpsagent_root, "apps"),
+            caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+            caddy_container="vpsagent-caddy",
+            docker_bin=fake_docker_sh,
+            systemctl_bin=fake_sys_sh,
+            vpsagent_root=vpsagent_root,
+            repo_dir=clone_dir,
+            allow_unauthenticated=True,
+        )
+        recovered = restarted_svc.core_update_status(check_remote=False)
+        self.assertEqual(recovered["state"], "succeeded")
+        self.assertEqual(recovered["currentVersion"], "2.0.0-alpha.2")
+
+        # 3. Diverged branch (local commit + upstream commit) is rejected cleanly instead of advertising unusable update
+        Path(os.path.join(work_dir, "package.json")).write_text(
+            json.dumps({"name": "vpsagent", "version": "2.0.0-alpha.3"}),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(
+            ["git", "-C", work_dir, "commit", "-m", "upstream v3"],
+            check=True,
+            env=git_env,
+        )
+        subprocess.run(["git", "-C", work_dir, "push", "origin", "main"], check=True, env=git_env)
+
+        Path(os.path.join(clone_dir, "local-note.txt")).write_text("local commit\n", encoding="utf-8")
+        subprocess.run(["git", "-C", clone_dir, "add", "local-note.txt"], check=True, env=git_env)
+        subprocess.run(
+            ["git", "-C", clone_dir, "commit", "-m", "local diverged commit"],
+            check=True,
+            env=git_env,
+        )
+        diverged = restarted_svc.core_update_status(check_remote=True)
+        self.assertFalse(diverged["canUpdate"])
+        self.assertFalse(diverged["updateAvailable"])
+        self.assertIn("diverged", (diverged["unavailableReason"] or "").lower())
+
+        # 4. Dirty working tree blocks self-update safely
         Path(os.path.join(clone_dir, "package.json")).write_text(
             '{"name":"vpsagent","version":"dirty"}\n', encoding="utf-8"
         )
-        dirty_status = svc.core_update_status(check_remote=False)
+        dirty_status = restarted_svc.core_update_status(check_remote=False)
         self.assertFalse(dirty_status["canUpdate"])
         self.assertTrue(dirty_status["dirtyWorkingTree"])
         with self.assertRaises(rb.BridgeRequestError) as ctx_dirty:
-            svc.start_core_update({})
+            restarted_svc.start_core_update({})
         self.assertEqual(ctx_dirty.exception.status_code, 400)
 
 
