@@ -5185,8 +5185,21 @@ class RuntimeService:
                             old_content = fh.read()
                     with open(src_path, "rb") as fh:
                         written_content = fh.read()
-                    with open(dst_path, "wb") as fh:
-                        fh.write(written_content)
+                    try:
+                        with open(dst_path, "wb") as fh:
+                            fh.write(written_content)
+                    except OSError:
+                        # Immediately restore original file if write/close failed after truncation
+                        try:
+                            if old_content is None:
+                                if os.path.isfile(dst_path):
+                                    os.unlink(dst_path)
+                            else:
+                                with open(dst_path, "wb") as rfh:
+                                    rfh.write(old_content)
+                        except OSError:
+                            pass
+                        raise
                     config_snapshots.append((dst_path, old_content, written_content))
 
             # Step 3: Rebuild and restart vpsagent-core stack
@@ -5320,20 +5333,24 @@ class RuntimeService:
             for dst_path, old_content, written_content in reversed(config_snapshots):
                 fname = os.path.basename(dst_path)
                 try:
-                    current_content: bytes | None = None
-                    if os.path.isfile(dst_path):
-                        with open(dst_path, "rb") as fh:
-                            current_content = fh.read()
-                    if current_content != written_content:
+                    if not os.path.isfile(dst_path):
                         rollback_notes.append(
                             f"Preserved {fname} because it was modified during the build."
                         )
                         continue
+                    with open(dst_path, "r+b") as fh:
+                        current_content = fh.read()
+                        if current_content != written_content:
+                            rollback_notes.append(
+                                f"Preserved {fname} because it was modified during the build."
+                            )
+                            continue
+                        if old_content is not None:
+                            fh.seek(0)
+                            fh.write(old_content)
+                            fh.truncate()
                     if old_content is None:
                         os.unlink(dst_path)
-                    else:
-                        with open(dst_path, "wb") as fh:
-                            fh.write(old_content)
                     restored_files.append(fname)
                 except OSError as restore_exc:
                     rollback_notes.append(

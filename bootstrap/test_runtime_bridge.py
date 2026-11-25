@@ -1647,6 +1647,94 @@ sys.exit(0)
         self.assertEqual(kwargs["env"]["LOGNAME"], "ubuntu")
         self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
 
+    def test_core_update_restores_config_when_write_fails_after_truncation(self) -> None:
+        import builtins
+        import subprocess
+        from unittest import mock
+
+        remote_dir = os.path.join(self.tmp, "wfail-remote.git")
+        work_dir = os.path.join(self.tmp, "wfail-work")
+        clone_dir = os.path.join(self.tmp, "wfail-clone")
+        vpsagent_root = os.path.join(self.tmp, "wfail-root")
+        os.makedirs(os.path.join(vpsagent_root, "apps"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "caddy", "apps.d"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "run"), exist_ok=True)
+        Path(os.path.join(vpsagent_root, ".env")).write_text(
+            "VPSAGENT_RUNTIME_TOKEN=test-secret-token-value-123456\n", encoding="utf-8"
+        )
+        caddy_dst = os.path.join(vpsagent_root, "Caddyfile")
+        Path(caddy_dst).write_text("# original v1 caddyfile\n", encoding="utf-8")
+
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        subprocess.run(["git", "init", "--bare", remote_dir], check=True, env=git_env)
+        subprocess.run(["git", "clone", remote_dir, work_dir], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "checkout", "-b", "main"], check=True, env=git_env)
+        os.makedirs(os.path.join(work_dir, "bootstrap"), exist_ok=True)
+        Path(os.path.join(work_dir, "bootstrap", "Caddyfile")).write_text("# v1\n", encoding="utf-8")
+        Path(os.path.join(work_dir, "bootstrap", "docker-compose.core.yml")).write_text("services: {}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "commit", "-m", "v1"], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "push", "-u", "origin", "main"], check=True, env=git_env)
+        subprocess.run(["git", "--git-dir", remote_dir, "symbolic-ref", "HEAD", "refs/heads/main"], check=True, env=git_env)
+        subprocess.run(["git", "clone", "--branch", "main", remote_dir, clone_dir], check=True, env=git_env)
+
+        Path(os.path.join(work_dir, "bootstrap", "Caddyfile")).write_text("# v2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", work_dir, "add", "."], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "commit", "-m", "v2"], check=True, env=git_env)
+        subprocess.run(["git", "-C", work_dir, "push", "origin", "main"], check=True, env=git_env)
+
+        svc = rb.RuntimeService(
+            apps_root=os.path.join(vpsagent_root, "apps"),
+            caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+            caddy_container="vpsagent-caddy",
+            vpsagent_root=vpsagent_root,
+            repo_dir=clone_dir,
+            allow_unauthenticated=True,
+        )
+
+        real_open = builtins.open
+        fail_once = {"triggered": False}
+
+        class FailingWriter:
+            def __init__(self, inner: object) -> None:
+                self._inner = inner
+
+            def __enter__(self) -> "FailingWriter":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                self._inner.close()  # type: ignore[attr-defined]
+
+            def write(self, _data: bytes) -> int:
+                raise OSError("simulated disk full after truncation")
+
+        def guarded_open(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+            fh = real_open(file, mode, *args, **kwargs)  # type: ignore[call-overload]
+            if (
+                not fail_once["triggered"]
+                and mode == "wb"
+                and os.path.abspath(str(file)) == os.path.abspath(caddy_dst)
+            ):
+                fail_once["triggered"] = True
+                return FailingWriter(fh)
+            return fh
+
+        with mock.patch.object(builtins, "open", side_effect=guarded_open):
+            svc._run_core_update_worker(clone_dir, "main")
+
+        self.assertTrue(fail_once["triggered"])
+        self.assertEqual(
+            Path(caddy_dst).read_text(encoding="utf-8"),
+            "# original v1 caddyfile\n",
+        )
+        self.assertEqual(svc.core_update_status(check_remote=False)["state"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()
