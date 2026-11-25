@@ -9,6 +9,8 @@ import {
 
 const DEFAULT_GITHUB_API_BASE_URL = "https://api.github.com";
 const GITHUB_API_TIMEOUT_MS = 12_000;
+const GITHUB_REPOS_PER_PAGE = 100;
+const MAX_GITHUB_REPO_PAGES = 5;
 
 export interface GithubClientOptions {
   apiBaseUrl?: string | undefined;
@@ -223,7 +225,8 @@ export async function verifyGithubToken(
 }
 
 /**
- * Lists GitHub repositories visible to a single stored GitHub token.
+ * Lists GitHub repositories visible to a single stored GitHub token,
+ * following pagination up to MAX_GITHUB_REPO_PAGES when filtering or filling limit.
  */
 export async function listGithubReposForToken(
   token: string,
@@ -232,91 +235,105 @@ export async function listGithubReposForToken(
     query?: string | undefined;
     limit?: number | undefined;
   },
-): Promise<GithubRepoSummary[]> {
+): Promise<{ repos: GithubRepoSummary[]; hasMore: boolean }> {
   const safeToken = validateGitAccessToken(token);
-  const res = await githubApiRequest(
-    "/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member",
-    safeToken,
-    options,
-  );
-  if (res.status === 401) {
-    throw new RuntimeBridgeError(
-      401,
-      `GitHub token "${meta.credentialLabel}" was rejected or expired. Update or re-test it in AI Keys & Settings.`,
-    );
-  }
-  if (res.status === 403) {
-    throw new RuntimeBridgeError(
-      403,
-      `GitHub token "${meta.credentialLabel}" does not have permission to list repositories.`,
-    );
-  }
-  if (!res.ok) {
-    throw new RuntimeBridgeError(
-      res.status >= 400 ? res.status : 502,
-      `GitHub repository listing failed (HTTP ${res.status}).`,
-    );
-  }
-
-  const rawList = (await res.json()) as unknown;
-  if (!Array.isArray(rawList)) {
-    return [];
-  }
-
   const needle = options?.query?.trim().toLowerCase() || "";
   const limit = Math.min(Math.max(options?.limit ?? 50, 1), 100);
   const results: GithubRepoSummary[] = [];
+  let hasMore = false;
 
-  for (const item of rawList as GithubApiRepo[]) {
-    if (
-      !item ||
-      typeof item.full_name !== "string" ||
-      typeof item.name !== "string" ||
-      typeof item.html_url !== "string" ||
-      !isGithubHttpsRepoUrl(item.html_url)
-    ) {
-      continue;
+  for (let page = 1; page <= MAX_GITHUB_REPO_PAGES; page++) {
+    const res = await githubApiRequest(
+      `/user/repos?per_page=${GITHUB_REPOS_PER_PAGE}&page=${page}&sort=updated&affiliation=owner,collaborator,organization_member`,
+      safeToken,
+      options,
+    );
+    if (res.status === 401) {
+      throw new RuntimeBridgeError(
+        401,
+        `GitHub token "${meta.credentialLabel}" was rejected or expired. Update or re-test it in AI Keys & Settings.`,
+      );
     }
-    const owner =
-      typeof item.owner?.login === "string" && item.owner.login.trim()
-        ? item.owner.login.trim()
-        : item.full_name.split("/")[0] || "";
-    if (!owner) {
-      continue;
+    if (res.status === 403) {
+      throw new RuntimeBridgeError(
+        403,
+        `GitHub token "${meta.credentialLabel}" does not have permission to list repositories.`,
+      );
     }
-    const description =
-      typeof item.description === "string" && item.description.trim()
-        ? item.description.trim()
-        : null;
-    if (needle) {
-      const hay = `${item.full_name} ${item.name} ${description ?? ""}`.toLowerCase();
-      if (!hay.includes(needle)) {
+    if (!res.ok) {
+      throw new RuntimeBridgeError(
+        res.status >= 400 ? res.status : 502,
+        `GitHub repository listing failed (HTTP ${res.status}).`,
+      );
+    }
+
+    const rawList = (await res.json()) as unknown;
+    if (!Array.isArray(rawList)) {
+      break;
+    }
+
+    for (let idx = 0; idx < rawList.length; idx++) {
+      const item = rawList[idx] as GithubApiRepo;
+      if (
+        !item ||
+        typeof item.full_name !== "string" ||
+        typeof item.name !== "string" ||
+        typeof item.html_url !== "string" ||
+        !isGithubHttpsRepoUrl(item.html_url)
+      ) {
         continue;
       }
+      const owner =
+        typeof item.owner?.login === "string" && item.owner.login.trim()
+          ? item.owner.login.trim()
+          : item.full_name.split("/")[0] || "";
+      if (!owner) {
+        continue;
+      }
+      const description =
+        typeof item.description === "string" && item.description.trim()
+          ? item.description.trim()
+          : null;
+      if (needle) {
+        const hay = `${item.full_name} ${item.name} ${description ?? ""}`.toLowerCase();
+        if (!hay.includes(needle)) {
+          continue;
+        }
+      }
+      const parsed = GithubRepoSummarySchema.parse({
+        fullName: item.full_name,
+        name: item.name,
+        owner,
+        private: Boolean(item.private),
+        defaultBranch:
+          typeof item.default_branch === "string" && item.default_branch.trim()
+            ? item.default_branch.trim()
+            : null,
+        htmlUrl: item.html_url.replace(/\/+$/, ""),
+        description,
+        updatedAt:
+          typeof item.updated_at === "string" && item.updated_at.trim()
+            ? item.updated_at.trim()
+            : null,
+        credentialId: meta.credentialId,
+        credentialLabel: meta.credentialLabel,
+      });
+      results.push(parsed);
+      if (results.length >= limit) {
+        if (idx < rawList.length - 1 || rawList.length === GITHUB_REPOS_PER_PAGE) {
+          hasMore = true;
+        }
+        return { repos: results, hasMore };
+      }
     }
-    const parsed = GithubRepoSummarySchema.parse({
-      fullName: item.full_name,
-      name: item.name,
-      owner,
-      private: Boolean(item.private),
-      defaultBranch:
-        typeof item.default_branch === "string" && item.default_branch.trim()
-          ? item.default_branch.trim()
-          : null,
-      htmlUrl: item.html_url.replace(/\/+$/, ""),
-      description,
-      updatedAt:
-        typeof item.updated_at === "string" && item.updated_at.trim()
-          ? item.updated_at.trim()
-          : null,
-      credentialId: meta.credentialId,
-      credentialLabel: meta.credentialLabel,
-    });
-    results.push(parsed);
-    if (results.length >= limit) {
+
+    if (rawList.length < GITHUB_REPOS_PER_PAGE) {
       break;
+    }
+    if (page === MAX_GITHUB_REPO_PAGES) {
+      hasMore = true;
     }
   }
 
-  return results;
+  return { repos: results, hasMore };
 }

@@ -417,6 +417,7 @@ export const api = {
     return apiFetch<{
       connected: boolean;
       repos: GithubRepoSummary[];
+      hasMore?: boolean;
       errors: Array<{ credentialId: string; label: string; error: string }>;
     }>(`/api/git/repos${qs ? `?${qs}` : ""}`);
   },
@@ -447,6 +448,7 @@ export const api = {
       memoryLimitMb: number;
       companions: CompanionService[];
       envVars: Record<string, string>;
+      createOnly?: boolean;
     },
     asyncMode = true,
   ) =>

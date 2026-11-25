@@ -888,12 +888,13 @@ def _inspect_cloned_repo(
             [
                 "FROM nginxinc/nginx-unprivileged:alpine",
                 "COPY . /usr/share/nginx/html",
+                "RUN printf '%s\\n' 'server {' '  listen 8080;' '  server_name _;' '  root /usr/share/nginx/html;' '  index index.html;' '  location ~ /\\. {' '    deny all;' '    return 404;' '  }' '  location / {' '    try_files $uri $uri/ =404;' '  }' '}' > /etc/nginx/conf.d/default.conf",
                 "EXPOSE 8080",
                 "",
             ]
         )
         notes.append(
-            "No Dockerfile found — auto-detected static HTML site (index.html) and packaged it with an unprivileged web server."
+            "No Dockerfile found — auto-detected static HTML site (index.html) and packaged it with an unprivileged web server (hidden dotfiles and repo metadata excluded)."
         )
         return {
             "ok": True,
@@ -3120,6 +3121,44 @@ class RuntimeService:
                         504,
                         f"Git build timed out after {int(total_timeout_s)}s before Docker build.",
                     )
+
+                # Always strip .git metadata before docker build so private repo history never enters images
+                git_meta_dir = os.path.join(real_clone_dir, ".git")
+                if os.path.lexists(git_meta_dir):
+                    if os.path.isdir(git_meta_dir) and not os.path.islink(git_meta_dir):
+                        shutil.rmtree(git_meta_dir, ignore_errors=True)
+                    else:
+                        try:
+                            os.unlink(git_meta_dir)
+                        except OSError:
+                            pass
+
+                # For auto-detected static sites without a custom .dockerignore, exclude dotfiles and non-site repo files
+                if used_auto_dockerfile and inspected["detectedRuntime"] == "static":
+                    dockerignore_path = os.path.join(real_clone_dir, ".dockerignore")
+                    if not os.path.lexists(dockerignore_path):
+                        with open(dockerignore_path, "w", encoding="utf-8") as difh:
+                            difh.write(
+                                "\n".join(
+                                    [
+                                        ".git",
+                                        ".*",
+                                        ".*/**",
+                                        "**/.env*",
+                                        "*.pem",
+                                        "*.key",
+                                        "README*",
+                                        "LICENSE*",
+                                        "Dockerfile*",
+                                        "docker-compose*",
+                                        "Makefile",
+                                        "*.sh",
+                                        "*.py",
+                                        "",
+                                    ]
+                                )
+                            )
+                        os.chmod(dockerignore_path, 0o600)
 
                 build_proc = self._run_docker(
                     [

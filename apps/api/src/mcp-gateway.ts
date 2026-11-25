@@ -1175,6 +1175,32 @@ function buildGithubSettingsUrl(store: RegistryStore): string {
   return base ? `${base}${hash}` : hash;
 }
 
+function normalizeGitUrlForComparison(rawUrl: string): string {
+  return rawUrl
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\.git$/i, "")
+    .toLowerCase();
+}
+
+function isRepoBoundToAllowedApp(
+  store: RegistryStore,
+  token: McpTokenRecord,
+  rawRepoUrl: string,
+): boolean {
+  const target = normalizeGitUrlForComparison(rawRepoUrl);
+  for (const allowedSlug of token.allowedSlugs) {
+    const existing = store.getApp(allowedSlug);
+    if (
+      existing?.gitRepoUrl &&
+      normalizeGitUrlForComparison(existing.gitRepoUrl) === target
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function enforceMcpBoundary(
   c: Context,
   store: RegistryStore,
@@ -1531,6 +1557,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           );
           const setup = store.getSetupState();
           const gitCredentials = store.listGitCredentials();
+          const isAppLocked = token.allowedSlugs.length > 0;
           callResult = toolOk({
             server: {
               dashboardUrl: buildDashboardBaseUrl(store),
@@ -1540,12 +1567,14 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
               publicReposSupported: true,
               privateReposSupported: true,
               githubConnected: gitCredentials.length > 0,
-              githubCredentials: gitCredentials.map((c) => ({
-                id: c.id,
-                label: c.label,
-                accountLogin: c.accountLogin,
-                isDefault: c.isDefault,
-              })),
+              githubCredentials: isAppLocked
+                ? []
+                : gitCredentials.map((c) => ({
+                    id: c.id,
+                    label: c.label,
+                    accountLogin: c.accountLogin,
+                    isDefault: c.isDefault,
+                  })),
               githubSettingsUrl: buildGithubSettingsUrl(store),
               autoDetectedRuntimes: [
                 "dockerfile",
@@ -1638,6 +1667,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           callResult = toolOk({
             connected: true,
             repos: res.repos,
+            hasMore: res.hasMore,
             errors: res.errors,
             githubSettingsUrl,
           });
@@ -1646,8 +1676,27 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
 
         case "inspect_git_repo": {
           const parsedInput = InspectGitInputSchema.parse(args);
+          const allowSavedGitCredentials =
+            token.allowedSlugs.length === 0 ||
+            isRepoBoundToAllowedApp(store, token, parsedInput.gitRepoUrl);
+          if (!allowSavedGitCredentials && parsedInput.gitCredentialId) {
+            store.recordAudit({
+              actor: "agent",
+              actorTokenId: token.id,
+              action: "mcp.blocked_app_scope",
+              targetSlug: null,
+              summary: `Blocked app-locked pass "${token.name}" from inspecting unrelated repo with saved GitHub credentials`,
+              riskLevel: "high",
+            });
+            callResult = toolErr(
+              `Permission denied: visitor pass "${token.name}" is locked to [${token.allowedSlugs.join(", ")}] and cannot use saved GitHub credentials for an unrelated repository.`,
+            );
+            break;
+          }
           try {
-            const inspected = await executor.inspectGitRepo(parsedInput);
+            const inspected = await executor.inspectGitRepo(parsedInput, {
+              allowSavedGitCredentials,
+            });
             callResult = toolOk({
               ...inspected,
               canDeployWithCurrentPass:
@@ -1660,6 +1709,12 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
             });
           } catch (err) {
             if (err instanceof RuntimeBridgeError && err.statusCode === 401) {
+              if (!allowSavedGitCredentials) {
+                callResult = toolErr(
+                  `Permission denied: visitor pass "${token.name}" is locked to [${token.allowedSlugs.join(", ")}] and cannot access unrelated private repositories using the owner's saved GitHub credentials.`,
+                );
+                break;
+              }
               callResult = toolErr(
                 `${err.message} Connect or update a GitHub token at ${buildGithubSettingsUrl(store)}.`,
               );
@@ -1818,6 +1873,30 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
         case "deploy_app": {
           const input = DeployAppInputSchema.parse(args);
           const slug = validateAppSlug(input.slug);
+          let allowSavedGitCredentials = true;
+          if (token.allowedSlugs.length > 0 && input.sourceType === "git") {
+            const existingForSlug = store.getApp(slug);
+            allowSavedGitCredentials = Boolean(
+              existingForSlug?.gitRepoUrl &&
+                input.gitRepoUrl &&
+                normalizeGitUrlForComparison(existingForSlug.gitRepoUrl) ===
+                  normalizeGitUrlForComparison(input.gitRepoUrl),
+            );
+            if (!allowSavedGitCredentials && input.gitCredentialId) {
+              store.recordAudit({
+                actor: "agent",
+                actorTokenId: token.id,
+                action: "mcp.blocked_app_scope",
+                targetSlug: slug,
+                summary: `Blocked app-locked pass "${token.name}" from deploying unrelated private repo into "${slug}"`,
+                riskLevel: "high",
+              });
+              callResult = toolErr(
+                `Permission denied: visitor pass "${token.name}" is locked to [${token.allowedSlugs.join(", ")}] and cannot deploy an unrelated private repository using the owner's saved GitHub credentials.`,
+              );
+              break;
+            }
+          }
           callResult = await handleMutation(token, {
             action: "deploy_app",
             targetSlug: slug,
@@ -1829,6 +1908,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
                 actorTokenId: token.id,
                 waitMs: deployGraceMs,
                 throwOnImmediateFailure: true,
+                allowSavedGitCredentials,
               });
               if (!started.done) {
                 return {

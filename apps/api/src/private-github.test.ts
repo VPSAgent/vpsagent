@@ -762,4 +762,276 @@ describe("Private GitHub Repositories (Credentials API, Smart Resolution, Host P
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
   });
+
+  it("enforces createOnly conflict protection, GitHub pagination, and app-locked private repo isolation", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpsagent-priv-gh2-"));
+    const appsRoot = path.join(tempDir, "apps");
+    fs.mkdirSync(appsRoot, { recursive: true });
+
+    const TOKEN_A = "github_pat_11PAGINATED_LOCK_TOKEN_5555";
+    const inspectCalls: Array<{ url: string; token?: string | null }> = [];
+    const buildCalls: Array<{ url: string; token?: string | null }> = [];
+
+    const bridge = createControlledMockBridge({
+      publicRepos: new Set(["https://github.com/vercel/next-demo"]),
+      privateRepoTokens: new Map([
+        ["https://github.com/alice/secret-app", TOKEN_A],
+      ]),
+      onInspectCall: (input) =>
+        inspectCalls.push({ url: input.gitRepoUrl, token: input.gitToken }),
+      onBuildCall: (input) =>
+        buildCalls.push({ url: input.gitRepoUrl, token: input.gitToken }),
+    });
+
+    const page1Repos = Array.from({ length: 100 }, (_, i) => ({
+      full_name: `alice/recent-repo-${i + 1}`,
+      name: `recent-repo-${i + 1}`,
+      owner: { login: "alice" },
+      private: true,
+      default_branch: "main",
+      html_url: `https://github.com/alice/recent-repo-${i + 1}`,
+      description: `Recent repo ${i + 1}`,
+      updated_at: "2026-11-25T10:00:00Z",
+    }));
+
+    const page2Repos = [
+      {
+        full_name: "alice/legacy-billing-service",
+        name: "legacy-billing-service",
+        owner: { login: "alice" },
+        private: true,
+        default_branch: "main",
+        html_url: "https://github.com/alice/legacy-billing-service",
+        description: "Older repo on page 2",
+        updated_at: "2025-01-10T10:00:00Z",
+      },
+    ];
+
+    const mockGithubFetch: typeof fetch = async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/user")) {
+        return new Response(JSON.stringify({ login: "alice" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      if (url.includes("/user/repos")) {
+        const parsed = new URL(url);
+        const page = Number(parsed.searchParams.get("page") ?? "1");
+        const body = page === 1 ? page1Repos : page === 2 ? page2Repos : [];
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("Not Found", { status: 404 });
+    };
+
+    const store = new RegistryStore(path.join(tempDir, "registry.db"), {
+      encryptionSecret: "priv-gh2-encryption-secret-32-bytes",
+    });
+
+    const { app } = createVpsAgentApp({
+      store,
+      bridge,
+      appsRoot,
+      sessionSecret: "priv-gh2-session-secret-32-bytes",
+      trustProxy: true,
+      isLocalListener: false,
+      defaultPeerIp: "172.18.0.2",
+      readinessTimeoutSeconds: 5,
+      readinessPollIntervalMs: 10,
+      mcpDeployGraceMs: 2000,
+      lookupFn: async () => [{ address: "140.82.121.4", family: 4 }],
+      githubFetchFn: mockGithubFetch,
+    });
+
+    try {
+      store.setAdminPassphrase("correct-horse-battery");
+      store.updateSetupState({
+        claimed: true,
+        domain: "vps.example.com",
+        httpsActive: true,
+        tlsStatus: "active",
+        claimedAt: new Date().toISOString(),
+      });
+
+      const loginRes = await app.request("https://vps.example.com/api/auth/login", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          host: "vps.example.com",
+          "x-forwarded-proto": "https",
+        },
+        body: JSON.stringify({ passphrase: "correct-horse-battery" }),
+      });
+      const cookie = loginRes.headers.get("set-cookie")!.split(";")[0]!;
+
+      const addRes = await app.request(
+        "https://vps.example.com/api/git/credentials",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({ token: TOKEN_A }),
+        },
+      );
+      expect(addRes.status).toBe(201);
+      const credId = ((await addRes.json()) as { credential: { id: string } })
+        .credential.id;
+
+      // 1. Pagination finds older repo on page 2
+      const searchRes = await app.request(
+        "https://vps.example.com/api/git/repos?query=legacy-billing",
+        {
+          headers: {
+            cookie,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+        },
+      );
+      expect(searchRes.status).toBe(200);
+      const searchJson = (await searchRes.json()) as {
+        repos: Array<{ fullName: string }>;
+        hasMore: boolean;
+      };
+      expect(searchJson.repos.map((r) => r.fullName)).toEqual([
+        "alice/legacy-billing-service",
+      ]);
+      expect(searchJson.hasMore).toBe(false);
+
+      // 2. createOnly rejects overwriting an existing app slug with HTTP 409
+      const firstDeploy = await app.request("https://vps.example.com/api/apps", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          cookie,
+          host: "vps.example.com",
+          "x-forwarded-proto": "https",
+        },
+        body: JSON.stringify({
+          slug: "my-site",
+          name: "My Site",
+          sourceType: "git",
+          gitRepoUrl: "https://github.com/vercel/next-demo",
+          createOnly: true,
+        }),
+      });
+      expect(firstDeploy.status).toBe(201);
+
+      const duplicateDeploy = await app.request(
+        "https://vps.example.com/api/apps",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({
+            slug: "my-site",
+            name: "My Site Copy",
+            sourceType: "git",
+            gitRepoUrl: "https://github.com/vercel/next-demo",
+            createOnly: true,
+          }),
+        },
+      );
+      expect(duplicateDeploy.status).toBe(409);
+
+      // 3. App-locked MCP pass cannot inspect or deploy unrelated private repos using owner credentials
+      const lockedTokRes = await app.request(
+        "https://vps.example.com/api/mcp/tokens",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            cookie,
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+          body: JSON.stringify({
+            name: "Locked Agent",
+            scope: "safe-auto-deploy",
+            allowedSlugs: ["only-this-app"],
+          }),
+        },
+      );
+      const lockedRawToken = (
+        (await lockedTokRes.json()) as { rawToken: string }
+      ).rawToken;
+
+      const callMcp = async (
+        name: string,
+        args: Record<string, unknown> = {},
+      ) => {
+        const res = await app.request("https://vps.example.com/mcp", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+            authorization: `Bearer ${lockedRawToken}`,
+          },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name, arguments: args },
+          }),
+        });
+        expect(res.status).toBe(200);
+        return (await res.json()) as {
+          result: { isError?: boolean; content?: Array<{ text: string }> };
+        };
+      };
+
+      const lockedInfo = await callMcp("get_server_info");
+      const lockedInfoJson = JSON.parse(lockedInfo.result.content![0]!.text) as {
+        server: { githubCredentials: unknown[] };
+      };
+      expect(lockedInfoJson.server.githubCredentials).toEqual([]);
+
+      inspectCalls.length = 0;
+      const lockedInspect = await callMcp("inspect_git_repo", {
+        gitRepoUrl: "https://github.com/alice/secret-app",
+      });
+      expect(lockedInspect.result.isError).toBe(true);
+      expect(inspectCalls.every((c) => !c.token)).toBe(true);
+
+      const lockedInspectExplicit = await callMcp("inspect_git_repo", {
+        gitRepoUrl: "https://github.com/alice/secret-app",
+        gitCredentialId: credId,
+      });
+      expect(lockedInspectExplicit.result.isError).toBe(true);
+
+      buildCalls.length = 0;
+      const lockedPrivateDeploy = await callMcp("deploy_app", {
+        slug: "only-this-app",
+        name: "Locked Private Attempt",
+        sourceType: "git",
+        gitRepoUrl: "https://github.com/alice/secret-app",
+      });
+      expect(lockedPrivateDeploy.result.isError).toBe(true);
+      expect(buildCalls.every((c) => !c.token)).toBe(true);
+
+      // Deploying a public repo into the allowed slug still succeeds
+      const lockedPublicDeploy = await callMcp("deploy_app", {
+        slug: "only-this-app",
+        name: "Locked Public App",
+        sourceType: "git",
+        gitRepoUrl: "https://github.com/vercel/next-demo",
+      });
+      expect(lockedPublicDeploy.result.isError).toBe(false);
+    } finally {
+      store.close();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
 });

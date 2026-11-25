@@ -1927,6 +1927,159 @@ sys.exit(1)
         self.assertNotIn(token, joined)
         self.assertNotIn(expected_b64, joined)
 
+    def test_real_git_sends_basic_auth_header_from_git_config_global(self) -> None:
+        """
+        Verify the real system `git` binary reads our GIT_CONFIG_GLOBAL file format
+        and transmits the expected `Authorization: Basic ...` header over HTTP(S).
+        """
+        import base64
+        import shutil
+        import subprocess
+
+        git_bin = shutil.which("git")
+        if not git_bin:
+            self.skipTest("git binary not available")
+
+        token = "github_pat_11REALGIT_AUTH_TEST_9999"
+        expected_b64 = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+        captured: dict[str, str | None] = {"auth": None, "path": None}
+
+        class _GitAuthHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                captured["auth"] = self.headers.get("Authorization")
+                captured["path"] = self.path
+                # Return 401 so git stops cleanly right after sending the request
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _GitAuthHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            cfg_path = os.path.join(self.tmp, "real-git-auth.conf")
+            base_url = f"http://127.0.0.1:{port}/"
+            fd = os.open(cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(
+                    fd,
+                    (
+                        f'[http "{base_url}"]\n'
+                        f"\textraHeader = Authorization: Basic {expected_b64}\n"
+                    ).encode("utf-8"),
+                )
+            finally:
+                os.close(fd)
+
+            env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": self.tmp,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": cfg_path,
+            }
+            subprocess.run(
+                [git_bin, "ls-remote", f"{base_url}acme/private-demo.git"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(captured["auth"], f"Basic {expected_b64}")
+            self.assertIn("/acme/private-demo.git/info/refs", captured["path"] or "")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_static_build_strips_git_dir_and_blocks_dotfiles(self) -> None:
+        """
+        Static auto-detected deployments must strip `.git`, create a protective `.dockerignore`
+        excluding dotfiles/repo metadata, and configure Nginx to deny dotfile requests.
+        """
+        static_dir = os.path.join(self.tmp, "static-sec-test")
+        os.makedirs(static_dir, exist_ok=True)
+        docker_seen_file = os.path.join(static_dir, "docker_seen.json")
+
+        git_py = os.path.join(static_dir, "fake_static_git.py")
+        Path(git_py).write_text(
+            """import os, sys
+args = sys.argv[1:]
+if "clone" in args:
+    dst = args[-1]
+    os.makedirs(os.path.join(dst, ".git"), exist_ok=True)
+    with open(os.path.join(dst, ".git", "config"), "w", encoding="utf-8") as fh:
+        fh.write("[core]\\n")
+    with open(os.path.join(dst, "index.html"), "w", encoding="utf-8") as fh:
+        fh.write("<h1>Hello</h1>\\n")
+    with open(os.path.join(dst, ".env"), "w", encoding="utf-8") as fh:
+        fh.write("SECRET=should-not-ship\\n")
+    with open(os.path.join(dst, "README.md"), "w", encoding="utf-8") as fh:
+        fh.write("# Private Repo Notes\\n")
+    sys.exit(0)
+if "rev-parse" in args:
+    print("main" if "--abbrev-ref" in args else "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        git_sh = os.path.join(static_dir, "fake-static-git")
+        Path(git_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{git_py}" "$@"\n', encoding="utf-8")
+        os.chmod(git_sh, 0o755)
+
+        docker_py = os.path.join(static_dir, "fake_static_docker.py")
+        Path(docker_py).write_text(
+            f"""import json, os, sys
+args = sys.argv[1:]
+if args[:1] == ["build"]:
+    ctx_dir = args[-1]
+    df_path = args[args.index("-f") + 1]
+    dockerignore_path = os.path.join(ctx_dir, ".dockerignore")
+    with open({docker_seen_file!r}, "w", encoding="utf-8") as out:
+        json.dump({{
+            "hasGitDir": os.path.exists(os.path.join(ctx_dir, ".git")),
+            "dockerignore": open(dockerignore_path, "r", encoding="utf-8").read() if os.path.exists(dockerignore_path) else "",
+            "dockerfile": open(df_path, "r", encoding="utf-8").read(),
+        }}, out)
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        docker_sh = os.path.join(static_dir, "fake-static-docker")
+        Path(docker_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n', encoding="utf-8")
+        os.chmod(docker_sh, 0o755)
+
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+
+        built = svc.build_git(
+            {
+                "slug": "static-private",
+                "gitRepoUrl": "https://github.com/acme/static-site",
+                "gitToken": "github_pat_11STATIC_TEST_TOKEN_1234",
+            }
+        )
+        self.assertTrue(built["ok"])
+        self.assertEqual(built["detectedRuntime"], "static")
+        seen = json.loads(Path(docker_seen_file).read_text(encoding="utf-8"))
+        self.assertFalse(seen["hasGitDir"])
+        self.assertIn(".git", seen["dockerignore"])
+        self.assertIn(".*", seen["dockerignore"])
+        self.assertIn("README*", seen["dockerignore"])
+        self.assertIn("location ~ /\\.", seen["dockerfile"])
+
 
 if __name__ == "__main__":
     unittest.main()

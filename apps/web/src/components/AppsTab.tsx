@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Database,
   ExternalLink,
@@ -68,6 +68,57 @@ function appStatusText(status: AppRecord["status"]): string {
   return "text-amber-300";
 }
 
+const RESERVED_SLUGS = new Set([
+  "core",
+  "vpsagent",
+  "vps-os",
+  "caddy",
+  "api",
+  "dashboard",
+  "agent",
+  "system",
+  "root",
+  "admin",
+]);
+
+function normalizeSlugCandidate(raw: string): string {
+  let cleaned = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48)
+    .replace(/-+$/g, "");
+  if (cleaned.length < 2) {
+    cleaned = `${cleaned || "my"}-app`;
+  }
+  return cleaned;
+}
+
+function pickUnusedSlug(
+  rawRepoName: string,
+  owner: string | null,
+  existingApps: AppRecord[],
+): string {
+  const taken = new Set(existingApps.map((a) => a.slug.toLowerCase()));
+  const isAvailable = (cand: string) =>
+    cand.length >= 2 && !RESERVED_SLUGS.has(cand) && !taken.has(cand);
+
+  const base = normalizeSlugCandidate(rawRepoName);
+  if (isAvailable(base)) return base;
+
+  if (owner) {
+    const withOwner = normalizeSlugCandidate(`${owner}-${rawRepoName}`);
+    if (isAvailable(withOwner)) return withOwner;
+  }
+
+  for (let i = 2; i <= 99; i++) {
+    const suffix = `-${i}`;
+    const candidate = `${base.slice(0, 48 - suffix.length).replace(/-+$/g, "")}${suffix}`;
+    if (isAvailable(candidate)) return candidate;
+  }
+  return base;
+}
+
 type DrawerSection = "deployments" | "logs" | "domain" | "env" | "security";
 
 interface AppsTabProps {
@@ -108,9 +159,11 @@ export function AppsTab({
   const [gitBranch, setGitBranch] = useState("");
   const [gitCredentialId, setGitCredentialId] = useState("");
   const [githubRepos, setGithubRepos] = useState<GithubRepoSummary[]>([]);
+  const [reposHasMore, setReposHasMore] = useState(false);
   const [reposLoading, setReposLoading] = useState(false);
   const [repoFilter, setRepoFilter] = useState("");
   const [reposError, setReposError] = useState<string | null>(null);
+  const manualFieldsRef = useRef<Set<string>>(new Set());
   const [dockerfilePath, setDockerfilePath] = useState("auto");
   const [internalPort, setInternalPort] = useState("");
   const [domain, setDomain] = useState("");
@@ -227,52 +280,69 @@ export function AppsTab({
     return () => window.clearInterval(timer);
   }, [onRefresh, openDrawerBySlug, section, selectedSlug, trackedDeployment]);
 
-  const loadGithubRepos = useCallback(async () => {
-    if (gitCredentials.length === 0) {
-      setGithubRepos([]);
-      return;
-    }
-    setReposLoading(true);
-    setReposError(null);
-    try {
-      const res = await api.listGithubRepos({ limit: 50 });
-      setGithubRepos(res.repos);
-      if (res.errors.length > 0 && res.repos.length === 0) {
-        setReposError(res.errors[0]!.error);
+  const loadGithubRepos = useCallback(
+    async (queryText?: string) => {
+      if (gitCredentials.length === 0) {
+        setGithubRepos([]);
+        setReposHasMore(false);
+        return;
       }
-    } catch (err) {
-      setReposError(
-        err instanceof Error
-          ? err.message
-          : "Could not load your GitHub repositories.",
-      );
-    } finally {
-      setReposLoading(false);
-    }
-  }, [gitCredentials.length]);
+      setReposLoading(true);
+      setReposError(null);
+      try {
+        const res = await api.listGithubRepos({
+          ...(queryText?.trim() ? { query: queryText.trim() } : {}),
+          limit: 50,
+        });
+        setGithubRepos(res.repos);
+        setReposHasMore(Boolean(res.hasMore));
+        if (res.errors.length > 0 && res.repos.length === 0) {
+          setReposError(res.errors[0]!.error);
+        }
+      } catch (err) {
+        setReposError(
+          err instanceof Error
+            ? err.message
+            : "Could not load your GitHub repositories.",
+        );
+      } finally {
+        setReposLoading(false);
+      }
+    },
+    [gitCredentials.length],
+  );
 
   useEffect(() => {
-    if (showCreate && sourceType === "git" && gitCredentials.length > 0) {
-      void loadGithubRepos();
+    if (!showCreate || sourceType !== "git" || gitCredentials.length === 0) {
+      return;
     }
-  }, [gitCredentials.length, loadGithubRepos, showCreate, sourceType]);
+    const timer = window.setTimeout(() => {
+      void loadGithubRepos(repoFilter);
+    }, repoFilter.trim() ? 250 : 0);
+    return () => window.clearTimeout(timer);
+  }, [gitCredentials.length, loadGithubRepos, repoFilter, showCreate, sourceType]);
+
+  const resetInferredBuildFields = () => {
+    const manual = manualFieldsRef.current;
+    if (!manual.has("dockerfile")) setDockerfilePath("auto");
+    if (!manual.has("port")) setInternalPort("");
+    if (!manual.has("postgres")) setWithPostgres(false);
+    if (!manual.has("redis")) setWithRedis(false);
+    if (!manual.has("domain")) setDomain("");
+  };
 
   const handleSelectGithubRepo = (repo: GithubRepoSummary) => {
     setGitRepoUrl(repo.htmlUrl);
-    setGitBranch(repo.defaultBranch ?? "");
-    setGitCredentialId(repo.credentialId);
     setGitPreview(null);
-    if (!slug.trim()) {
-      const cleanedSlug = repo.name
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-+|-+$/g, "")
-        .slice(0, 48);
-      if (cleanedSlug.length >= 2) {
-        setSlug(cleanedSlug);
-      }
+    resetInferredBuildFields();
+    const manual = manualFieldsRef.current;
+    if (!manual.has("branch")) {
+      setGitBranch(repo.defaultBranch ?? "");
     }
-    if (!name.trim()) {
+    if (!manual.has("slug")) {
+      setSlug(pickUnusedSlug(repo.name, repo.owner, apps));
+    }
+    if (!manual.has("name")) {
       const displayName = repo.name
         .replace(/[-_.]+/g, " ")
         .replace(/\b\w/g, (ch) => ch.toUpperCase())
@@ -300,21 +370,29 @@ export function AppsTab({
       );
       const info = res.inspect;
       setGitPreview(info);
-      if (info.gitCredentialId && !gitCredentialId) {
-        setGitCredentialId(info.gitCredentialId);
+      const manual = manualFieldsRef.current;
+      if (!manual.has("name")) setName(info.suggestedName);
+      if (!manual.has("slug")) {
+        setSlug(pickUnusedSlug(info.suggestedSlug, null, apps));
       }
-      if (!name.trim()) setName(info.suggestedName);
-      if (!slug.trim()) setSlug(info.suggestedSlug);
-      if (!gitBranch.trim() && info.resolvedBranch) {
+      if (!manual.has("branch") && info.resolvedBranch) {
         setGitBranch(info.resolvedBranch);
       }
-      setDockerfilePath(info.hasDockerfile ? info.dockerfilePath : "auto");
-      setInternalPort(String(info.suggestedPort));
-      if (!domain.trim() && info.suggestedDomain && !noDomain) {
+      if (!manual.has("dockerfile")) {
+        setDockerfilePath(info.hasDockerfile ? info.dockerfilePath : "auto");
+      }
+      if (!manual.has("port")) {
+        setInternalPort(String(info.suggestedPort));
+      }
+      if (!manual.has("domain") && info.suggestedDomain && !noDomain) {
         setDomain(info.suggestedDomain);
       }
-      setWithPostgres(info.suggestedCompanions.includes("postgres"));
-      setWithRedis(info.suggestedCompanions.includes("redis"));
+      if (!manual.has("postgres")) {
+        setWithPostgres(info.suggestedCompanions.includes("postgres"));
+      }
+      if (!manual.has("redis")) {
+        setWithRedis(info.suggestedCompanions.includes("redis"));
+      }
       setNotice(info.buildPlanSummary);
     } catch (err) {
       setGitPreview(null);
@@ -419,12 +497,14 @@ export function AppsTab({
           memoryLimitMb: 512,
           companions,
           envVars: parsedEnv,
+          createOnly: true,
         },
         true,
       );
 
       setShowCreate(false);
       setGitPreview(null);
+      manualFieldsRef.current.clear();
       setSlug("");
       setName("");
       setGitRepoUrl("");
@@ -533,6 +613,7 @@ export function AppsTab({
               if (v) {
                 setGitCredentialId("");
                 setRepoFilter("");
+                manualFieldsRef.current.clear();
               }
               return !v;
             });
@@ -713,7 +794,7 @@ export function AppsTab({
                       <button
                         type="button"
                         disabled={reposLoading}
-                        onClick={() => void loadGithubRepos()}
+                        onClick={() => void loadGithubRepos(repoFilter)}
                         className="btn-press inline-flex items-center gap-1 rounded-md border border-white/[0.1] bg-[#111317] px-2.5 py-1 text-xs text-[#D1D5DB] hover:text-white disabled:opacity-50 cursor-pointer"
                       >
                         <RefreshCw
@@ -732,80 +813,71 @@ export function AppsTab({
                     <p className="text-xs text-[#9CA3AF]">
                       Loading your accessible repositories...
                     </p>
+                  ) : githubRepos.length === 0 ? (
+                    <p className="text-xs text-[#9CA3AF]">
+                      {repoFilter.trim()
+                        ? "No repositories match that search."
+                        : "No repositories returned for your saved token yet — check Contents: Read-only permission or paste a repo URL below."}
+                    </p>
                   ) : (
-                    (() => {
-                      const needle = repoFilter.trim().toLowerCase();
-                      const filtered = needle
-                        ? githubRepos.filter(
-                            (r) =>
-                              r.fullName.toLowerCase().includes(needle) ||
-                              (r.description ?? "")
-                                .toLowerCase()
-                                .includes(needle),
-                          )
-                        : githubRepos;
-                      if (filtered.length === 0) {
-                        return (
-                          <p className="text-xs text-[#9CA3AF]">
-                            {githubRepos.length === 0
-                              ? "No repositories returned for your saved token yet — check Contents: Read-only permission or paste a repo URL below."
-                              : "No repositories match that filter."}
-                          </p>
-                        );
-                      }
-                      return (
-                        <div className="max-h-44 overflow-y-auto divide-y divide-white/[0.06] rounded-md border border-white/[0.08] bg-[#090A0C]">
-                          {filtered.map((repo) => {
-                            const selected =
-                              gitRepoUrl.trim().replace(/\/+$/, "") ===
-                              repo.htmlUrl;
-                            return (
-                              <button
-                                key={`${repo.credentialId}:${repo.fullName}`}
-                                type="button"
-                                onClick={() => handleSelectGithubRepo(repo)}
-                                className={`w-full text-left px-3 py-2 flex items-center justify-between gap-3 text-xs cursor-pointer transition-colors ${
-                                  selected
-                                    ? "bg-emerald-500/12 text-white"
-                                    : "hover:bg-white/[0.04] text-[#D1D5DB]"
-                                }`}
-                              >
-                                <div className="min-w-0">
-                                  <div className="flex items-center gap-2">
-                                    <span className="font-mono font-medium truncate">
-                                      {repo.fullName}
+                    <>
+                      <div className="max-h-44 overflow-y-auto divide-y divide-white/[0.06] rounded-md border border-white/[0.08] bg-[#090A0C]">
+                        {githubRepos.map((repo) => {
+                          const selected =
+                            gitRepoUrl.trim().replace(/\/+$/, "") ===
+                            repo.htmlUrl;
+                          return (
+                            <button
+                              key={`${repo.credentialId}:${repo.fullName}`}
+                              type="button"
+                              onClick={() => handleSelectGithubRepo(repo)}
+                              className={`w-full text-left px-3 py-2 flex items-center justify-between gap-3 text-xs cursor-pointer transition-colors ${
+                                selected
+                                  ? "bg-emerald-500/12 text-white"
+                                  : "hover:bg-white/[0.04] text-[#D1D5DB]"
+                              }`}
+                            >
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <span className="font-mono font-medium truncate">
+                                    {repo.fullName}
+                                  </span>
+                                  {repo.private ? (
+                                    <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 shrink-0">
+                                      <Lock className="h-2.5 w-2.5" />
+                                      Private
                                     </span>
-                                    {repo.private ? (
-                                      <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 shrink-0">
-                                        <Lock className="h-2.5 w-2.5" />
-                                        Private
-                                      </span>
-                                    ) : (
-                                      <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-[#9CA3AF] shrink-0">
-                                        Public
-                                      </span>
-                                    )}
-                                  </div>
-                                  {repo.description && (
-                                    <p className="text-[11px] text-[#6B7280] truncate mt-0.5">
-                                      {repo.description}
-                                    </p>
-                                  )}
-                                </div>
-                                <div className="text-right shrink-0 text-[11px] text-[#6B7280] font-mono">
-                                  {repo.defaultBranch ?? "main"}
-                                  {gitCredentials.length > 1 && (
-                                    <span className="block text-[10px] text-[#9CA3AF] font-sans">
-                                      {repo.credentialLabel}
+                                  ) : (
+                                    <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-[#9CA3AF] shrink-0">
+                                      Public
                                     </span>
                                   )}
                                 </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      );
-                    })()
+                                {repo.description && (
+                                  <p className="text-[11px] text-[#6B7280] truncate mt-0.5">
+                                    {repo.description}
+                                  </p>
+                                )}
+                              </div>
+                              <div className="text-right shrink-0 text-[11px] text-[#6B7280] font-mono">
+                                {repo.defaultBranch ?? "main"}
+                                {gitCredentials.length > 1 && (
+                                  <span className="block text-[10px] text-[#9CA3AF] font-sans">
+                                    {repo.credentialLabel}
+                                  </span>
+                                )}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {reposHasMore && (
+                        <p className="text-[11px] text-[#9CA3AF]">
+                          Showing top matches — type in the filter box to search
+                          older repositories or paste any GitHub URL below.
+                        </p>
+                      )}
+                    </>
                   )}
                 </div>
               ) : null}
@@ -818,7 +890,11 @@ export function AppsTab({
                   <input
                     type="url"
                     value={gitRepoUrl}
-                    onChange={(e) => setGitRepoUrl(e.target.value)}
+                    onChange={(e) => {
+                      setGitRepoUrl(e.target.value);
+                      setGitPreview(null);
+                      resetInferredBuildFields();
+                    }}
                     placeholder="https://github.com/owner/repo"
                     required
                     className="field-input w-full rounded-lg px-3.5 py-2 text-sm font-mono"
@@ -908,7 +984,10 @@ export function AppsTab({
                   <input
                     type="text"
                     value={gitBranch}
-                    onChange={(e) => setGitBranch(e.target.value)}
+                    onChange={(e) => {
+                      manualFieldsRef.current.add("branch");
+                      setGitBranch(e.target.value);
+                    }}
                     placeholder="main"
                     className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
                   />
@@ -920,7 +999,10 @@ export function AppsTab({
                   <input
                     type="text"
                     value={dockerfilePath}
-                    onChange={(e) => setDockerfilePath(e.target.value)}
+                    onChange={(e) => {
+                      manualFieldsRef.current.add("dockerfile");
+                      setDockerfilePath(e.target.value);
+                    }}
                     placeholder="auto"
                     className="field-input w-full rounded-lg px-3.5 py-2 text-sm font-mono"
                   />
@@ -955,7 +1037,10 @@ export function AppsTab({
               <input
                 type="text"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => {
+                  manualFieldsRef.current.add("name");
+                  setName(e.target.value);
+                }}
                 placeholder="My Blog"
                 required
                 className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
@@ -968,7 +1053,10 @@ export function AppsTab({
               <input
                 type="text"
                 value={slug}
-                onChange={(e) => setSlug(e.target.value)}
+                onChange={(e) => {
+                  manualFieldsRef.current.add("slug");
+                  setSlug(e.target.value);
+                }}
                 placeholder="my-blog"
                 required
                 className="field-input w-full rounded-lg px-3.5 py-2 text-sm font-mono"
@@ -989,7 +1077,10 @@ export function AppsTab({
               <input
                 type="number"
                 value={internalPort}
-                onChange={(e) => setInternalPort(e.target.value)}
+                onChange={(e) => {
+                  manualFieldsRef.current.add("port");
+                  setInternalPort(e.target.value);
+                }}
                 placeholder={sourceType === "git" ? "Auto-detect" : "8080"}
                 min={1}
                 max={65535}
@@ -1010,7 +1101,10 @@ export function AppsTab({
                 type="text"
                 value={domain}
                 disabled={noDomain}
-                onChange={(e) => setDomain(e.target.value)}
+                onChange={(e) => {
+                  manualFieldsRef.current.add("domain");
+                  setDomain(e.target.value);
+                }}
                 placeholder={
                   appsBaseDomain
                     ? `${slug || "my-app"}.${appsBaseDomain}`
@@ -1037,7 +1131,10 @@ export function AppsTab({
               <input
                 type="checkbox"
                 checked={withPostgres}
-                onChange={(e) => setWithPostgres(e.target.checked)}
+                onChange={(e) => {
+                  manualFieldsRef.current.add("postgres");
+                  setWithPostgres(e.target.checked);
+                }}
                 className="rounded border-white/20 bg-[#090A0C] accent-emerald-500"
               />
               Attach private Postgres database
@@ -1046,7 +1143,10 @@ export function AppsTab({
               <input
                 type="checkbox"
                 checked={withRedis}
-                onChange={(e) => setWithRedis(e.target.checked)}
+                onChange={(e) => {
+                  manualFieldsRef.current.add("redis");
+                  setWithRedis(e.target.checked);
+                }}
                 className="rounded border-white/20 bg-[#090A0C] accent-emerald-500"
               />
               Attach private Redis cache
@@ -1073,6 +1173,7 @@ export function AppsTab({
                 setShowCreate(false);
                 setGitCredentialId("");
                 setRepoFilter("");
+                manualFieldsRef.current.clear();
               }}
               className="btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-4 py-2 text-[13px] font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
             >

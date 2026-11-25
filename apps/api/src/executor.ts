@@ -53,6 +53,7 @@ export const DeployAppInputSchema = z.object({
   memoryLimitMb: z.number().int().min(64).max(131072).default(512),
   companions: z.array(CompanionServiceSchema).default([]),
   envVars: z.record(z.string(), z.string()).default({}),
+  createOnly: z.boolean().optional(),
 });
 export type DeployAppInput = z.input<typeof DeployAppInputSchema>;
 
@@ -332,10 +333,18 @@ export class AppExecutor {
     opts?: {
       explicitCredentialId?: string | null;
       storedCredentialId?: string | null;
+      allowSavedGitCredentials?: boolean;
     },
   ): GitAuthCandidate[] {
+    const allowSaved = opts?.allowSavedGitCredentials !== false;
     const explicitId = opts?.explicitCredentialId?.trim() || null;
     if (explicitId) {
+      if (!allowSaved) {
+        throw new RuntimeBridgeError(
+          403,
+          "This app-locked visitor pass cannot use the owner's saved GitHub credentials for an unrelated repository.",
+        );
+      }
       if (!isGithubHttpsRepoUrl(repoUrl)) {
         throw new RuntimeBridgeError(
           400,
@@ -352,7 +361,7 @@ export class AppExecutor {
       return [{ id: secret.record.id, token: secret.token }];
     }
 
-    if (!isGithubHttpsRepoUrl(repoUrl)) {
+    if (!allowSaved || !isGithubHttpsRepoUrl(repoUrl)) {
       return [{ id: null, token: null }];
     }
 
@@ -443,6 +452,7 @@ export class AppExecutor {
   }): Promise<{
     connected: boolean;
     repos: GithubRepoSummary[];
+    hasMore: boolean;
     errors: Array<{ credentialId: string; label: string; error: string }>;
   }> {
     const allCredentials = this.store.listGitCredentials();
@@ -457,13 +467,14 @@ export class AppExecutor {
       );
     }
     if (targets.length === 0) {
-      return { connected: false, repos: [], errors: [] };
+      return { connected: false, repos: [], hasMore: false, errors: [] };
     }
 
     const seenFullNames = new Set<string>();
     const repos: GithubRepoSummary[] = [];
     const errors: Array<{ credentialId: string; label: string; error: string }> =
       [];
+    let anyHasMore = false;
 
     for (const cred of targets) {
       const secret = this.store.getGitCredentialSecretForRuntime(cred.id);
@@ -481,7 +492,10 @@ export class AppExecutor {
             limit: 100,
           },
         );
-        for (const repo of fetched) {
+        if (fetched.hasMore) {
+          anyHasMore = true;
+        }
+        for (const repo of fetched.repos) {
           const key = repo.fullName.toLowerCase();
           if (!seenFullNames.has(key)) {
             seenFullNames.add(key);
@@ -503,11 +517,15 @@ export class AppExecutor {
     return {
       connected: true,
       repos: repos.slice(0, limit),
+      hasMore: anyHasMore || repos.length > limit,
       errors,
     };
   }
 
-  async inspectGitRepo(rawInput: InspectGitInput): Promise<
+  async inspectGitRepo(
+    rawInput: InspectGitInput,
+    options?: { allowSavedGitCredentials?: boolean | undefined },
+  ): Promise<
     RuntimeInspectGitResult & {
       suggestedDomain: string | null;
       usedAuth: boolean;
@@ -533,6 +551,7 @@ export class AppExecutor {
     const explicitCredentialId = input.gitCredentialId?.trim() || null;
     const candidates = this.buildGitAuthCandidates(safeRepoUrl, {
       explicitCredentialId,
+      allowSavedGitCredentials: options?.allowSavedGitCredentials !== false,
     });
 
     const { value: result, usedCredentialId } = await this.runGitWithCandidates(
@@ -569,6 +588,7 @@ export class AppExecutor {
       actorTokenId?: string | null;
       waitMs?: number;
       throwOnImmediateFailure?: boolean;
+      allowSavedGitCredentials?: boolean;
     },
   ): Promise<StartDeploymentResult> {
     const input = DeployAppInputSchema.parse(rawInput);
@@ -594,6 +614,12 @@ export class AppExecutor {
     let backgroundStarted = false;
     try {
       const existing = this.store.getApp(slug);
+      if (input.createOnly && existing) {
+        throw new RuntimeBridgeError(
+          409,
+          `An app with short ID "${slug}" already exists. Choose a different short ID or use Rebuild on the existing app.`,
+        );
+      }
       let validatedGitUrl: string | null = null;
       const explicitCredentialId = input.gitCredentialId?.trim() || null;
       let gitCandidates: GitAuthCandidate[] = [{ id: null, token: null }];
@@ -608,6 +634,7 @@ export class AppExecutor {
         );
         gitCandidates = this.buildGitAuthCandidates(validatedGitUrl, {
           explicitCredentialId,
+          allowSavedGitCredentials: options?.allowSavedGitCredentials !== false,
         });
       }
 
