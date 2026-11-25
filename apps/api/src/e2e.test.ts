@@ -1331,7 +1331,20 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
           .isError,
       ).toBe(false);
 
-      const cleanupRes = await postMcp(autoApprove.rawToken, {
+      // Server-wide docker_cleanup queues for approval under auto-approve, and runs immediately under host-admin
+      const autoCleanupQueued = await postMcp(autoApprove.rawToken, {
+        jsonrpc: "2.0",
+        id: 1120,
+        method: "tools/call",
+        params: { name: "docker_cleanup", arguments: { pruneVolumes: false } },
+      });
+      const autoCleanupData = JSON.parse(
+        ((await autoCleanupQueued.json()) as { result: { content: Array<{ text: string }> } })
+          .result.content[0]!.text,
+      ) as { status: string };
+      expect(autoCleanupData.status).toBe("pending_approval");
+
+      const cleanupRes = await postMcp(hostAdmin.rawToken, {
         jsonrpc: "2.0",
         id: 112,
         method: "tools/call",

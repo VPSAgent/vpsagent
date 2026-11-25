@@ -18,6 +18,7 @@ export const HOST_ADMIN_ACTIONS = new Set([
   "write_file",
   "delete_file",
   "manage_service",
+  "docker_cleanup",
 ]);
 
 /** Returns true when an action operates directly on the VPS host rather than an isolated app. */

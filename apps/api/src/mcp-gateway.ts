@@ -1082,7 +1082,7 @@ function buildServerInstructions(
         : token.scope === "safe-auto-deploy"
           ? `SAFE AUTO-DEPLOY (safe-auto-deploy): app deploys, rebuilds, restarts, env updates, and domains run right away; deleting apps and host-level admin actions queue for human approval${dashboardUrl ? ` (${dashboardUrl})` : ""}.`
           : token.scope === "auto-approve"
-            ? `TRUSTED AUTO-PASS (auto-approve): all isolated app actions run right away; host-level admin tools (run_host_command, write_file, delete_file, manage_service) still queue for human approval${dashboardUrl ? ` (${dashboardUrl})` : ""}.`
+            ? `TRUSTED AUTO-PASS (auto-approve): all isolated app actions run right away; host-level admin tools (run_host_command, write_file, delete_file, manage_service, docker_cleanup) still queue for human approval${dashboardUrl ? ` (${dashboardUrl})` : ""}.`
             : "FULL SERVER ADMIN (host-admin): explicit root-level host administration access; both app and host tools run immediately and are logged in History.";
 
   return [
@@ -2017,7 +2017,15 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           const input = ManageHostServiceInputSchema.parse(args);
           if (input.action === "status") {
             const res = await bridge.manageHostService(input);
-            callResult = toolOk(res);
+            if (!res.ok) {
+              const safe = redactStructuredValue(res);
+              callResult = {
+                content: [{ type: "text", text: JSON.stringify(safe, null, 2) }],
+                isError: true,
+              };
+            } else {
+              callResult = toolOk(res);
+            }
             break;
           }
           callResult = await handleMutation(token, {

@@ -11,6 +11,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import time
 import threading
 import unittest
 from pathlib import Path
@@ -1200,6 +1201,72 @@ sys.exit(1)
         with self.assertRaises(rb.BridgeRequestError) as ctx_svc:
             svc.manage_service({"service": "vpsagent-runtime.service", "action": "stop"})
         self.assertEqual(ctx_svc.exception.status_code, 403)
+
+        # 7. exec_in_app timeout stops the command INSIDE the container (delayed marker never appears)
+        app_slug = "timeout-exec-app"
+        app_dir = os.path.join(self.apps_root, app_slug)
+        os.makedirs(app_dir, exist_ok=True)
+        Path(os.path.join(app_dir, "docker-compose.yml")).write_text(
+            (
+                "services:\n"
+                "  app:\n"
+                "    image: alpine:3.20\n"
+                f"    container_name: vpsagent-app-{app_slug}\n"
+                "    cap_drop:\n"
+                "      - ALL\n"
+                "    security_opt:\n"
+                "      - no-new-privileges:true\n"
+                "    mem_limit: 256m\n"
+                "    cpus: '0.5'\n"
+                "    networks:\n"
+                "      - app_net\n"
+                "networks:\n"
+                "  app_net:\n"
+                "    driver: bridge\n"
+            ),
+            encoding="utf-8",
+        )
+        exec_docker_py = os.path.join(self.tmp, "exec_docker.py")
+        Path(exec_docker_py).write_text(
+            """import subprocess, sys
+args = sys.argv[1:]
+if "exec" in args:
+    idx = args.index("exec")
+    # Forward everything after `-T <service>` directly to local sh to simulate in-container exec
+    inner = args[idx + 3:]
+    proc = subprocess.run(inner)
+    sys.exit(proc.returncode)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        exec_docker_sh = os.path.join(self.tmp, "exec-docker")
+        Path(exec_docker_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{exec_docker_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(exec_docker_sh, 0o755)
+        svc_exec = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=exec_docker_sh,
+            allow_unauthenticated=True,
+            allowed_file_roots=[self.apps_root],
+        )
+        marker_file = os.path.join(self.apps_root, "should-never-exist.marker")
+        with self.assertRaises(rb.BridgeRequestError) as ctx_exec_to:
+            svc_exec.exec_in_app(
+                {
+                    "slug": app_slug,
+                    "command": f"sleep 2 && touch {marker_file}",
+                    "timeoutSeconds": 1,
+                }
+            )
+        self.assertEqual(ctx_exec_to.exception.status_code, 504)
+        # Wait past the delayed command's original 2s sleep and verify the marker was NEVER created
+        time.sleep(2.2)
+        self.assertFalse(os.path.exists(marker_file))
 
 
 if __name__ == "__main__":

@@ -476,7 +476,7 @@ export function KeysSettingsTab({
               }`}
             >
               <span className="font-semibold">
-                {testResult.ok ? "Connection Ready: " : "Attention: "}
+                {testResult.ok ? "Gateway healthy: " : "Attention: "}
               </span>
               {testResult.message}
             </div>

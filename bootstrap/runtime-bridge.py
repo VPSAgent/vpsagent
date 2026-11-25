@@ -4195,12 +4195,40 @@ class RuntimeService:
                 project_dir,
             ):
                 base = self._compose_cmd_base(slug, project_dir, compose_path)
+                # Enforce timeout INSIDE the container as well so timed-out shells
+                # are killed inside the container (not only the host docker CLI).
+                inner_wrapper = (
+                    f"if command -v timeout >/dev/null 2>&1; then "
+                    f'exec timeout -k 2 {timeout_s} sh -lc "$1"; '
+                    f"else "
+                    f'sh -lc "$1" & pid=$!; '
+                    f'(sleep {timeout_s}; kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null) & watcher=$!; '
+                    f'wait "$pid"; rc=$?; kill "$watcher" 2>/dev/null; '
+                    f'if [ "$rc" -eq 143 ] || [ "$rc" -eq 137 ]; then exit 124; fi; exit "$rc"; '
+                    f"fi"
+                )
                 t0 = time.monotonic()
                 rc, stdout, stderr, truncated = self._run_cmd_bounded(
-                    [self.docker_bin, *base, "exec", "-T", service, "sh", "-lc", command],
+                    [
+                        self.docker_bin,
+                        *base,
+                        "exec",
+                        "-T",
+                        service,
+                        "sh",
+                        "-c",
+                        inner_wrapper,
+                        "vpsagent-exec",
+                        command,
+                    ],
                     label="Docker exec",
-                    timeout=timeout_s,
+                    timeout=timeout_s + 3,
                 )
+                if rc == 124:
+                    raise BridgeRequestError(
+                        504,
+                        f'Command inside "{slug}" timed out after {timeout_s}s.',
+                    )
                 elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
                 return {
                     "exitCode": rc,
