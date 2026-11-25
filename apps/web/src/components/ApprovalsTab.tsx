@@ -6,12 +6,14 @@ interface ApprovalsTabProps {
   approvals: ApprovalRequest[];
   events: AuditEvent[];
   onRefresh: (query?: string) => Promise<void>;
+  onWatchDeployment?: (slug: string, deploymentId: string) => void;
 }
 
 export function ApprovalsTab({
   approvals,
   events,
   onRefresh,
+  onWatchDeployment,
 }: ApprovalsTabProps) {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
@@ -27,7 +29,11 @@ export function ApprovalsTab({
     setNotice(null);
     try {
       if (approve) {
-        const res = await api.approveRequest(id);
+        const res = await api.approveRequest(id, undefined, true);
+        if (res.deployment && onWatchDeployment) {
+          onWatchDeployment(res.deployment.slug, res.deployment.id);
+          return;
+        }
         setNotice(`Approved & executed: ${res.summary}`);
       } else {
         await api.rejectRequest(id);

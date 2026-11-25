@@ -40,10 +40,61 @@ export const AppRecordSchema = z.object({
   cpuLimit: z.string().min(1).max(16),
   memoryLimitMb: z.number().int().min(64).max(131072),
   companions: z.array(CompanionServiceSchema).default([]),
+  lastCommitSha: z.string().max(64).nullable().default(null),
+  detectedRuntime: z.string().max(48).nullable().default(null),
+  envExampleKeys: z.array(z.string().min(1).max(128)).default([]),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
 export type AppRecord = z.infer<typeof AppRecordSchema>;
+
+export const DetectedRuntimeSchema = z.enum([
+  "dockerfile",
+  "nextjs",
+  "vite-static",
+  "node",
+  "python",
+  "static",
+  "unknown",
+]);
+export type DetectedRuntime = z.infer<typeof DetectedRuntimeSchema>;
+
+export const DeploymentStatusSchema = z.enum([
+  "queued",
+  "cloning",
+  "building",
+  "starting",
+  "verifying",
+  "succeeded",
+  "failed",
+]);
+export type DeploymentStatus = z.infer<typeof DeploymentStatusSchema>;
+
+export const DeploymentActionSchema = z.enum(["deploy_app", "rebuild_app"]);
+export type DeploymentAction = z.infer<typeof DeploymentActionSchema>;
+
+export const DeploymentRecordSchema = z.object({
+  id: z.string().min(1),
+  slug: z.string().min(2).max(48),
+  action: DeploymentActionSchema,
+  status: DeploymentStatusSchema,
+  actor: z.enum(["user", "agent", "system"]),
+  actorTokenId: z.string().nullable().default(null),
+  sourceType: AppSourceTypeSchema,
+  gitRepoUrl: z.string().nullable().default(null),
+  gitBranch: z.string().nullable().default(null),
+  commitSha: z.string().nullable().default(null),
+  detectedRuntime: z.string().nullable().default(null),
+  usedAutoDockerfile: z.boolean().default(false),
+  domain: z.string().nullable().default(null),
+  phaseDetail: z.string().nullable().default(null),
+  buildLogs: z.array(z.string()).default([]),
+  error: z.string().nullable().default(null),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  finishedAt: z.string().nullable().default(null),
+});
+export type DeploymentRecord = z.infer<typeof DeploymentRecordSchema>;
 
 export const AppEnvEntrySchema = z.object({
   key: z.string().min(1).max(128),
@@ -117,6 +168,7 @@ export type TlsStatus = z.infer<typeof TlsStatusSchema>;
 export const SetupStateSchema = z.object({
   claimed: z.boolean(),
   domain: z.string().nullable(),
+  appsBaseDomain: z.string().nullable().default(null),
   acmeEmail: z.string().nullable(),
   httpsActive: z.boolean().default(false),
   tlsStatus: TlsStatusSchema.default("inactive"),

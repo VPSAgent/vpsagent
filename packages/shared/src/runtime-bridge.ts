@@ -107,8 +107,38 @@ export const RuntimeBuildGitResultSchema = z.object({
   commitSha: z.string().nullable(),
   durationMs: z.number().nonnegative(),
   buildLogTail: z.array(z.string()),
+  detectedRuntime: z.string().nullable().optional(),
+  usedAutoDockerfile: z.boolean().optional(),
+  suggestedPort: z.number().int().min(1).max(65535).nullable().optional(),
+  envExampleKeys: z.array(z.string()).optional(),
 });
 export type RuntimeBuildGitResult = z.infer<typeof RuntimeBuildGitResultSchema>;
+
+export const GitEnvExampleKeySchema = z.object({
+  key: z.string().min(1).max(128),
+  isSecret: z.boolean(),
+});
+export type GitEnvExampleKey = z.infer<typeof GitEnvExampleKeySchema>;
+
+export const RuntimeInspectGitResultSchema = z.object({
+  ok: z.boolean(),
+  gitRepoUrl: z.string(),
+  resolvedBranch: z.string().nullable(),
+  commitSha: z.string().nullable(),
+  hasDockerfile: z.boolean(),
+  dockerfilePath: z.string(),
+  detectedRuntime: z.string(),
+  suggestedPort: z.number().int().min(1).max(65535),
+  suggestedSlug: z.string().min(2).max(48),
+  suggestedName: z.string().min(1).max(100),
+  envExampleKeys: z.array(GitEnvExampleKeySchema).default([]),
+  suggestedCompanions: z.array(z.enum(["postgres", "redis"])).default([]),
+  buildPlanSummary: z.string(),
+  notes: z.array(z.string()).default([]),
+});
+export type RuntimeInspectGitResult = z.infer<
+  typeof RuntimeInspectGitResultSchema
+>;
 
 export const ContainerSecurityAuditSchema = z.object({
   capDropAll: z.boolean(),
@@ -196,6 +226,14 @@ export interface RuntimeBuildGitInput {
   gitRepoUrl: string;
   gitBranch?: string | null | undefined;
   dockerfilePath?: string | undefined;
+  allowAutoDetect?: boolean | undefined;
+  timeoutSeconds?: number | undefined;
+}
+
+export interface RuntimeInspectGitInput {
+  gitRepoUrl: string;
+  gitBranch?: string | null | undefined;
+  dockerfilePath?: string | undefined;
   timeoutSeconds?: number | undefined;
 }
 
@@ -216,6 +254,7 @@ export interface RuntimeBridge {
     action: RuntimeLifecycleAction,
   ): Promise<RuntimeLifecycleResult>;
   buildGitImage(input: RuntimeBuildGitInput): Promise<RuntimeBuildGitResult>;
+  inspectGitRepo?(input: RuntimeInspectGitInput): Promise<RuntimeInspectGitResult>;
   getLogs(slug: string, tail: number): Promise<string[]>;
   getLogsDetailed?(slug: string, tail: number): Promise<RuntimeLogsResult>;
   routeCaddy(input: {
@@ -245,11 +284,17 @@ export interface RuntimeBridge {
 
 export class RuntimeBridgeError extends Error {
   readonly statusCode: number;
+  readonly buildLogTail: string[];
 
-  constructor(statusCode: number, message: string) {
+  constructor(
+    statusCode: number,
+    message: string,
+    buildLogTail: string[] = [],
+  ) {
     super(redactSecrets(message));
     this.name = "RuntimeBridgeError";
     this.statusCode = statusCode;
+    this.buildLogTail = buildLogTail.map((line) => redactSecrets(line));
   }
 }
 
@@ -359,9 +404,12 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
     const safeBranch = input.gitBranch
       ? validateGitBranch(input.gitBranch)
       : undefined;
-    const safeDockerfile = input.dockerfilePath
-      ? validateDockerfilePath(input.dockerfilePath)
-      : "Dockerfile";
+    const safeDockerfile =
+      input.dockerfilePath && input.dockerfilePath !== "auto"
+        ? validateDockerfilePath(input.dockerfilePath)
+        : input.dockerfilePath === "auto"
+          ? "auto"
+          : "Dockerfile";
     const safeTimeoutSeconds =
       input.timeoutSeconds !== undefined
         ? z.number().int().min(10).max(600).parse(input.timeoutSeconds)
@@ -379,6 +427,9 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
         gitRepoUrl: safeRepoUrl,
         ...(safeBranch !== undefined ? { gitBranch: safeBranch } : {}),
         dockerfilePath: safeDockerfile,
+        ...(input.allowAutoDetect !== undefined
+          ? { allowAutoDetect: Boolean(input.allowAutoDetect) }
+          : {}),
         ...(safeTimeoutSeconds !== undefined
           ? { timeoutSeconds: safeTimeoutSeconds }
           : {}),
@@ -390,6 +441,47 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       ...parsed,
       buildLogTail: parsed.buildLogTail.map((line) => redactSecrets(line)),
     };
+  }
+
+  async inspectGitRepo(
+    input: RuntimeInspectGitInput,
+  ): Promise<RuntimeInspectGitResult> {
+    const safeRepoUrl = validateHttpBaseUrl(input.gitRepoUrl, {
+      allowPrivateNetwork: false,
+    });
+    if (!safeRepoUrl.startsWith("https://")) {
+      throw new Error("Git repository URL must use https://.");
+    }
+    const safeBranch = input.gitBranch
+      ? validateGitBranch(input.gitBranch)
+      : undefined;
+    const safeDockerfile =
+      input.dockerfilePath && input.dockerfilePath !== "auto"
+        ? validateDockerfilePath(input.dockerfilePath)
+        : "Dockerfile";
+    const safeTimeoutSeconds =
+      input.timeoutSeconds !== undefined
+        ? z.number().int().min(5).max(120).parse(input.timeoutSeconds)
+        : undefined;
+
+    const httpTimeoutMs = safeTimeoutSeconds
+      ? Math.max(SHORT_TIMEOUT_MS, (safeTimeoutSeconds + 15) * 1000)
+      : 90_000;
+
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/inspect-git",
+      {
+        gitRepoUrl: safeRepoUrl,
+        ...(safeBranch !== undefined ? { gitBranch: safeBranch } : {}),
+        dockerfilePath: safeDockerfile,
+        ...(safeTimeoutSeconds !== undefined
+          ? { timeoutSeconds: safeTimeoutSeconds }
+          : {}),
+      },
+      httpTimeoutMs,
+    );
+    return RuntimeInspectGitResultSchema.parse(raw);
   }
 
   async getLogsDetailed(slug: string, tail: number): Promise<RuntimeLogsResult> {
@@ -684,7 +776,16 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
               typeof (parsed as { error: unknown }).error === "string"
                 ? (parsed as { error: string }).error
                 : `Runtime bridge failed with HTTP ${status}.`;
-            fail(new RuntimeBridgeError(status, msg));
+            const buildLogTail =
+              typeof parsed === "object" &&
+              parsed !== null &&
+              "buildLogTail" in parsed &&
+              Array.isArray((parsed as { buildLogTail: unknown }).buildLogTail)
+                ? (parsed as { buildLogTail: unknown[] }).buildLogTail.filter(
+                    (line): line is string => typeof line === "string",
+                  )
+                : [];
+            fail(new RuntimeBridgeError(status, msg, buildLogTail));
             return;
           }
 

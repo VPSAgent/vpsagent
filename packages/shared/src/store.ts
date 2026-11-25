@@ -30,6 +30,10 @@ import {
   type AuditEvent,
   AuditEventSchema,
   type CompanionService,
+  type DeploymentAction,
+  type DeploymentRecord,
+  DeploymentRecordSchema,
+  type DeploymentStatus,
   type RiskLevel,
   type SetupState,
   SetupStateSchema,
@@ -52,8 +56,33 @@ interface AppRow {
   cpu_limit: string;
   memory_limit_mb: number;
   companions_json: string;
+  last_commit_sha: string | null;
+  detected_runtime: string | null;
+  env_example_keys_json: string;
   created_at: string;
   updated_at: string;
+}
+
+interface DeploymentRow {
+  id: string;
+  slug: string;
+  action: DeploymentAction;
+  status: DeploymentStatus;
+  actor: Actor;
+  actor_token_id: string | null;
+  source_type: AppRecord["sourceType"];
+  git_repo_url: string | null;
+  git_branch: string | null;
+  commit_sha: string | null;
+  detected_runtime: string | null;
+  used_auto_dockerfile: number;
+  domain: string | null;
+  phase_detail: string | null;
+  build_logs_json: string;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
 }
 
 interface AppEnvRow {
@@ -98,6 +127,7 @@ interface McpTokenRow {
   id: string;
   name: string;
   scope: McpTokenScope;
+  allowed_slugs_json: string;
   token_hash: string;
   token_prefix: string;
   created_at: string;
@@ -113,6 +143,7 @@ export interface RegistryStoreOptions {
 const DEFAULT_SETUP_STATE: SetupState = {
   claimed: false,
   domain: null,
+  appsBaseDomain: null,
   acmeEmail: null,
   httpsActive: false,
   tlsStatus: "inactive",
@@ -218,6 +249,9 @@ export class RegistryStore {
         cpu_limit TEXT NOT NULL,
         memory_limit_mb INTEGER NOT NULL,
         companions_json TEXT NOT NULL DEFAULT '[]',
+        last_commit_sha TEXT,
+        detected_runtime TEXT,
+        env_example_keys_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -231,6 +265,34 @@ export class RegistryStore {
         PRIMARY KEY (app_slug, key)
       );
 
+      CREATE TABLE IF NOT EXISTS deployments (
+        id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN ('deploy_app', 'rebuild_app')),
+        status TEXT NOT NULL CHECK (status IN ('queued', 'cloning', 'building', 'starting', 'verifying', 'succeeded', 'failed')),
+        actor TEXT NOT NULL CHECK (actor IN ('user', 'agent', 'system')),
+        actor_token_id TEXT,
+        source_type TEXT NOT NULL CHECK (source_type IN ('image', 'git')),
+        git_repo_url TEXT,
+        git_branch TEXT,
+        commit_sha TEXT,
+        detected_runtime TEXT,
+        used_auto_dockerfile INTEGER NOT NULL DEFAULT 0,
+        domain TEXT,
+        phase_detail TEXT,
+        build_logs_json TEXT NOT NULL DEFAULT '[]',
+        error_message TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        finished_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_deployments_slug_created
+        ON deployments (slug, created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_deployments_created
+        ON deployments (created_at DESC);
+
       CREATE TABLE IF NOT EXISTS approval_requests (
         id TEXT PRIMARY KEY,
         action TEXT NOT NULL,
@@ -239,7 +301,7 @@ export class RegistryStore {
         payload_json TEXT NOT NULL,
         requested_by TEXT NOT NULL,
         token_id TEXT,
-        token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'auto-approve')),
+        token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
         status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'executed', 'failed')),
         risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high')),
         decided_by TEXT,
@@ -277,7 +339,8 @@ export class RegistryStore {
       CREATE TABLE IF NOT EXISTS mcp_tokens (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        scope TEXT NOT NULL CHECK (scope IN ('read-only', 'approval-required', 'auto-approve')),
+        scope TEXT NOT NULL CHECK (scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
+        allowed_slugs_json TEXT NOT NULL DEFAULT '[]',
         token_hash TEXT NOT NULL UNIQUE,
         token_prefix TEXT NOT NULL,
         created_at TEXT NOT NULL,
@@ -293,8 +356,103 @@ export class RegistryStore {
     `);
     this.ensureColumn("apps", "probe_http", "INTEGER NOT NULL DEFAULT 1");
     this.ensureColumn("apps", "probe_path", "TEXT NOT NULL DEFAULT '/'");
+    this.ensureColumn("apps", "last_commit_sha", "TEXT");
+    this.ensureColumn("apps", "detected_runtime", "TEXT");
+    this.ensureColumn(
+      "apps",
+      "env_example_keys_json",
+      "TEXT NOT NULL DEFAULT '[]'",
+    );
     this.ensureColumn("approval_requests", "token_id", "TEXT");
     this.ensureColumn("audit_events", "actor_token_id", "TEXT");
+    this.ensureColumn(
+      "mcp_tokens",
+      "allowed_slugs_json",
+      "TEXT NOT NULL DEFAULT '[]'",
+    );
+    this.migrateScopeCheckConstraints();
+  }
+
+  private migrateScopeCheckConstraints(): void {
+    const tokenTable = this.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'mcp_tokens'",
+      )
+      .get() as { sql?: string } | undefined;
+    if (tokenTable?.sql && !tokenTable.sql.includes("safe-auto-deploy")) {
+      this.db.exec("PRAGMA foreign_keys = OFF;");
+      try {
+        this.db.exec(`
+          BEGIN;
+          CREATE TABLE mcp_tokens_new (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            scope TEXT NOT NULL CHECK (scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
+            allowed_slugs_json TEXT NOT NULL DEFAULT '[]',
+            token_hash TEXT NOT NULL UNIQUE,
+            token_prefix TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_used_at TEXT,
+            revoked_at TEXT
+          );
+          INSERT INTO mcp_tokens_new (id, name, scope, allowed_slugs_json, token_hash, token_prefix, created_at, last_used_at, revoked_at)
+            SELECT id, name, scope, COALESCE(allowed_slugs_json, '[]'), token_hash, token_prefix, created_at, last_used_at, revoked_at FROM mcp_tokens;
+          DROP TABLE mcp_tokens;
+          ALTER TABLE mcp_tokens_new RENAME TO mcp_tokens;
+          COMMIT;
+        `);
+      } catch (err) {
+        this.db.exec("ROLLBACK;");
+        throw err;
+      } finally {
+        this.db.exec("PRAGMA foreign_keys = ON;");
+      }
+    }
+
+    const approvalTable = this.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'approval_requests'",
+      )
+      .get() as { sql?: string } | undefined;
+    if (approvalTable?.sql && !approvalTable.sql.includes("safe-auto-deploy")) {
+      this.db.exec("PRAGMA foreign_keys = OFF;");
+      try {
+        this.db.exec(`
+          BEGIN;
+          CREATE TABLE approval_requests_new (
+            id TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            target_slug TEXT,
+            summary TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            token_id TEXT,
+            token_scope TEXT NOT NULL CHECK (token_scope IN ('read-only', 'approval-required', 'safe-auto-deploy', 'auto-approve')),
+            status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'executed', 'failed')),
+            risk_level TEXT NOT NULL CHECK (risk_level IN ('low', 'medium', 'high')),
+            decided_by TEXT,
+            decision_note TEXT,
+            result_summary TEXT,
+            created_at TEXT NOT NULL,
+            decided_at TEXT,
+            executed_at TEXT,
+            execution_owner TEXT
+          );
+          INSERT INTO approval_requests_new (id, action, target_slug, summary, payload_json, requested_by, token_id, token_scope, status, risk_level, decided_by, decision_note, result_summary, created_at, decided_at, executed_at, execution_owner)
+            SELECT id, action, target_slug, summary, payload_json, requested_by, token_id, token_scope, status, risk_level, decided_by, decision_note, result_summary, created_at, decided_at, executed_at, execution_owner FROM approval_requests;
+          DROP TABLE approval_requests;
+          ALTER TABLE approval_requests_new RENAME TO approval_requests;
+          CREATE INDEX IF NOT EXISTS idx_approvals_status_created
+            ON approval_requests (status, created_at DESC);
+          COMMIT;
+        `);
+      } catch (err) {
+        this.db.exec("ROLLBACK;");
+        throw err;
+      } finally {
+        this.db.exec("PRAGMA foreign_keys = ON;");
+      }
+    }
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -315,9 +473,21 @@ export class RegistryStore {
   // ---------------------------------------------------------------------------
 
   upsertApp(
-    input: Omit<AppRecord, "createdAt" | "updatedAt" | "probeHttp" | "probePath"> & {
+    input: Omit<
+      AppRecord,
+      | "createdAt"
+      | "updatedAt"
+      | "probeHttp"
+      | "probePath"
+      | "lastCommitSha"
+      | "detectedRuntime"
+      | "envExampleKeys"
+    > & {
       probeHttp?: boolean;
       probePath?: string;
+      lastCommitSha?: string | null;
+      detectedRuntime?: string | null;
+      envExampleKeys?: string[];
       createdAt?: string;
       updatedAt?: string;
     },
@@ -333,6 +503,18 @@ export class RegistryStore {
       domain: safeDomain,
       probeHttp: input.probeHttp ?? existing?.probeHttp ?? true,
       probePath: input.probePath ?? existing?.probePath ?? "/",
+      lastCommitSha:
+        input.lastCommitSha !== undefined
+          ? input.lastCommitSha
+          : (existing?.lastCommitSha ?? null),
+      detectedRuntime:
+        input.detectedRuntime !== undefined
+          ? input.detectedRuntime
+          : (existing?.detectedRuntime ?? null),
+      envExampleKeys:
+        input.envExampleKeys !== undefined
+          ? input.envExampleKeys
+          : (existing?.envExampleKeys ?? []),
       createdAt: existing?.createdAt ?? input.createdAt ?? now,
       updatedAt: input.updatedAt ?? now,
     });
@@ -342,8 +524,9 @@ export class RegistryStore {
         `INSERT INTO apps (
           slug, name, source_type, image, git_repo_url, git_branch, dockerfile_path,
           domain, folder_path, internal_port, probe_http, probe_path, status, cpu_limit,
-          memory_limit_mb, companions_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          memory_limit_mb, companions_json, last_commit_sha, detected_runtime,
+          env_example_keys_json, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(slug) DO UPDATE SET
           name = excluded.name,
           source_type = excluded.source_type,
@@ -360,6 +543,9 @@ export class RegistryStore {
           cpu_limit = excluded.cpu_limit,
           memory_limit_mb = excluded.memory_limit_mb,
           companions_json = excluded.companions_json,
+          last_commit_sha = excluded.last_commit_sha,
+          detected_runtime = excluded.detected_runtime,
+          env_example_keys_json = excluded.env_example_keys_json,
           updated_at = excluded.updated_at`,
       )
       .run(
@@ -379,6 +565,9 @@ export class RegistryStore {
         record.cpuLimit,
         record.memoryLimitMb,
         JSON.stringify(record.companions),
+        record.lastCommitSha,
+        record.detectedRuntime,
+        JSON.stringify(record.envExampleKeys),
         record.createdAt,
         record.updatedAt,
       );
@@ -423,6 +612,54 @@ export class RegistryStore {
     return this.getApp(slug);
   }
 
+  updateAppBuildMetadata(
+    slug: string,
+    patch: {
+      lastCommitSha?: string | null;
+      detectedRuntime?: string | null;
+      envExampleKeys?: string[];
+      internalPort?: number;
+    },
+  ): AppRecord | null {
+    const existing = this.getApp(slug);
+    if (!existing) {
+      return null;
+    }
+    const now = new Date().toISOString();
+    const nextCommitSha =
+      patch.lastCommitSha !== undefined
+        ? patch.lastCommitSha
+        : existing.lastCommitSha;
+    const nextRuntime =
+      patch.detectedRuntime !== undefined
+        ? patch.detectedRuntime
+        : existing.detectedRuntime;
+    const nextEnvKeys =
+      patch.envExampleKeys !== undefined
+        ? patch.envExampleKeys
+        : existing.envExampleKeys;
+    const nextPort =
+      patch.internalPort !== undefined
+        ? patch.internalPort
+        : existing.internalPort;
+    this.db
+      .prepare(
+        `UPDATE apps
+         SET last_commit_sha = ?, detected_runtime = ?, env_example_keys_json = ?,
+             internal_port = ?, updated_at = ?
+         WHERE slug = ?`,
+      )
+      .run(
+        nextCommitSha,
+        nextRuntime,
+        JSON.stringify(nextEnvKeys),
+        nextPort,
+        now,
+        slug,
+      );
+    return this.getApp(slug);
+  }
+
   deleteApp(slug: string): boolean {
     const res = this.db.prepare("DELETE FROM apps WHERE slug = ?").run(slug);
     return Number(res.changes) > 0;
@@ -430,6 +667,9 @@ export class RegistryStore {
 
   private mapAppRow(row: AppRow): AppRecord {
     const companions = JSON.parse(row.companions_json) as CompanionService[];
+    const envExampleKeys = row.env_example_keys_json
+      ? (JSON.parse(row.env_example_keys_json) as string[])
+      : [];
     return AppRecordSchema.parse({
       slug: row.slug,
       name: row.name,
@@ -447,8 +687,204 @@ export class RegistryStore {
       cpuLimit: row.cpu_limit,
       memoryLimitMb: row.memory_limit_mb,
       companions,
+      lastCommitSha: row.last_commit_sha ?? null,
+      detectedRuntime: row.detected_runtime ?? null,
+      envExampleKeys,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Deployments (live progress, commit tracking, and persisted redacted build logs)
+  // ---------------------------------------------------------------------------
+
+  createDeployment(input: {
+    slug: string;
+    action: DeploymentAction;
+    actor: Actor;
+    actorTokenId?: string | null;
+    sourceType: AppRecord["sourceType"];
+    gitRepoUrl?: string | null;
+    gitBranch?: string | null;
+    domain?: string | null;
+    phaseDetail?: string | null;
+  }): DeploymentRecord {
+    const id = `dep_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const now = new Date().toISOString();
+    const record = DeploymentRecordSchema.parse({
+      id,
+      slug: validateAppSlug(input.slug),
+      action: input.action,
+      status: "queued",
+      actor: input.actor,
+      actorTokenId: input.actorTokenId ?? null,
+      sourceType: input.sourceType,
+      gitRepoUrl: input.gitRepoUrl ?? null,
+      gitBranch: input.gitBranch ?? null,
+      commitSha: null,
+      detectedRuntime: null,
+      usedAutoDockerfile: false,
+      domain: input.domain ?? null,
+      phaseDetail: input.phaseDetail ? redactSecrets(input.phaseDetail) : null,
+      buildLogs: [],
+      error: null,
+      createdAt: now,
+      updatedAt: now,
+      finishedAt: null,
+    });
+
+    this.db
+      .prepare(
+        `INSERT INTO deployments (
+          id, slug, action, status, actor, actor_token_id, source_type,
+          git_repo_url, git_branch, commit_sha, detected_runtime,
+          used_auto_dockerfile, domain, phase_detail, build_logs_json,
+          error_message, created_at, updated_at, finished_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.id,
+        record.slug,
+        record.action,
+        record.status,
+        record.actor,
+        record.actorTokenId,
+        record.sourceType,
+        record.gitRepoUrl,
+        record.gitBranch,
+        record.commitSha,
+        record.detectedRuntime,
+        record.usedAutoDockerfile ? 1 : 0,
+        record.domain,
+        record.phaseDetail,
+        JSON.stringify(record.buildLogs),
+        record.error,
+        record.createdAt,
+        record.updatedAt,
+        record.finishedAt,
+      );
+
+    return record;
+  }
+
+  updateDeployment(
+    id: string,
+    patch: {
+      status?: DeploymentStatus;
+      commitSha?: string | null;
+      detectedRuntime?: string | null;
+      usedAutoDockerfile?: boolean;
+      domain?: string | null;
+      phaseDetail?: string | null;
+      buildLogs?: string[];
+      error?: string | null;
+      finishedAt?: string | null;
+    },
+  ): DeploymentRecord | null {
+    const existing = this.getDeployment(id);
+    if (!existing) {
+      return null;
+    }
+    const now = new Date().toISOString();
+    const nextLogs =
+      patch.buildLogs !== undefined
+        ? patch.buildLogs
+            .slice(-120)
+            .map((line) => redactSecrets(line).slice(0, 1000))
+        : existing.buildLogs;
+    const nextStatus = patch.status ?? existing.status;
+    const nextFinishedAt =
+      patch.finishedAt !== undefined
+        ? patch.finishedAt
+        : nextStatus === "succeeded" || nextStatus === "failed"
+          ? (existing.finishedAt ?? now)
+          : existing.finishedAt;
+
+    this.db
+      .prepare(
+        `UPDATE deployments
+         SET status = ?, commit_sha = ?, detected_runtime = ?,
+             used_auto_dockerfile = ?, domain = ?, phase_detail = ?,
+             build_logs_json = ?, error_message = ?, updated_at = ?,
+             finished_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        nextStatus,
+        patch.commitSha !== undefined ? patch.commitSha : existing.commitSha,
+        patch.detectedRuntime !== undefined
+          ? patch.detectedRuntime
+          : existing.detectedRuntime,
+        (patch.usedAutoDockerfile ?? existing.usedAutoDockerfile) ? 1 : 0,
+        patch.domain !== undefined ? patch.domain : existing.domain,
+        patch.phaseDetail !== undefined
+          ? patch.phaseDetail
+            ? redactSecrets(patch.phaseDetail).slice(0, 500)
+            : null
+          : existing.phaseDetail,
+        JSON.stringify(nextLogs),
+        patch.error !== undefined
+          ? patch.error
+            ? redactSecrets(patch.error).slice(0, 1000)
+            : null
+          : existing.error,
+        now,
+        nextFinishedAt,
+        id,
+      );
+
+    return this.getDeployment(id);
+  }
+
+  getDeployment(id: string): DeploymentRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM deployments WHERE id = ?")
+      .get(id) as DeploymentRow | undefined;
+    return row ? this.mapDeploymentRow(row) : null;
+  }
+
+  listDeployments(options?: {
+    slug?: string;
+    limit?: number;
+  }): DeploymentRecord[] {
+    const limit = Math.min(Math.max(options?.limit ?? 20, 1), 100);
+    const rows = options?.slug
+      ? (this.db
+          .prepare(
+            "SELECT * FROM deployments WHERE slug = ? ORDER BY created_at DESC LIMIT ?",
+          )
+          .all(options.slug, limit) as unknown as DeploymentRow[])
+      : (this.db
+          .prepare("SELECT * FROM deployments ORDER BY created_at DESC LIMIT ?")
+          .all(limit) as unknown as DeploymentRow[]);
+    return rows.map((row) => this.mapDeploymentRow(row));
+  }
+
+  private mapDeploymentRow(row: DeploymentRow): DeploymentRecord {
+    const buildLogs = row.build_logs_json
+      ? (JSON.parse(row.build_logs_json) as string[])
+      : [];
+    return DeploymentRecordSchema.parse({
+      id: row.id,
+      slug: row.slug,
+      action: row.action,
+      status: row.status,
+      actor: row.actor,
+      actorTokenId: row.actor_token_id ?? null,
+      sourceType: row.source_type,
+      gitRepoUrl: row.git_repo_url ?? null,
+      gitBranch: row.git_branch ?? null,
+      commitSha: row.commit_sha ?? null,
+      detectedRuntime: row.detected_runtime ?? null,
+      usedAutoDockerfile: row.used_auto_dockerfile !== 0,
+      domain: row.domain ?? null,
+      phaseDetail: row.phase_detail ?? null,
+      buildLogs,
+      error: row.error_message ?? null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      finishedAt: row.finished_at ?? null,
     });
   }
 
@@ -833,22 +1269,35 @@ export class RegistryStore {
   createMcpToken(input: {
     name: string;
     scope: McpTokenScope;
+    allowedSlugs?: string[];
   }): { record: McpTokenRecord; rawToken: string } {
     const id = `mcp_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
     const { rawToken, tokenHash, tokenPrefix } = generateMcpToken();
     const now = new Date().toISOString();
+    const allowedSlugs = Array.from(
+      new Set((input.allowedSlugs ?? []).map((s) => validateAppSlug(s))),
+    );
 
     this.db
       .prepare(
-        `INSERT INTO mcp_tokens (id, name, scope, token_hash, token_prefix, created_at, last_used_at, revoked_at)
-         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)`,
+        `INSERT INTO mcp_tokens (id, name, scope, allowed_slugs_json, token_hash, token_prefix, created_at, last_used_at, revoked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
       )
-      .run(id, input.name.trim(), input.scope, tokenHash, tokenPrefix, now);
+      .run(
+        id,
+        input.name.trim(),
+        input.scope,
+        JSON.stringify(allowedSlugs),
+        tokenHash,
+        tokenPrefix,
+        now,
+      );
 
     const record = McpTokenRecordSchema.parse({
       id,
       name: input.name.trim(),
       scope: input.scope,
+      allowedSlugs,
       tokenPrefix,
       createdAt: now,
       lastUsedAt: null,
@@ -867,6 +1316,9 @@ export class RegistryStore {
         id: row.id,
         name: row.name,
         scope: row.scope,
+        allowedSlugs: row.allowed_slugs_json
+          ? (JSON.parse(row.allowed_slugs_json) as string[])
+          : [],
         tokenPrefix: row.token_prefix,
         createdAt: row.created_at,
         lastUsedAt: row.last_used_at,
@@ -894,6 +1346,9 @@ export class RegistryStore {
       id: row.id,
       name: row.name,
       scope: row.scope,
+      allowedSlugs: row.allowed_slugs_json
+        ? (JSON.parse(row.allowed_slugs_json) as string[])
+        : [],
       tokenPrefix: row.token_prefix,
       createdAt: row.created_at,
       lastUsedAt: now,
@@ -954,10 +1409,17 @@ export class RegistryStore {
         : patch.domain === null
           ? null
           : validateDomain(patch.domain);
+    const nextAppsBaseDomain =
+      patch.appsBaseDomain === undefined
+        ? current.appsBaseDomain
+        : patch.appsBaseDomain === null
+          ? null
+          : validateDomain(patch.appsBaseDomain);
     const next = SetupStateSchema.parse({
       ...current,
       ...patch,
       domain: nextDomain,
+      appsBaseDomain: nextAppsBaseDomain,
     });
     const now = new Date().toISOString();
     this.db

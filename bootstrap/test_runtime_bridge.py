@@ -955,6 +955,135 @@ sys.exit(0)
             srv.shutdown()
             srv.server_close()
 
+    def test_inspect_and_auto_detect_build_without_dockerfile_and_failure_logs(self) -> None:
+        # 1. Next.js repo with .env.example (no Dockerfile) -> auto-detected port 3000, postgres hint, key-only env extraction
+        next_dir = tempfile.mkdtemp(dir=self.tmp)
+        docker_seen_file = os.path.join(next_dir, "captured-dockerfile.txt")
+        git_py = os.path.join(next_dir, "fake_git.py")
+        Path(git_py).write_text(
+            """import json, os, sys
+args = sys.argv[1:]
+if "clone" in args:
+    dst = args[-1]
+    os.makedirs(dst, exist_ok=True)
+    with open(os.path.join(dst, "package.json"), "w", encoding="utf-8") as fh:
+        json.dump({
+            "name": "cool-next-app",
+            "dependencies": {"next": "15.0.0", "react": "19.0.0", "pg": "8.13.0"},
+            "scripts": {"build": "next build", "start": "next start"}
+        }, fh)
+    with open(os.path.join(dst, "pnpm-lock.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("lockfileVersion: '9.0'\\n")
+    with open(os.path.join(dst, ".env.example"), "w", encoding="utf-8") as fh:
+        fh.write("OPENAI_API_KEY=sk-example-never-return-value\\nDATABASE_URL=postgres://x\\nPUBLIC_TITLE=Hello\\n")
+    sys.exit(0)
+if "rev-parse" in args:
+    if "--abbrev-ref" in args:
+        print("main")
+    else:
+        print("deadbeefcafebabe1234567890abcdef12345678")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        git_sh = os.path.join(next_dir, "fake-git")
+        Path(git_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{git_py}" "$@"\n', encoding="utf-8")
+        os.chmod(git_sh, 0o755)
+
+        docker_py = os.path.join(next_dir, "fake_docker.py")
+        Path(docker_py).write_text(
+            f"""import os, sys
+args = sys.argv[1:]
+if args[:1] == ["build"] and "-f" in args:
+    df_path = args[args.index("-f") + 1]
+    with open(df_path, "r", encoding="utf-8") as src:
+        content = src.read()
+    with open({docker_seen_file!r}, "w", encoding="utf-8") as out:
+        out.write(content)
+    print("Step 1/4 : FROM node:22-alpine")
+    print("Successfully built auto-next")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        docker_sh = os.path.join(next_dir, "fake-docker")
+        Path(docker_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n', encoding="utf-8")
+        os.chmod(docker_sh, 0o755)
+
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+
+        inspected = svc.inspect_git({"gitRepoUrl": "https://github.com/acme/my-next-app"})
+        self.assertEqual(inspected["detectedRuntime"], "nextjs")
+        self.assertFalse(inspected["hasDockerfile"])
+        self.assertEqual(inspected["suggestedPort"], 3000)
+        self.assertEqual(inspected["suggestedSlug"], "my-next-app")
+        self.assertIn("postgres", inspected["suggestedCompanions"])
+        env_keys = [item["key"] for item in inspected["envExampleKeys"]]
+        self.assertEqual(env_keys, ["OPENAI_API_KEY", "DATABASE_URL", "PUBLIC_TITLE"])
+        self.assertNotIn("sk-example-never-return-value", json.dumps(inspected))
+
+        built = svc.build_git(
+            {
+                "slug": "my-next-app",
+                "gitRepoUrl": "https://github.com/acme/my-next-app",
+                "dockerfilePath": "auto",
+            }
+        )
+        self.assertTrue(built["ok"])
+        self.assertTrue(built["usedAutoDockerfile"])
+        self.assertEqual(built["detectedRuntime"], "nextjs")
+        self.assertEqual(built["suggestedPort"], 3000)
+        self.assertIn("OPENAI_API_KEY", built["envExampleKeys"])
+        generated_df = Path(docker_seen_file).read_text(encoding="utf-8")
+        self.assertIn("USER node", generated_df)
+        self.assertIn("pnpm", generated_df)
+
+        # 2. Failed Docker build preserves redacted buildLogTail on BridgeRequestError
+        fail_docker_py = os.path.join(next_dir, "fail_docker.py")
+        Path(fail_docker_py).write_text(
+            """import sys
+print("Step 1/2 : RUN npm run build")
+sys.stderr.write("ERROR: failed with API_KEY=sk-never-leak-build-err-12345\\n")
+sys.exit(1)
+""",
+            encoding="utf-8",
+        )
+        fail_docker_sh = os.path.join(next_dir, "fail-docker")
+        Path(fail_docker_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{fail_docker_py}" "$@"\n', encoding="utf-8")
+        os.chmod(fail_docker_sh, 0o755)
+        svc_fail = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=fail_docker_sh,
+            git_bin=git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+        with self.assertRaises(rb.BridgeRequestError) as ctx:
+            svc_fail.build_git(
+                {
+                    "slug": "my-next-app",
+                    "gitRepoUrl": "https://github.com/acme/my-next-app",
+                    "dockerfilePath": "auto",
+                }
+            )
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertTrue(len(ctx.exception.build_log_tail) >= 1)
+        joined_tail = "\n".join(ctx.exception.build_log_tail)
+        self.assertNotIn("sk-never-leak-build-err-12345", joined_tail)
+        self.assertIn("[REDACTED]", joined_tail)
+
 
 if __name__ == "__main__":
     unittest.main()

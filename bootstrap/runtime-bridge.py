@@ -202,9 +202,18 @@ def default_tls_checker(
 
 
 class BridgeRequestError(Exception):
-    def __init__(self, status_code: int, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        build_log_tail: list[str] | None = None,
+    ) -> None:
         super().__init__(redact_secrets(message))
         self.status_code = status_code
+        self.build_log_tail = [
+            redact_secrets(line)[:MAX_LOG_LINE_CHARS]
+            for line in (build_log_tail or [])
+        ][-MAX_BUILD_LOG_LINES:]
 
 
 def redact_secrets(text: str) -> str:
@@ -321,6 +330,513 @@ def validate_git_branch(raw: Any) -> str | None:
     ):
         raise BridgeRequestError(400, f'Invalid Git branch name "{raw}".')
     return trimmed
+
+
+ENV_SECRET_KEY_HINT_RE = re.compile(
+    r"(?:key|token|secret|password|passwd|pass|passphrase|credential|auth|private|database_url|redis_url)",
+    re.IGNORECASE,
+)
+EXPOSE_PORT_RE = re.compile(r"^\s*EXPOSE\s+(\d{1,5})(?:/tcp)?(?:\s|$)", re.IGNORECASE | re.MULTILINE)
+MAX_INSPECT_FILE_BYTES = 256 * 1024
+MAX_ENV_EXAMPLE_BYTES = 32 * 1024
+
+
+def _derive_slug_and_name_from_repo_url(repo_url: str) -> tuple[str, str]:
+    parsed = urlparse(repo_url)
+    segments = [seg for seg in parsed.path.split("/") if seg]
+    raw_repo = segments[-1] if segments else "github-app"
+    if raw_repo.lower().endswith(".git"):
+        raw_repo = raw_repo[:-4]
+    cleaned = re.sub(r"[^a-z0-9]+", "-", raw_repo.lower()).strip("-")
+    if len(cleaned) < 2:
+        cleaned = f"{cleaned or 'my'}-app"
+    slug = cleaned[:48].rstrip("-")
+    if len(slug) < 2 or not SLUG_PATTERN.match(slug) or slug in RESERVED_SLUGS:
+        base = re.sub(r"[^a-z0-9-]", "", slug)[:40].strip("-") or "repo"
+        slug = f"{base}-app"
+        if slug in RESERVED_SLUGS:
+            slug = "github-app"
+    words = [w for w in re.split(r"[-_.\s]+", raw_repo) if w]
+    display_name = " ".join(w[:1].upper() + w[1:] for w in words)[:100] or "GitHub App"
+    return slug, display_name
+
+
+def _is_regular_file_inside(repo_root: str, rel_path: str) -> str | None:
+    real_root = os.path.realpath(repo_root)
+    current = real_root
+    for part in rel_path.split("/"):
+        current = os.path.join(current, part)
+        if os.path.islink(current):
+            return None
+    if not os.path.isfile(current):
+        return None
+    real_target = os.path.realpath(current)
+    if not real_target.startswith(real_root + os.sep):
+        return None
+    return real_target
+
+
+def _safe_read_repo_text(repo_root: str, rel_path: str, max_bytes: int) -> str | None:
+    target = _is_regular_file_inside(repo_root, rel_path)
+    if target is None:
+        return None
+    try:
+        return _read_regular_file_nofollow(target, max_bytes, rel_path)
+    except BridgeRequestError:
+        return None
+
+
+def _extract_env_example_keys(repo_root: str) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    keys: list[dict[str, Any]] = []
+    for candidate in (".env.example", ".env.sample", ".env.template", "env.example"):
+        content = _safe_read_repo_text(repo_root, candidate, MAX_ENV_EXAMPLE_BYTES)
+        if not content:
+            continue
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if "=" not in line:
+                continue
+            key = line.split("=", 1)[0].strip()
+            if not key or not ENV_KEY_PATTERN.match(key):
+                continue
+            if key in DISALLOWED_ENV_EXACT or any(
+                key.startswith(prefix) for prefix in DISALLOWED_ENV_PREFIXES
+            ):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append(
+                {
+                    "key": key,
+                    "isSecret": bool(ENV_SECRET_KEY_HINT_RE.search(key)),
+                }
+            )
+            if len(keys) >= 60:
+                return keys
+    return keys
+
+
+def _detect_dockerfile_exposed_port(dockerfile_text: str) -> int:
+    match = EXPOSE_PORT_RE.search(dockerfile_text)
+    if match:
+        port = int(match.group(1))
+        if 1 <= port <= 65535:
+            return port
+    return 8080
+
+
+def _build_node_install_lines(pkg_manager: str) -> list[str]:
+    if pkg_manager == "pnpm":
+        return [
+            "RUN corepack enable",
+            "COPY package.json pnpm-lock.yaml* ./",
+            "RUN pnpm install --frozen-lockfile || pnpm install",
+        ]
+    if pkg_manager == "yarn":
+        return [
+            "RUN corepack enable",
+            "COPY package.json yarn.lock* ./",
+            "RUN yarn install --frozen-lockfile || yarn install",
+        ]
+    return [
+        "COPY package.json package-lock.json* ./",
+        "RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi",
+    ]
+
+
+def _inspect_cloned_repo(
+    clone_dir: str,
+    repo_url: str,
+    resolved_branch: str | None,
+    commit_sha: str | None,
+    dockerfile_rel: str,
+) -> dict[str, Any]:
+    """
+    Safely inspects a cloned public repository (strictly no symlink escapes, bounded reads,
+    never extracts .env.example values) to detect its runtime, port, companion databases,
+    required env key names, and optional auto-generated Locked-Apartment Dockerfile.
+    """
+    suggested_slug, suggested_name = _derive_slug_and_name_from_repo_url(repo_url)
+    env_example_keys = _extract_env_example_keys(clone_dir)
+    env_key_names = {item["key"] for item in env_example_keys}
+    notes: list[str] = []
+
+    check_df_rel = "Dockerfile" if dockerfile_rel == "auto" else dockerfile_rel
+    # Verify explicit dockerfile path does not escape via symlinks
+    real_clone_dir = os.path.realpath(clone_dir)
+    df_current = real_clone_dir
+    for part in check_df_rel.split("/"):
+        df_current = os.path.join(df_current, part)
+        if os.path.islink(df_current):
+            raise BridgeRequestError(
+                400,
+                f'Security boundary violation: Dockerfile path "{check_df_rel}" contains a symlink.',
+            )
+    has_dockerfile = os.path.isfile(df_current) and os.path.realpath(
+        df_current
+    ).startswith(real_clone_dir + os.sep)
+
+    # Gather dependency hints from package.json and Python files for companion suggestions
+    pkg_text = _safe_read_repo_text(clone_dir, "package.json", MAX_INSPECT_FILE_BYTES)
+    pkg_data: dict[str, Any] | None = None
+    if pkg_text:
+        try:
+            loaded = json.loads(pkg_text)
+            if isinstance(loaded, dict):
+                pkg_data = loaded
+        except json.JSONDecodeError:
+            pkg_data = None
+
+    deps: dict[str, Any] = {}
+    scripts: dict[str, str] = {}
+    if pkg_data is not None:
+        for field in ("dependencies", "devDependencies"):
+            val = pkg_data.get(field)
+            if isinstance(val, dict):
+                deps.update(val)
+        raw_scripts = pkg_data.get("scripts")
+        if isinstance(raw_scripts, dict):
+            scripts = {
+                str(k): str(v) for k, v in raw_scripts.items() if isinstance(v, str)
+            }
+
+    req_text = _safe_read_repo_text(clone_dir, "requirements.txt", MAX_INSPECT_FILE_BYTES) or ""
+    pyproject_text = _safe_read_repo_text(clone_dir, "pyproject.toml", MAX_INSPECT_FILE_BYTES) or ""
+    py_deps_lower = f"{req_text}\n{pyproject_text}".lower()
+
+    suggested_companions: list[str] = []
+    if (
+        any(k in env_key_names or k.startswith("POSTGRES_") for k in ("DATABASE_URL",))
+        or any(k.startswith("POSTGRES_") for k in env_key_names)
+        or any(d in deps for d in ("pg", "postgres", "prisma", "@prisma/client", "drizzle-orm"))
+        or any(p in py_deps_lower for p in ("psycopg", "asyncpg", "sqlalchemy", "sqlmodel"))
+    ):
+        suggested_companions.append("postgres")
+    if (
+        "REDIS_URL" in env_key_names
+        or any(k.startswith("REDIS_") for k in env_key_names)
+        or any(d in deps for d in ("redis", "ioredis", "bullmq"))
+        or re.search(r"\bredis\b", py_deps_lower)
+    ):
+        suggested_companions.append("redis")
+
+    if has_dockerfile:
+        df_text = _safe_read_repo_text(clone_dir, check_df_rel, MAX_INSPECT_FILE_BYTES) or ""
+        suggested_port = _detect_dockerfile_exposed_port(df_text)
+        return {
+            "ok": True,
+            "gitRepoUrl": repo_url,
+            "resolvedBranch": resolved_branch,
+            "commitSha": commit_sha,
+            "hasDockerfile": True,
+            "dockerfilePath": check_df_rel,
+            "detectedRuntime": "dockerfile",
+            "suggestedPort": suggested_port,
+            "suggestedSlug": suggested_slug,
+            "suggestedName": suggested_name,
+            "envExampleKeys": env_example_keys,
+            "suggestedCompanions": suggested_companions,
+            "buildPlanSummary": f"Uses repository {check_df_rel} (port {suggested_port}).",
+            "notes": notes,
+            "generatedDockerfile": None,
+        }
+
+    # Auto-detect common runtimes when no Dockerfile exists
+    if pkg_data is not None:
+        if _is_regular_file_inside(clone_dir, "pnpm-lock.yaml"):
+            pkg_manager = "pnpm"
+            run_prefix = "pnpm"
+        elif _is_regular_file_inside(clone_dir, "yarn.lock"):
+            pkg_manager = "yarn"
+            run_prefix = "yarn"
+        else:
+            pkg_manager = "npm"
+            run_prefix = "npm run"
+
+        install_lines = _build_node_install_lines(pkg_manager)
+
+        if "next" in deps:
+            build_cmd = f"{run_prefix} build" if "build" in scripts else "npx next build"
+            start_cmd = (
+                '["sh", "-c", "npx next start -H 0.0.0.0 -p ${PORT:-3000}"]'
+                if pkg_manager == "npm"
+                else f'["sh", "-c", "{pkg_manager} exec next start -H 0.0.0.0 -p ${{PORT:-3000}}"]'
+            )
+            generated_df = "\n".join(
+                [
+                    "FROM node:22-alpine",
+                    "WORKDIR /app",
+                    "ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0",
+                    *install_lines,
+                    "COPY . .",
+                    f"RUN {build_cmd}",
+                    "RUN chown -R node:node /app",
+                    "USER node",
+                    "EXPOSE 3000",
+                    f"CMD {start_cmd}",
+                    "",
+                ]
+            )
+            notes.append(
+                f"No Dockerfile found — auto-detected Next.js ({pkg_manager}) and generated a non-root Locked-Apartment build recipe."
+            )
+            return {
+                "ok": True,
+                "gitRepoUrl": repo_url,
+                "resolvedBranch": resolved_branch,
+                "commitSha": commit_sha,
+                "hasDockerfile": False,
+                "dockerfilePath": "auto",
+                "detectedRuntime": "nextjs",
+                "suggestedPort": 3000,
+                "suggestedSlug": suggested_slug,
+                "suggestedName": suggested_name,
+                "envExampleKeys": env_example_keys,
+                "suggestedCompanions": suggested_companions,
+                "buildPlanSummary": f"Auto-detected Next.js ({pkg_manager}) — runs on port 3000.",
+                "notes": notes,
+                "generatedDockerfile": generated_df,
+            }
+
+        backend_deps = {
+            "express",
+            "fastify",
+            "hono",
+            "@nestjs/core",
+            "koa",
+            "nuxt",
+            "astro",
+            "@sveltejs/kit",
+        }
+        start_script = scripts.get("start", "")
+        has_server_start = bool(
+            re.search(r"\b(node|tsx|ts-node|bun|fastify|nest)\b", start_script)
+        )
+        if (
+            "vite" in deps
+            and "build" in scripts
+            and not any(d in deps for d in backend_deps)
+            and not has_server_start
+        ):
+            build_cmd = f"{run_prefix} build"
+            generated_df = "\n".join(
+                [
+                    "FROM node:22-alpine AS builder",
+                    "WORKDIR /app",
+                    *install_lines,
+                    "COPY . .",
+                    f"RUN {build_cmd}",
+                    "",
+                    "FROM nginxinc/nginx-unprivileged:alpine",
+                    "COPY --from=builder /app/dist /usr/share/nginx/html",
+                    r'RUN printf "server {\n  listen 8080;\n  server_name _;\n  root /usr/share/nginx/html;\n  index index.html;\n  location / {\n    try_files \$uri \$uri/ /index.html;\n  }\n}\n" > /etc/nginx/conf.d/default.conf',
+                    "EXPOSE 8080",
+                    "",
+                ]
+            )
+            notes.append(
+                f"No Dockerfile found — auto-detected Vite web app ({pkg_manager}) and packaged it with an unprivileged static web server."
+            )
+            return {
+                "ok": True,
+                "gitRepoUrl": repo_url,
+                "resolvedBranch": resolved_branch,
+                "commitSha": commit_sha,
+                "hasDockerfile": False,
+                "dockerfilePath": "auto",
+                "detectedRuntime": "vite-static",
+                "suggestedPort": 8080,
+                "suggestedSlug": suggested_slug,
+                "suggestedName": suggested_name,
+                "envExampleKeys": env_example_keys,
+                "suggestedCompanions": suggested_companions,
+                "buildPlanSummary": f"Auto-detected Vite frontend ({pkg_manager}) — builds dist/ and serves on port 8080.",
+                "notes": notes,
+                "generatedDockerfile": generated_df,
+            }
+
+        has_build = "build" in scripts
+        if "start" in scripts:
+            start_cmd = (
+                '["pnpm", "start"]'
+                if pkg_manager == "pnpm"
+                else '["yarn", "start"]'
+                if pkg_manager == "yarn"
+                else '["npm", "start"]'
+            )
+        elif _is_regular_file_inside(clone_dir, "server.js"):
+            start_cmd = '["node", "server.js"]'
+        elif _is_regular_file_inside(clone_dir, "index.js"):
+            start_cmd = '["node", "index.js"]'
+        else:
+            start_cmd = '["npm", "start"]'
+
+        node_lines = [
+            "FROM node:22-alpine",
+            "WORKDIR /app",
+            "ENV NODE_ENV=production PORT=3000 HOST=0.0.0.0",
+            *install_lines,
+            "COPY . .",
+        ]
+        if has_build:
+            node_lines.append(f"RUN {run_prefix} build")
+        node_lines.extend(
+            [
+                "RUN chown -R node:node /app",
+                "USER node",
+                "EXPOSE 3000",
+                f"CMD {start_cmd}",
+                "",
+            ]
+        )
+        notes.append(
+            f"No Dockerfile found — auto-detected Node.js ({pkg_manager}) and generated a non-root Locked-Apartment build recipe."
+        )
+        return {
+            "ok": True,
+            "gitRepoUrl": repo_url,
+            "resolvedBranch": resolved_branch,
+            "commitSha": commit_sha,
+            "hasDockerfile": False,
+            "dockerfilePath": "auto",
+            "detectedRuntime": "node",
+            "suggestedPort": 3000,
+            "suggestedSlug": suggested_slug,
+            "suggestedName": suggested_name,
+            "envExampleKeys": env_example_keys,
+            "suggestedCompanions": suggested_companions,
+            "buildPlanSummary": f"Auto-detected Node.js ({pkg_manager}) — runs on port 3000.",
+            "notes": notes,
+            "generatedDockerfile": "\n".join(node_lines),
+        }
+
+    if req_text or pyproject_text:
+        has_main = _is_regular_file_inside(clone_dir, "main.py") is not None
+        has_app = _is_regular_file_inside(clone_dir, "app.py") is not None
+        has_wsgi = _is_regular_file_inside(clone_dir, "wsgi.py") is not None
+        if ("fastapi" in py_deps_lower or "uvicorn" in py_deps_lower) and (
+            has_main or has_app
+        ):
+            mod = "main" if has_main else "app"
+            py_cmd = f'["python", "-m", "uvicorn", "{mod}:app", "--host", "0.0.0.0", "--port", "8000"]'
+            py_desc = f"FastAPI / Uvicorn ({mod}:app)"
+        elif "gunicorn" in py_deps_lower and (has_wsgi or has_app or has_main):
+            mod = "wsgi" if has_wsgi else ("app" if has_app else "main")
+            py_cmd = f'["python", "-m", "gunicorn", "--bind", "0.0.0.0:8000", "{mod}:app"]'
+            py_desc = f"Gunicorn ({mod}:app)"
+        elif "flask" in py_deps_lower and (has_app or has_main):
+            mod = "app" if has_app else "main"
+            py_cmd = f'["python", "-m", "flask", "--app", "{mod}", "run", "--host", "0.0.0.0", "--port", "8000"]'
+            py_desc = f"Flask ({mod}.py)"
+        elif has_main:
+            py_cmd = '["python", "main.py"]'
+            py_desc = "Python (main.py)"
+        elif has_app:
+            py_cmd = '["python", "app.py"]'
+            py_desc = "Python (app.py)"
+        else:
+            py_cmd = '["python", "-m", "http.server", "8000"]'
+            py_desc = "Python"
+
+        py_lines = [
+            "FROM python:3.12-slim",
+            "WORKDIR /app",
+            "ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PORT=8000",
+            "RUN useradd --create-home --uid 10001 appuser",
+            "COPY . .",
+        ]
+        if req_text:
+            py_lines.append(
+                "RUN pip install --no-cache-dir -r requirements.txt"
+            )
+        elif pyproject_text:
+            py_lines.append("RUN pip install --no-cache-dir .")
+        py_lines.extend(
+            [
+                "RUN chown -R appuser:appuser /app",
+                "USER appuser",
+                "EXPOSE 8000",
+                f"CMD {py_cmd}",
+                "",
+            ]
+        )
+        notes.append(
+            f"No Dockerfile found — auto-detected {py_desc} and generated a non-root Locked-Apartment build recipe."
+        )
+        return {
+            "ok": True,
+            "gitRepoUrl": repo_url,
+            "resolvedBranch": resolved_branch,
+            "commitSha": commit_sha,
+            "hasDockerfile": False,
+            "dockerfilePath": "auto",
+            "detectedRuntime": "python",
+            "suggestedPort": 8000,
+            "suggestedSlug": suggested_slug,
+            "suggestedName": suggested_name,
+            "envExampleKeys": env_example_keys,
+            "suggestedCompanions": suggested_companions,
+            "buildPlanSummary": f"Auto-detected {py_desc} — runs on port 8000.",
+            "notes": notes,
+            "generatedDockerfile": "\n".join(py_lines),
+        }
+
+    if _is_regular_file_inside(clone_dir, "index.html"):
+        generated_df = "\n".join(
+            [
+                "FROM nginxinc/nginx-unprivileged:alpine",
+                "COPY . /usr/share/nginx/html",
+                "EXPOSE 8080",
+                "",
+            ]
+        )
+        notes.append(
+            "No Dockerfile found — auto-detected static HTML site (index.html) and packaged it with an unprivileged web server."
+        )
+        return {
+            "ok": True,
+            "gitRepoUrl": repo_url,
+            "resolvedBranch": resolved_branch,
+            "commitSha": commit_sha,
+            "hasDockerfile": False,
+            "dockerfilePath": "auto",
+            "detectedRuntime": "static",
+            "suggestedPort": 8080,
+            "suggestedSlug": suggested_slug,
+            "suggestedName": suggested_name,
+            "envExampleKeys": env_example_keys,
+            "suggestedCompanions": suggested_companions,
+            "buildPlanSummary": "Auto-detected static website (index.html) — serves on port 8080.",
+            "notes": notes,
+            "generatedDockerfile": generated_df,
+        }
+
+    notes.append(
+        "No Dockerfile found and no Node.js (package.json), Python (requirements.txt/pyproject.toml), or static (index.html) project was detected. Add a Dockerfile to this repository to deploy it."
+    )
+    return {
+        "ok": True,
+        "gitRepoUrl": repo_url,
+        "resolvedBranch": resolved_branch,
+        "commitSha": commit_sha,
+        "hasDockerfile": False,
+        "dockerfilePath": check_df_rel,
+        "detectedRuntime": "unknown",
+        "suggestedPort": 8080,
+        "suggestedSlug": suggested_slug,
+        "suggestedName": suggested_name,
+        "envExampleKeys": env_example_keys,
+        "suggestedCompanions": suggested_companions,
+        "buildPlanSummary": "Could not auto-detect project type — a Dockerfile is required.",
+        "notes": notes,
+        "generatedDockerfile": None,
+    }
 
 
 def validate_dockerfile_path(raw: Any) -> str:
@@ -2193,13 +2709,116 @@ class RuntimeService:
                     "detail": f"Workload {slug} {action} -> {status}",
                 }
 
+    def _clone_public_repo(
+        self,
+        repo_url: str,
+        repo_host: str,
+        repo_port: int,
+        validated_ips: list[str],
+        branch: str | None,
+        clone_dir: str,
+        clone_timeout: float,
+    ) -> tuple[str | None, str | None]:
+        with _PinnedGitConnectProxy(
+            repo_host,
+            repo_port,
+            validated_ips,
+            connect_timeout=min(15.0, clone_timeout),
+        ) as proxy:
+            clone_args = [
+                "clone",
+                "--depth",
+                "1",
+                "--single-branch",
+                "-c",
+                "protocol.file.allow=never",
+                "-c",
+                "http.followRedirects=false",
+                "-c",
+                "core.symlinks=false",
+                "-c",
+                f"http.proxy=http://127.0.0.1:{proxy.port}",
+            ]
+            if branch:
+                clone_args.extend(["--branch", branch])
+            clone_args.extend(["--", repo_url, clone_dir])
+            self._run_git(clone_args, timeout=clone_timeout, check=True)
+
+        rev_proc = self._run_git(
+            ["-C", clone_dir, "rev-parse", "HEAD"], timeout=10, check=False
+        )
+        commit_sha = (
+            rev_proc.stdout.strip()[:40]
+            if rev_proc.returncode == 0 and rev_proc.stdout.strip()
+            else None
+        )
+        branch_proc = self._run_git(
+            ["-C", clone_dir, "rev-parse", "--abbrev-ref", "HEAD"],
+            timeout=10,
+            check=False,
+        )
+        resolved_branch = (
+            branch_proc.stdout.strip()[:120]
+            if branch_proc.returncode == 0
+            and branch_proc.stdout.strip()
+            and branch_proc.stdout.strip() != "HEAD"
+            else branch
+        )
+        return commit_sha, resolved_branch
+
+    def inspect_git(self, payload: dict[str, Any]) -> dict[str, Any]:
+        repo_url, repo_host, repo_port, validated_ips = validate_git_repo_url_with_ips(
+            payload.get("gitRepoUrl"), dns_resolver=self.dns_resolver
+        )
+        branch = validate_git_branch(payload.get("gitBranch"))
+        dockerfile_rel = validate_dockerfile_path(payload.get("dockerfilePath"))
+        raw_timeout = payload.get("timeoutSeconds", 45)
+        if (
+            not isinstance(raw_timeout, (int, float))
+            or isinstance(raw_timeout, bool)
+            or raw_timeout < 5
+            or raw_timeout > 120
+        ):
+            raise BridgeRequestError(
+                400, "Field 'timeoutSeconds' must be between 5 and 120."
+            )
+
+        build_dir = tempfile.mkdtemp(prefix="vpsagent-inspect-")
+        os.chmod(build_dir, 0o700)
+        clone_dir = os.path.join(build_dir, "repo")
+        try:
+            commit_sha, resolved_branch = self._clone_public_repo(
+                repo_url,
+                repo_host,
+                repo_port,
+                validated_ips,
+                branch,
+                clone_dir,
+                float(raw_timeout),
+            )
+            info = _inspect_cloned_repo(
+                clone_dir, repo_url, resolved_branch, commit_sha, dockerfile_rel
+            )
+            info.pop("generatedDockerfile", None)
+            return info
+        finally:
+            shutil.rmtree(build_dir, ignore_errors=True)
+
     def build_git(self, payload: dict[str, Any]) -> dict[str, Any]:
         slug = validate_slug(payload.get("slug"))
         repo_url, repo_host, repo_port, validated_ips = validate_git_repo_url_with_ips(
             payload.get("gitRepoUrl"), dns_resolver=self.dns_resolver
         )
         branch = validate_git_branch(payload.get("gitBranch"))
-        dockerfile_rel = validate_dockerfile_path(payload.get("dockerfilePath"))
+        raw_df = payload.get("dockerfilePath")
+        dockerfile_rel = (
+            "auto"
+            if isinstance(raw_df, str) and raw_df.strip() == "auto"
+            else validate_dockerfile_path(raw_df)
+        )
+        allow_auto_detect = bool(
+            payload.get("allowAutoDetect", dockerfile_rel in ("Dockerfile", "auto"))
+        )
 
         raw_timeout = payload.get("timeoutSeconds", DEFAULT_BUILD_TIMEOUT_S)
         if (
@@ -2224,61 +2843,42 @@ class RuntimeService:
             clone_dir = os.path.join(build_dir, "repo")
             try:
                 clone_timeout = max(5.0, min(total_timeout_s * 0.4, 90.0))
-                with _PinnedGitConnectProxy(
+                commit_sha, resolved_branch = self._clone_public_repo(
+                    repo_url,
                     repo_host,
                     repo_port,
                     validated_ips,
-                    connect_timeout=min(15.0, clone_timeout),
-                ) as proxy:
-                    clone_args = [
-                        "clone",
-                        "--depth",
-                        "1",
-                        "--single-branch",
-                        "-c",
-                        "protocol.file.allow=never",
-                        "-c",
-                        "http.followRedirects=false",
-                        "-c",
-                        "core.symlinks=false",
-                        "-c",
-                        f"http.proxy=http://127.0.0.1:{proxy.port}",
-                    ]
-                    if branch:
-                        clone_args.extend(["--branch", branch])
-                    clone_args.extend(["--", repo_url, clone_dir])
-                    self._run_git(clone_args, timeout=clone_timeout, check=True)
+                    branch,
+                    clone_dir,
+                    clone_timeout,
+                )
 
-                # Verify Dockerfile exists inside clone_dir and is not a symlink escape
+                inspected = _inspect_cloned_repo(
+                    clone_dir, repo_url, resolved_branch, commit_sha, dockerfile_rel
+                )
                 real_clone_dir = os.path.realpath(clone_dir)
-                current = real_clone_dir
-                for part in dockerfile_rel.split("/"):
-                    current = os.path.join(current, part)
-                    if os.path.islink(current):
-                        raise BridgeRequestError(
-                            400,
-                            f'Security boundary violation: Dockerfile path "{dockerfile_rel}" contains a symlink.',
-                        )
-                if not os.path.isfile(current):
+                used_auto_dockerfile = False
+                if inspected["hasDockerfile"]:
+                    check_rel = "Dockerfile" if dockerfile_rel == "auto" else dockerfile_rel
+                    real_dockerfile = os.path.realpath(
+                        os.path.join(real_clone_dir, check_rel)
+                    )
+                elif (
+                    allow_auto_detect
+                    and dockerfile_rel in ("Dockerfile", "auto")
+                    and inspected.get("generatedDockerfile")
+                ):
+                    auto_df_path = os.path.join(build_dir, "Dockerfile.vpsagent")
+                    with open(auto_df_path, "w", encoding="utf-8") as fh:
+                        fh.write(str(inspected["generatedDockerfile"]))
+                    os.chmod(auto_df_path, 0o600)
+                    real_dockerfile = auto_df_path
+                    used_auto_dockerfile = True
+                else:
                     raise BridgeRequestError(
                         400,
-                        f'Dockerfile "{dockerfile_rel}" was not found in repository.',
+                        f'Dockerfile "{dockerfile_rel}" was not found in repository, and no supported Node, Python, or static web project was detected.',
                     )
-                real_dockerfile = os.path.realpath(current)
-                if not real_dockerfile.startswith(real_clone_dir + os.sep):
-                    raise BridgeRequestError(
-                        400,
-                        f'Security boundary violation: Dockerfile "{dockerfile_rel}" escapes repository.',
-                    )
-
-                rev_proc = self._run_git(
-                    ["-C", clone_dir, "rev-parse", "HEAD"], timeout=10, check=False
-                )
-                commit_sha = (
-                    rev_proc.stdout.strip()[:40]
-                    if rev_proc.returncode == 0 and rev_proc.stdout.strip()
-                    else None
-                )
 
                 remaining_s = deadline - time.monotonic()
                 if remaining_s < 1.0:
@@ -2297,7 +2897,7 @@ class RuntimeService:
                         real_clone_dir,
                     ],
                     timeout=remaining_s,
-                    check=True,
+                    check=False,
                 )
                 combined = "\n".join(
                     p for p in (build_proc.stdout, build_proc.stderr) if p
@@ -2309,6 +2909,14 @@ class RuntimeService:
                     if line.strip()
                 ][-MAX_BUILD_LOG_LINES:]
 
+                if build_proc.returncode != 0:
+                    err_excerpt = log_tail[-1] if log_tail else "unknown Docker build error"
+                    raise BridgeRequestError(
+                        502,
+                        f"Docker build failed (exit {build_proc.returncode}): {err_excerpt}",
+                        build_log_tail=log_tail,
+                    )
+
                 return {
                     "ok": True,
                     "slug": slug,
@@ -2316,6 +2924,12 @@ class RuntimeService:
                     "commitSha": commit_sha,
                     "durationMs": round((time.monotonic() - t0) * 1000, 1),
                     "buildLogTail": log_tail,
+                    "detectedRuntime": inspected["detectedRuntime"],
+                    "usedAutoDockerfile": used_auto_dockerfile,
+                    "suggestedPort": inspected["suggestedPort"],
+                    "envExampleKeys": [
+                        item["key"] for item in inspected["envExampleKeys"]
+                    ],
                 }
             finally:
                 shutil.rmtree(build_dir, ignore_errors=True)
@@ -3414,6 +4028,8 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(200, service.lifecycle(payload))
                 elif self.path == "/v1/apps/build-git":
                     self._send_json(200, service.build_git(payload))
+                elif self.path == "/v1/apps/inspect-git":
+                    self._send_json(200, service.inspect_git(payload))
                 elif self.path == "/v1/apps/logs":
                     self._send_json(200, service.logs(payload))
                 elif self.path == "/v1/apps/route-caddy":
@@ -3433,7 +4049,10 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                 else:
                     self._send_json(404, {"error": "Not found."})
             except BridgeRequestError as exc:
-                self._send_json(exc.status_code, {"error": str(exc)})
+                err_body: dict[str, Any] = {"error": str(exc)}
+                if exc.build_log_tail:
+                    err_body["buildLogTail"] = exc.build_log_tail
+                self._send_json(exc.status_code, err_body)
             except Exception as exc:  # pragma: no cover - defensive fallback
                 self._send_json(500, {"error": redact_secrets(str(exc))})
 
