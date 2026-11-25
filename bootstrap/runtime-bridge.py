@@ -5107,7 +5107,9 @@ class RuntimeService:
     def _run_core_update_worker(self, repo_dir: str, branch: str) -> None:
         bridge_changed = False
         prev_commit: str | None = None
+        after_commit: str | None = None
         merged_new_commit = False
+        config_snapshots: list[tuple[str, bytes | None]] = []
         try:
             # Record current HEAD so we can roll back cleanly if Docker build fails
             prev_proc = self._run_repo_git(repo_dir, ["rev-parse", "HEAD"], timeout=10)
@@ -5158,7 +5160,7 @@ class RuntimeService:
                 if line.strip():
                     self._append_update_log(line)
 
-            # Step 2: Sync core bootstrap configs into VPSAGENT_ROOT
+            # Step 2: Snapshot existing core configs before syncing updated files into VPSAGENT_ROOT
             # Note: Never overwrite caddy/apps.d/00-default.caddy during updates so an app
             # with slug "00-default" never loses its live HTTPS route.
             self._append_update_log(
@@ -5172,10 +5174,17 @@ class RuntimeService:
             caddyfile_src = os.path.join(bootstrap_dir, "Caddyfile")
             caddyfile_dst = os.path.join(self.vpsagent_root, "Caddyfile")
 
-            if os.path.isfile(caddyfile_src) and os.path.isdir(self.vpsagent_root):
-                shutil.copyfile(caddyfile_src, caddyfile_dst)
-            if os.path.isfile(compose_src) and os.path.isdir(self.vpsagent_root):
-                shutil.copyfile(compose_src, compose_dst)
+            for src_path, dst_path in (
+                (caddyfile_src, caddyfile_dst),
+                (compose_src, compose_dst),
+            ):
+                if os.path.isfile(src_path) and os.path.isdir(self.vpsagent_root):
+                    old_content: bytes | None = None
+                    if os.path.isfile(dst_path):
+                        with open(dst_path, "rb") as fh:
+                            old_content = fh.read()
+                    config_snapshots.append((dst_path, old_content))
+                    shutil.copyfile(src_path, dst_path)
 
             # Step 3: Rebuild and restart vpsagent-core stack
             env_file = os.path.join(self.vpsagent_root, ".env")
@@ -5301,21 +5310,59 @@ class RuntimeService:
                     pass
         except Exception as exc:
             err_text = redact_secrets(str(exc))
-            rollback_note: str | None = None
+            rollback_notes: list[str] = []
+            # Restore snapshotted Compose & Caddy config files so failed updates never leave new config on disk
+            for dst_path, old_content in reversed(config_snapshots):
+                try:
+                    if old_content is None:
+                        if os.path.isfile(dst_path):
+                            os.unlink(dst_path)
+                    else:
+                        with open(dst_path, "wb") as fh:
+                            fh.write(old_content)
+                except OSError:
+                    pass
+            if config_snapshots:
+                rollback_notes.append(
+                    "Restored previous Docker Compose and Caddy configuration files."
+                )
+
+            # Only roll back Git checkout if it is still clean and at the exact merged commit
+            # (never discard local edits the owner made while Docker was building).
             if merged_new_commit and prev_commit:
                 try:
-                    rb_proc = self._run_repo_git(
-                        repo_dir, ["reset", "--hard", prev_commit], timeout=20
+                    cur_head_proc = self._run_repo_git(
+                        repo_dir, ["rev-parse", "HEAD"], timeout=10
                     )
-                    if rb_proc.returncode == 0:
-                        rollback_note = f"Rolled source checkout back to running commit {prev_commit[:7]}."
+                    cur_head = (
+                        (cur_head_proc.stdout or "").strip()
+                        if cur_head_proc.returncode == 0
+                        else None
+                    )
+                    cur_status_proc = self._run_repo_git(
+                        repo_dir, ["status", "--porcelain"], timeout=10
+                    )
+                    is_still_clean = (
+                        cur_status_proc.returncode == 0
+                        and not (cur_status_proc.stdout or "").strip()
+                    )
+                    if is_still_clean and cur_head == after_commit:
+                        rb_proc = self._run_repo_git(
+                            repo_dir, ["reset", "--hard", prev_commit], timeout=20
+                        )
+                        if rb_proc.returncode == 0:
+                            rollback_notes.append(
+                                f"Rolled source checkout back to running commit {prev_commit[:7]}."
+                            )
+                    else:
+                        rollback_notes.append(
+                            "Skipped automatic Git rollback because local changes were detected in the checkout during the build."
+                        )
                 except Exception:
                     pass
             finished_iso = datetime.now(timezone.utc).isoformat()
             with self._update_lock:
-                extra_logs = [f"ERROR: {err_text}"]
-                if rollback_note:
-                    extra_logs.append(rollback_note)
+                extra_logs = [f"ERROR: {err_text}", *rollback_notes]
                 self._update_state = {
                     **self._update_state,
                     "state": "failed",
