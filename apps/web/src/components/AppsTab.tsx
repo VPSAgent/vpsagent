@@ -384,9 +384,6 @@ export function AppsTab({
       if (!manual.has("port")) {
         setInternalPort(String(info.suggestedPort));
       }
-      if (!manual.has("domain") && info.suggestedDomain && !noDomain) {
-        setDomain(info.suggestedDomain);
-      }
       if (!manual.has("postgres")) {
         setWithPostgres(info.suggestedCompanions.includes("postgres"));
       }
@@ -816,7 +813,9 @@ export function AppsTab({
                   ) : githubRepos.length === 0 ? (
                     <p className="text-xs text-[#9CA3AF]">
                       {repoFilter.trim()
-                        ? "No repositories match that search."
+                        ? reposHasMore
+                          ? "No matches in the 500 most recently updated repositories — paste any GitHub URL below to deploy it directly."
+                          : "No repositories match that search."
                         : "No repositories returned for your saved token yet — check Contents: Read-only permission or paste a repo URL below."}
                     </p>
                   ) : (
@@ -873,8 +872,9 @@ export function AppsTab({
                       </div>
                       {reposHasMore && (
                         <p className="text-[11px] text-[#9CA3AF]">
-                          Showing top matches — type in the filter box to search
-                          older repositories or paste any GitHub URL below.
+                          Showing matches from the 500 most recently updated
+                          repositories — paste any GitHub URL below if yours is
+                          older.
                         </p>
                       )}
                     </>

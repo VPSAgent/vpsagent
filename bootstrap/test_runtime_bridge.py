@@ -2077,8 +2077,54 @@ sys.exit(0)
         self.assertFalse(seen["hasGitDir"])
         self.assertIn(".git", seen["dockerignore"])
         self.assertIn(".*", seen["dockerignore"])
+        self.assertIn("!.well-known", seen["dockerignore"])
+        self.assertIn("!.well-known/**", seen["dockerignore"])
         self.assertIn("README*", seen["dockerignore"])
-        self.assertIn("location ~ /\\.", seen["dockerfile"])
+        self.assertIn("location ~ /\\.(?!well-known(/|$))", seen["dockerfile"])
+
+        # Repository-supplied Dockerfile must preserve `.git` for version-stamping builds
+        df_git_py = os.path.join(static_dir, "fake_df_git.py")
+        Path(df_git_py).write_text(
+            """import os, sys
+args = sys.argv[1:]
+if "clone" in args:
+    dst = args[-1]
+    os.makedirs(os.path.join(dst, ".git"), exist_ok=True)
+    with open(os.path.join(dst, ".git", "HEAD"), "w", encoding="utf-8") as fh:
+        fh.write("ref: refs/heads/main\\n")
+    with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as fh:
+        fh.write("FROM alpine:3.20\\nCOPY .git /tmp/.git\\nEXPOSE 8080\\n")
+    sys.exit(0)
+if "rev-parse" in args:
+    print("main" if "--abbrev-ref" in args else "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        df_git_sh = os.path.join(static_dir, "fake-df-git")
+        Path(df_git_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{df_git_py}" "$@"\n', encoding="utf-8")
+        os.chmod(df_git_sh, 0o755)
+        svc_df = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=df_git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+        built_df = svc_df.build_git(
+            {
+                "slug": "custom-df-version",
+                "gitRepoUrl": "https://github.com/acme/versioned-app",
+                "gitToken": "github_pat_11STATIC_TEST_TOKEN_1234",
+            }
+        )
+        self.assertTrue(built_df["ok"])
+        self.assertFalse(built_df["usedAutoDockerfile"])
+        seen_df = json.loads(Path(docker_seen_file).read_text(encoding="utf-8"))
+        self.assertTrue(seen_df["hasGitDir"])
 
 
 if __name__ == "__main__":
