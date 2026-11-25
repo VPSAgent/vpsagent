@@ -368,4 +368,84 @@ describe("RegistryStore (SQLite WAL)", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("encrypts GitHub credentials at rest, manages defaults, and links/clears app gitCredentialId", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpsagent-gitcred-"));
+    const dbFile = path.join(tmpDir, "registry.db");
+    const credStore = new RegistryStore(dbFile, {
+      encryptionSecret: "git-cred-test-encryption-secret-32b",
+    });
+
+    try {
+      const firstToken = "github_pat_11FIRSTTOKEN_00001111";
+      const secondToken = "ghp_SECONDTOKEN_22223333";
+
+      const first = credStore.createGitCredential({
+        label: "Personal GitHub",
+        token: firstToken,
+        accountLogin: "alice",
+      });
+      expect(first.isDefault).toBe(true);
+      expect(first.tokenHint).toBe("github_pat_••••1111");
+      expect(first.accountLogin).toBe("alice");
+
+      // Verify raw SQLite row stores AES-256-GCM ciphertext and never plaintext token
+      const rawDb = new DatabaseSync(dbFile);
+      const rawRow = rawDb
+        .prepare("SELECT token_enc FROM git_credentials WHERE id = ?")
+        .get(first.id) as { token_enc: string };
+      rawDb.close();
+      expect(rawRow.token_enc.startsWith("gcm:")).toBe(true);
+      expect(rawRow.token_enc).not.toContain(firstToken);
+
+      const second = credStore.createGitCredential({
+        label: "Work Org",
+        token: secondToken,
+        accountLogin: "acme-bot",
+      });
+      expect(second.isDefault).toBe(false);
+      expect(second.tokenHint).toBe("ghp_••••3333");
+
+      // Switch default to second credential
+      const promoted = credStore.setDefaultGitCredential(second.id);
+      expect(promoted?.isDefault).toBe(true);
+      expect(credStore.getDefaultGitCredential()?.id).toBe(second.id);
+      expect(credStore.getGitCredential(first.id)?.isDefault).toBe(false);
+
+      // Decrypt secret for runtime bridge & touch lastUsedAt
+      const decrypted = credStore.getGitCredentialSecretForRuntime(second.id);
+      expect(decrypted?.token).toBe(secondToken);
+      credStore.touchGitCredentialLastUsed(second.id);
+      expect(credStore.getGitCredential(second.id)?.lastUsedAt).not.toBeNull();
+
+      // Link app to second credential and verify persistence
+      const app = credStore.upsertApp({
+        slug: "private-api",
+        name: "Private API",
+        sourceType: "git",
+        image: null,
+        gitRepoUrl: "https://github.com/acme/private-api",
+        gitBranch: "main",
+        dockerfilePath: "Dockerfile",
+        domain: null,
+        folderPath: "/apps/private-api",
+        internalPort: 3000,
+        status: "running",
+        cpuLimit: "0.5",
+        memoryLimitMb: 512,
+        companions: [],
+        gitCredentialId: second.id,
+      });
+      expect(app.gitCredentialId).toBe(second.id);
+
+      // Deleting default credential promotes remaining credential and clears app.gitCredentialId
+      expect(credStore.deleteGitCredential(second.id)).toBe(true);
+      expect(credStore.getApp("private-api")?.gitCredentialId).toBeNull();
+      expect(credStore.getDefaultGitCredential()?.id).toBe(first.id);
+      expect(credStore.listGitCredentials()).toHaveLength(1);
+    } finally {
+      credStore.close();
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

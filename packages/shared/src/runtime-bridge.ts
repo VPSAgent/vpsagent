@@ -2,10 +2,13 @@ import http from "node:http";
 import https from "node:https";
 import { z } from "zod";
 import {
+  isGithubHttpsRepoUrl,
   redactSecrets,
+  scrubTokenFromText,
   validateAppSlug,
   validateDockerfilePath,
   validateDomain,
+  validateGitAccessToken,
   validateGitBranch,
   validateHttpBaseUrl,
 } from "./safety.js";
@@ -109,6 +112,7 @@ export const RuntimeBuildGitResultSchema = z.object({
   buildLogTail: z.array(z.string()),
   detectedRuntime: z.string().nullable().optional(),
   usedAutoDockerfile: z.boolean().optional(),
+  usedAuth: z.boolean().optional(),
   suggestedPort: z.number().int().min(1).max(65535).nullable().optional(),
   envExampleKeys: z.array(z.string()).optional(),
 });
@@ -135,6 +139,7 @@ export const RuntimeInspectGitResultSchema = z.object({
   suggestedCompanions: z.array(z.enum(["postgres", "redis"])).default([]),
   buildPlanSummary: z.string(),
   notes: z.array(z.string()).default([]),
+  usedAuth: z.boolean().optional(),
 });
 export type RuntimeInspectGitResult = z.infer<
   typeof RuntimeInspectGitResultSchema
@@ -431,6 +436,7 @@ export interface RuntimeBuildGitInput {
   gitRepoUrl: string;
   gitBranch?: string | null | undefined;
   dockerfilePath?: string | undefined;
+  gitToken?: string | null | undefined;
   allowAutoDetect?: boolean | undefined;
   timeoutSeconds?: number | undefined;
 }
@@ -439,6 +445,7 @@ export interface RuntimeInspectGitInput {
   gitRepoUrl: string;
   gitBranch?: string | null | undefined;
   dockerfilePath?: string | undefined;
+  gitToken?: string | null | undefined;
   timeoutSeconds?: number | undefined;
 }
 
@@ -626,6 +633,14 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
     if (!safeRepoUrl.startsWith("https://")) {
       throw new Error("Git repository URL must use https://.");
     }
+    const safeToken = input.gitToken?.trim()
+      ? validateGitAccessToken(input.gitToken)
+      : undefined;
+    if (safeToken && !isGithubHttpsRepoUrl(safeRepoUrl)) {
+      throw new Error(
+        "GitHub access tokens can only be used with https://github.com repositories.",
+      );
+    }
     const safeBranch = input.gitBranch
       ? validateGitBranch(input.gitBranch)
       : undefined;
@@ -644,27 +659,42 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       ? Math.max(SHORT_TIMEOUT_MS, (safeTimeoutSeconds + 30) * 1000)
       : Math.max(this.defaultTimeoutMs, BUILD_TIMEOUT_MS);
 
-    const raw = await this.requestJson(
-      "POST",
-      "/v1/apps/build-git",
-      {
-        slug: safeSlug,
-        gitRepoUrl: safeRepoUrl,
-        ...(safeBranch !== undefined ? { gitBranch: safeBranch } : {}),
-        dockerfilePath: safeDockerfile,
-        ...(input.allowAutoDetect !== undefined
-          ? { allowAutoDetect: Boolean(input.allowAutoDetect) }
-          : {}),
-        ...(safeTimeoutSeconds !== undefined
-          ? { timeoutSeconds: safeTimeoutSeconds }
-          : {}),
-      },
-      httpTimeoutMs,
-    );
+    let raw: unknown;
+    try {
+      raw = await this.requestJson(
+        "POST",
+        "/v1/apps/build-git",
+        {
+          slug: safeSlug,
+          gitRepoUrl: safeRepoUrl,
+          ...(safeBranch !== undefined ? { gitBranch: safeBranch } : {}),
+          ...(safeToken !== undefined ? { gitToken: safeToken } : {}),
+          dockerfilePath: safeDockerfile,
+          ...(input.allowAutoDetect !== undefined
+            ? { allowAutoDetect: Boolean(input.allowAutoDetect) }
+            : {}),
+          ...(safeTimeoutSeconds !== undefined
+            ? { timeoutSeconds: safeTimeoutSeconds }
+            : {}),
+        },
+        httpTimeoutMs,
+      );
+    } catch (err) {
+      if (err instanceof RuntimeBridgeError) {
+        throw new RuntimeBridgeError(
+          err.statusCode,
+          scrubTokenFromText(err.message, safeToken),
+          err.buildLogTail.map((line) => scrubTokenFromText(line, safeToken)),
+        );
+      }
+      throw err;
+    }
     const parsed = RuntimeBuildGitResultSchema.parse(raw);
     return {
       ...parsed,
-      buildLogTail: parsed.buildLogTail.map((line) => redactSecrets(line)),
+      buildLogTail: parsed.buildLogTail.map((line) =>
+        scrubTokenFromText(line, safeToken),
+      ),
     };
   }
 
@@ -676,6 +706,14 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
     });
     if (!safeRepoUrl.startsWith("https://")) {
       throw new Error("Git repository URL must use https://.");
+    }
+    const safeToken = input.gitToken?.trim()
+      ? validateGitAccessToken(input.gitToken)
+      : undefined;
+    if (safeToken && !isGithubHttpsRepoUrl(safeRepoUrl)) {
+      throw new Error(
+        "GitHub access tokens can only be used with https://github.com repositories.",
+      );
     }
     const safeBranch = input.gitBranch
       ? validateGitBranch(input.gitBranch)
@@ -693,19 +731,32 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       ? Math.max(SHORT_TIMEOUT_MS, (safeTimeoutSeconds + 15) * 1000)
       : 90_000;
 
-    const raw = await this.requestJson(
-      "POST",
-      "/v1/apps/inspect-git",
-      {
-        gitRepoUrl: safeRepoUrl,
-        ...(safeBranch !== undefined ? { gitBranch: safeBranch } : {}),
-        dockerfilePath: safeDockerfile,
-        ...(safeTimeoutSeconds !== undefined
-          ? { timeoutSeconds: safeTimeoutSeconds }
-          : {}),
-      },
-      httpTimeoutMs,
-    );
+    let raw: unknown;
+    try {
+      raw = await this.requestJson(
+        "POST",
+        "/v1/apps/inspect-git",
+        {
+          gitRepoUrl: safeRepoUrl,
+          ...(safeBranch !== undefined ? { gitBranch: safeBranch } : {}),
+          ...(safeToken !== undefined ? { gitToken: safeToken } : {}),
+          dockerfilePath: safeDockerfile,
+          ...(safeTimeoutSeconds !== undefined
+            ? { timeoutSeconds: safeTimeoutSeconds }
+            : {}),
+        },
+        httpTimeoutMs,
+      );
+    } catch (err) {
+      if (err instanceof RuntimeBridgeError) {
+        throw new RuntimeBridgeError(
+          err.statusCode,
+          scrubTokenFromText(err.message, safeToken),
+          err.buildLogTail.map((line) => scrubTokenFromText(line, safeToken)),
+        );
+      }
+      throw err;
+    }
     return RuntimeInspectGitResultSchema.parse(raw);
   }
 

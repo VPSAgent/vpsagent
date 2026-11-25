@@ -4,6 +4,36 @@ import { McpTokenScopeSchema } from "./mcp.js";
 export const AppSourceTypeSchema = z.enum(["image", "git"]);
 export type AppSourceType = z.infer<typeof AppSourceTypeSchema>;
 
+export const GitProviderSchema = z.enum(["github"]);
+export type GitProvider = z.infer<typeof GitProviderSchema>;
+
+export const GitCredentialRecordSchema = z.object({
+  id: z.string().min(1),
+  provider: GitProviderSchema.default("github"),
+  label: z.string().min(1).max(80),
+  accountLogin: z.string().max(100).nullable().default(null),
+  tokenHint: z.string().min(4).max(32),
+  isDefault: z.boolean().default(false),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  lastUsedAt: z.string().nullable().default(null),
+});
+export type GitCredentialRecord = z.infer<typeof GitCredentialRecordSchema>;
+
+export const GithubRepoSummarySchema = z.object({
+  fullName: z.string(),
+  name: z.string(),
+  owner: z.string(),
+  private: z.boolean(),
+  defaultBranch: z.string().nullable(),
+  htmlUrl: z.string(),
+  description: z.string().nullable(),
+  updatedAt: z.string().nullable(),
+  credentialId: z.string(),
+  credentialLabel: z.string(),
+});
+export type GithubRepoSummary = z.infer<typeof GithubRepoSummarySchema>;
+
 export const CompanionServiceTypeSchema = z.enum(["postgres", "redis"]);
 export type CompanionServiceType = z.infer<typeof CompanionServiceTypeSchema>;
 
@@ -43,6 +73,7 @@ export const AppRecordSchema = z.object({
   lastCommitSha: z.string().max(64).nullable().default(null),
   detectedRuntime: z.string().max(48).nullable().default(null),
   envExampleKeys: z.array(z.string().min(1).max(128)).default([]),
+  gitCredentialId: z.string().max(64).nullable().default(null),
   createdAt: z.string(),
   updatedAt: z.string(),
 });

@@ -7,6 +7,7 @@ import {
   AppSourceTypeSchema,
   CompanionServiceSchema,
   type DeploymentRecord,
+  type GithubRepoSummary,
   type HostLookupFn,
   type RegistryStore,
   type RuntimeBridge,
@@ -19,8 +20,11 @@ import {
   RuntimeServiceActionSchema,
   type RuntimeWriteFileResult,
   generateApartmentBlueprint,
+  isGithubHttpsRepoUrl,
+  parseGithubRepoOwnerAndName,
   redactSecrets,
   resolveScopedAppDir,
+  scrubTokenFromText,
   validateAppSlug,
   validateDockerfilePath,
   validateDomain,
@@ -29,6 +33,7 @@ import {
   validateGitRepoUrl,
   writeApartmentBlueprint,
 } from "@vpsagent/shared";
+import { listGithubReposForToken } from "./github.js";
 
 export const DeployAppInputSchema = z.object({
   slug: z.string().min(2).max(48),
@@ -37,6 +42,7 @@ export const DeployAppInputSchema = z.object({
   image: z.string().min(1).max(255).nullable().optional(),
   gitRepoUrl: z.string().min(1).max(500).nullable().optional(),
   gitBranch: z.string().min(1).max(120).nullable().optional(),
+  gitCredentialId: z.string().trim().min(1).max(64).nullable().optional(),
   dockerfilePath: z.string().min(1).max(200).optional(),
   domain: z.string().min(1).max(253).nullable().optional(),
   noDomain: z.boolean().optional(),
@@ -53,6 +59,7 @@ export type DeployAppInput = z.input<typeof DeployAppInputSchema>;
 export const InspectGitInputSchema = z.object({
   gitRepoUrl: z.string().min(1).max(500),
   gitBranch: z.string().min(1).max(120).nullable().optional(),
+  gitCredentialId: z.string().trim().min(1).max(64).nullable().optional(),
   dockerfilePath: z.string().min(1).max(200).optional(),
 });
 export type InspectGitInput = z.input<typeof InspectGitInputSchema>;
@@ -137,7 +144,16 @@ export interface AppExecutorOptions {
   readinessTimeoutSeconds?: number | undefined;
   readinessPollIntervalMs?: number | undefined;
   buildTimeoutSeconds?: number | undefined;
+  githubApiBaseUrl?: string | undefined;
+  githubFetchFn?: typeof fetch | undefined;
 }
+
+interface GitAuthCandidate {
+  id: string | null;
+  token: string | null;
+}
+
+const MAX_SAVED_GIT_AUTH_ATTEMPTS = 5;
 
 const AUTO_MANAGED_ENV_KEYS = new Set(["PORT", "APP_PORT", "APP_SLUG"]);
 
@@ -184,6 +200,8 @@ export class AppExecutor {
   private readonly readinessTimeoutSeconds: number;
   private readonly readinessPollIntervalMs: number;
   private readonly buildTimeoutSeconds: number;
+  private readonly githubApiBaseUrl: string | undefined;
+  private readonly githubFetchFn: typeof fetch | undefined;
   private readonly activeSlugs = new Set<string>();
 
   constructor(options: AppExecutorOptions) {
@@ -194,6 +212,8 @@ export class AppExecutor {
     this.readinessTimeoutSeconds = options.readinessTimeoutSeconds ?? 15;
     this.readinessPollIntervalMs = options.readinessPollIntervalMs ?? 500;
     this.buildTimeoutSeconds = options.buildTimeoutSeconds ?? 300;
+    this.githubApiBaseUrl = options.githubApiBaseUrl;
+    this.githubFetchFn = options.githubFetchFn;
   }
 
   private acquireSlugLock(slug: string): () => void {
@@ -269,8 +289,230 @@ export class AppExecutor {
     return null;
   }
 
+  private getRankedGithubCandidates(
+    repoUrl: string,
+    excludeIds = new Set<string>(),
+  ): GitAuthCandidate[] {
+    const owner = parseGithubRepoOwnerAndName(repoUrl)?.owner.toLowerCase() ?? null;
+    const allCreds = this.store
+      .listGitCredentials()
+      .filter((c) => !excludeIds.has(c.id));
+
+    const tier1 = allCreds.filter(
+      (c) => owner && c.accountLogin?.toLowerCase() === owner && c.isDefault,
+    );
+    const tier2 = allCreds.filter(
+      (c) => owner && c.accountLogin?.toLowerCase() === owner && !c.isDefault,
+    );
+    const tier3 = allCreds.filter(
+      (c) =>
+        c.isDefault && !(owner && c.accountLogin?.toLowerCase() === owner),
+    );
+    const tier4 = allCreds.filter(
+      (c) =>
+        !c.isDefault && !(owner && c.accountLogin?.toLowerCase() === owner),
+    );
+
+    const ordered = [...tier1, ...tier2, ...tier3, ...tier4];
+    const resolved: GitAuthCandidate[] = [];
+    for (const cred of ordered) {
+      if (resolved.length >= MAX_SAVED_GIT_AUTH_ATTEMPTS) {
+        break;
+      }
+      const secret = this.store.getGitCredentialSecretForRuntime(cred.id);
+      if (secret) {
+        resolved.push({ id: secret.record.id, token: secret.token });
+      }
+    }
+    return resolved;
+  }
+
+  private buildGitAuthCandidates(
+    repoUrl: string,
+    opts?: {
+      explicitCredentialId?: string | null;
+      storedCredentialId?: string | null;
+    },
+  ): GitAuthCandidate[] {
+    const explicitId = opts?.explicitCredentialId?.trim() || null;
+    if (explicitId) {
+      if (!isGithubHttpsRepoUrl(repoUrl)) {
+        throw new RuntimeBridgeError(
+          400,
+          "GitHub access tokens can only be used with https://github.com repositories.",
+        );
+      }
+      const secret = this.store.getGitCredentialSecretForRuntime(explicitId);
+      if (!secret) {
+        throw new RuntimeBridgeError(
+          404,
+          `GitHub access token "${explicitId}" was not found.`,
+        );
+      }
+      return [{ id: secret.record.id, token: secret.token }];
+    }
+
+    if (!isGithubHttpsRepoUrl(repoUrl)) {
+      return [{ id: null, token: null }];
+    }
+
+    const storedId = opts?.storedCredentialId?.trim() || null;
+    if (storedId) {
+      const candidates: GitAuthCandidate[] = [];
+      const seen = new Set<string>();
+      const storedSecret = this.store.getGitCredentialSecretForRuntime(storedId);
+      if (storedSecret) {
+        candidates.push({ id: storedSecret.record.id, token: storedSecret.token });
+        seen.add(storedSecret.record.id);
+      }
+      const remaining = this.getRankedGithubCandidates(repoUrl, seen).slice(
+        0,
+        Math.max(0, MAX_SAVED_GIT_AUTH_ATTEMPTS - candidates.length),
+      );
+      candidates.push(...remaining);
+      candidates.push({ id: null, token: null });
+      return candidates;
+    }
+
+    return [
+      { id: null, token: null },
+      ...this.getRankedGithubCandidates(repoUrl),
+    ];
+  }
+
+  private async runGitWithCandidates<T>(
+    repoUrl: string,
+    candidates: GitAuthCandidate[],
+    fn: (candidate: GitAuthCandidate) => Promise<T>,
+  ): Promise<{ value: T; usedCredentialId: string | null }> {
+    let lastAuthError: RuntimeBridgeError | null = null;
+    for (const candidate of candidates) {
+      try {
+        const value = await fn(candidate);
+        if (candidate.id) {
+          this.store.touchGitCredentialLastUsed(candidate.id);
+        }
+        return { value, usedCredentialId: candidate.id };
+      } catch (err) {
+        if (err instanceof RuntimeBridgeError) {
+          const scrubbed = new RuntimeBridgeError(
+            err.statusCode,
+            scrubTokenFromText(err.message, candidate.token),
+            err.buildLogTail.map((line) =>
+              scrubTokenFromText(line, candidate.token),
+            ),
+          );
+          if (err.statusCode === 401) {
+            lastAuthError = scrubbed;
+            continue;
+          }
+          throw scrubbed;
+        }
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(scrubTokenFromText(msg, candidate.token));
+      }
+    }
+
+    if (!isGithubHttpsRepoUrl(repoUrl)) {
+      throw (
+        lastAuthError ??
+        new RuntimeBridgeError(
+          401,
+          "Authentication required: this repository appears to be private or does not exist.",
+        )
+      );
+    }
+
+    const savedCount = this.store.listGitCredentials().length;
+    if (savedCount === 0) {
+      throw new RuntimeBridgeError(
+        401,
+        "This GitHub repository appears to be private (or was not found). Connect a GitHub access token in AI Keys & Settings → Private GitHub Repos, then try again.",
+      );
+    }
+    throw new RuntimeBridgeError(
+      401,
+      "GitHub rejected access to this repository using your saved GitHub token(s). Verify the repository URL is correct and that your token has not expired and has Read-only Contents permission for this repo.",
+    );
+  }
+
+  async listGithubRepos(options?: {
+    credentialId?: string | undefined;
+    query?: string | undefined;
+    limit?: number | undefined;
+  }): Promise<{
+    connected: boolean;
+    repos: GithubRepoSummary[];
+    errors: Array<{ credentialId: string; label: string; error: string }>;
+  }> {
+    const allCredentials = this.store.listGitCredentials();
+    const targetId = options?.credentialId?.trim() || undefined;
+    const targets = targetId
+      ? allCredentials.filter((c) => c.id === targetId)
+      : allCredentials;
+    if (targetId && targets.length === 0) {
+      throw new RuntimeBridgeError(
+        404,
+        `GitHub access token "${targetId}" was not found.`,
+      );
+    }
+    if (targets.length === 0) {
+      return { connected: false, repos: [], errors: [] };
+    }
+
+    const seenFullNames = new Set<string>();
+    const repos: GithubRepoSummary[] = [];
+    const errors: Array<{ credentialId: string; label: string; error: string }> =
+      [];
+
+    for (const cred of targets) {
+      const secret = this.store.getGitCredentialSecretForRuntime(cred.id);
+      if (!secret) {
+        continue;
+      }
+      try {
+        const fetched = await listGithubReposForToken(
+          secret.token,
+          { credentialId: cred.id, credentialLabel: cred.label },
+          {
+            apiBaseUrl: this.githubApiBaseUrl,
+            fetchFn: this.githubFetchFn,
+            ...(options?.query ? { query: options.query } : {}),
+            limit: 100,
+          },
+        );
+        for (const repo of fetched) {
+          const key = repo.fullName.toLowerCase();
+          if (!seenFullNames.has(key)) {
+            seenFullNames.add(key);
+            repos.push(repo);
+          }
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        errors.push({
+          credentialId: cred.id,
+          label: cred.label,
+          error: scrubTokenFromText(msg, secret.token),
+        });
+      }
+    }
+
+    repos.sort((a, b) => (b.updatedAt ?? "").localeCompare(a.updatedAt ?? ""));
+    const limit = Math.min(Math.max(options?.limit ?? 50, 1), 100);
+    return {
+      connected: true,
+      repos: repos.slice(0, limit),
+      errors,
+    };
+  }
+
   async inspectGitRepo(rawInput: InspectGitInput): Promise<
-    RuntimeInspectGitResult & { suggestedDomain: string | null }
+    RuntimeInspectGitResult & {
+      suggestedDomain: string | null;
+      usedAuth: boolean;
+      gitCredentialId: string | null;
+    }
   > {
     if (!this.bridge.inspectGitRepo) {
       throw new RuntimeBridgeError(
@@ -288,18 +530,30 @@ export class AppExecutor {
       input.dockerfilePath && input.dockerfilePath !== "auto"
         ? validateDockerfilePath(input.dockerfilePath)
         : "Dockerfile";
-
-    const result = await this.bridge.inspectGitRepo({
-      gitRepoUrl: safeRepoUrl,
-      gitBranch: safeBranch,
-      dockerfilePath: safeDockerfile,
+    const explicitCredentialId = input.gitCredentialId?.trim() || null;
+    const candidates = this.buildGitAuthCandidates(safeRepoUrl, {
+      explicitCredentialId,
     });
+
+    const { value: result, usedCredentialId } = await this.runGitWithCandidates(
+      safeRepoUrl,
+      candidates,
+      (candidate) =>
+        this.bridge.inspectGitRepo!({
+          gitRepoUrl: safeRepoUrl,
+          gitBranch: safeBranch,
+          dockerfilePath: safeDockerfile,
+          ...(candidate.token ? { gitToken: candidate.token } : {}),
+        }),
+    );
     const baseDomain = this.store.getSetupState().appsBaseDomain;
     const suggestedDomain = baseDomain
       ? validateDomain(`${result.suggestedSlug}.${baseDomain}`)
       : null;
     return {
       ...result,
+      usedAuth: Boolean(result.usedAuth ?? usedCredentialId),
+      gitCredentialId: usedCredentialId,
       suggestedDomain,
     };
   }
@@ -341,6 +595,8 @@ export class AppExecutor {
     try {
       const existing = this.store.getApp(slug);
       let validatedGitUrl: string | null = null;
+      const explicitCredentialId = input.gitCredentialId?.trim() || null;
+      let gitCandidates: GitAuthCandidate[] = [{ id: null, token: null }];
 
       if (input.sourceType === "git") {
         if (!input.gitRepoUrl) {
@@ -350,6 +606,9 @@ export class AppExecutor {
           input.gitRepoUrl,
           this.lookupFn ? { lookupFn: this.lookupFn } : undefined,
         );
+        gitCandidates = this.buildGitAuthCandidates(validatedGitUrl, {
+          explicitCredentialId,
+        });
       }
 
       // Preserve existing companion passwords on re-deploy so DB access never breaks.
@@ -408,6 +667,10 @@ export class AppExecutor {
         cpuLimit: input.cpuLimit,
         memoryLimitMb: input.memoryLimitMb,
         companions: blueprint.companions,
+        gitCredentialId:
+          input.sourceType === "git"
+            ? (explicitCredentialId ?? existing?.gitCredentialId ?? null)
+            : null,
       });
 
       const envToStore = Object.entries(blueprint.envVars).map(
@@ -446,17 +709,27 @@ export class AppExecutor {
           if (input.sourceType === "git" && validatedGitUrl) {
             this.store.updateDeployment(deployment.id, {
               status: "building",
-              phaseDetail: "Cloning public GitHub repository and building image...",
+              phaseDetail: explicitCredentialId
+                ? "Cloning private GitHub repository and building image..."
+                : "Cloning GitHub repository and building image...",
             });
-            const buildRes = await this.bridge.buildGitImage({
-              slug,
-              gitRepoUrl: validatedGitUrl,
-              gitBranch: safeBranch,
-              dockerfilePath: safeDockerfile,
-              allowAutoDetect:
-                safeDockerfile === "Dockerfile" || safeDockerfile === "auto",
-              timeoutSeconds: this.buildTimeoutSeconds,
-            });
+            const { value: buildRes, usedCredentialId } =
+              await this.runGitWithCandidates(
+                validatedGitUrl,
+                gitCandidates,
+                (candidate) =>
+                  this.bridge.buildGitImage({
+                    slug,
+                    gitRepoUrl: validatedGitUrl,
+                    gitBranch: safeBranch,
+                    dockerfilePath: safeDockerfile,
+                    ...(candidate.token ? { gitToken: candidate.token } : {}),
+                    allowAutoDetect:
+                      safeDockerfile === "Dockerfile" ||
+                      safeDockerfile === "auto",
+                    timeoutSeconds: this.buildTimeoutSeconds,
+                  }),
+              );
             buildLogs = buildRes.buildLogTail;
             if (
               input.internalPort === undefined &&
@@ -505,6 +778,7 @@ export class AppExecutor {
               detectedRuntime: buildRes.detectedRuntime ?? null,
               envExampleKeys: buildRes.envExampleKeys ?? [],
               internalPort: resolvedPort,
+              gitCredentialId: usedCredentialId,
             });
             this.store.updateDeployment(deployment.id, {
               status: "starting",
@@ -715,6 +989,7 @@ export class AppExecutor {
     let backgroundStarted = false;
     try {
       let safeRepo: string | null = null;
+      let gitCandidates: GitAuthCandidate[] = [{ id: null, token: null }];
       if (existing.sourceType === "git") {
         if (!existing.gitRepoUrl) {
           throw new RuntimeBridgeError(
@@ -726,6 +1001,9 @@ export class AppExecutor {
           existing.gitRepoUrl,
           this.lookupFn ? { lookupFn: this.lookupFn } : undefined,
         );
+        gitCandidates = this.buildGitAuthCandidates(safeRepo, {
+          storedCredentialId: existing.gitCredentialId,
+        });
       }
 
       const deployment = this.store.createDeployment({
@@ -758,18 +1036,27 @@ export class AppExecutor {
             this.store.updateAppStatus(slug, "building");
             this.store.updateDeployment(deployment.id, {
               status: "building",
-              phaseDetail: "Re-cloning public GitHub repository and rebuilding image...",
+              phaseDetail: existing.gitCredentialId
+                ? "Re-cloning private GitHub repository and rebuilding image..."
+                : "Re-cloning GitHub repository and rebuilding image...",
             });
-            const buildRes = await this.bridge.buildGitImage({
-              slug,
-              gitRepoUrl: safeRepo,
-              gitBranch: existing.gitBranch,
-              dockerfilePath: existing.dockerfilePath,
-              allowAutoDetect:
-                existing.dockerfilePath === "Dockerfile" ||
-                existing.dockerfilePath === "auto",
-              timeoutSeconds: this.buildTimeoutSeconds,
-            });
+            const { value: buildRes, usedCredentialId } =
+              await this.runGitWithCandidates(
+                safeRepo,
+                gitCandidates,
+                (candidate) =>
+                  this.bridge.buildGitImage({
+                    slug,
+                    gitRepoUrl: safeRepo,
+                    gitBranch: existing.gitBranch,
+                    dockerfilePath: existing.dockerfilePath,
+                    ...(candidate.token ? { gitToken: candidate.token } : {}),
+                    allowAutoDetect:
+                      existing.dockerfilePath === "Dockerfile" ||
+                      existing.dockerfilePath === "auto",
+                    timeoutSeconds: this.buildTimeoutSeconds,
+                  }),
+              );
             buildLogs = buildRes.buildLogTail;
             this.store.updateAppBuildMetadata(slug, {
               lastCommitSha: buildRes.commitSha ?? null,
@@ -778,6 +1065,7 @@ export class AppExecutor {
               ...(buildRes.envExampleKeys
                 ? { envExampleKeys: buildRes.envExampleKeys }
                 : {}),
+              gitCredentialId: usedCredentialId,
             });
             this.store.updateDeployment(deployment.id, {
               status: "starting",

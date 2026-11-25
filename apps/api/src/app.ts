@@ -10,6 +10,7 @@ import {
   type RuntimeBridge,
   RuntimeBridgeError,
   redactSecrets,
+  scrubTokenFromText,
   syncAppStatuses,
   validateDomain,
 } from "@vpsagent/shared";
@@ -26,6 +27,7 @@ import {
   InspectGitInputSchema,
   UpdateAppEnvInputSchema,
 } from "./executor.js";
+import { verifyGithubToken } from "./github.js";
 import {
   MCP_TOOLS,
   McpSessionStore,
@@ -53,6 +55,8 @@ export interface VpsAgentAppOptions {
   readinessPollIntervalMs?: number | undefined;
   buildTimeoutSeconds?: number | undefined;
   mcpDeployGraceMs?: number | undefined;
+  githubApiBaseUrl?: string | undefined;
+  githubFetchFn?: typeof fetch | undefined;
 }
 
 const ClaimInputSchema = z.object({
@@ -83,6 +87,12 @@ const SetAppDomainBodySchema = z.object({
 const DecisionBodySchema = z.object({
   note: z.string().max(400).optional(),
   async: z.boolean().optional(),
+});
+
+const CreateGitCredentialBodySchema = z.object({
+  label: z.string().trim().max(80).optional(),
+  token: z.string().trim().min(1, "GitHub token is required.").max(512),
+  isDefault: z.boolean().optional(),
 });
 
 const MIME_TYPES: Record<string, string> = {
@@ -161,6 +171,8 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     readinessTimeoutSeconds: options.readinessTimeoutSeconds,
     readinessPollIntervalMs: options.readinessPollIntervalMs,
     buildTimeoutSeconds: options.buildTimeoutSeconds,
+    githubApiBaseUrl: options.githubApiBaseUrl,
+    githubFetchFn: options.githubFetchFn,
   });
 
   const app = new Hono();
@@ -390,6 +402,49 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   app.use("/api/mcp/*", requireOwner);
   app.use("/api/system/*", requireOwner);
 
+  const assertSameOriginPost = (
+    c: Parameters<Parameters<typeof app.use>[1]>[0],
+  ): Response | null => {
+    const fetchSite = c.req.header("sec-fetch-site")?.trim().toLowerCase();
+    if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+      return c.json(
+        { error: "Cross-origin or sibling-site request blocked." },
+        403,
+      );
+    }
+    const origin = c.req.header("origin")?.trim();
+    if (origin) {
+      let parsedOrigin: URL;
+      try {
+        parsedOrigin = new URL(origin);
+      } catch {
+        return c.json({ error: "Invalid Origin header." }, 403);
+      }
+      const expectedHost = (getRequestHost(c, trustProxy) || "").toLowerCase();
+      if (!expectedHost || parsedOrigin.host.toLowerCase() !== expectedHost) {
+        return c.json({ error: "Cross-origin request blocked." }, 403);
+      }
+      const expectedProto = getRequestProtocol(c, trustProxy);
+      if (
+        expectedProto === "https" &&
+        parsedOrigin.protocol.toLowerCase() !== "https:"
+      ) {
+        return c.json(
+          { error: "HTTPS Origin is required for this request." },
+          403,
+        );
+      }
+    }
+    const contentType = (c.req.header("content-type") || "").toLowerCase();
+    if (!contentType.includes("application/json")) {
+      return c.json(
+        { error: "Content-Type: application/json is required." },
+        415,
+      );
+    }
+    return null;
+  };
+
   // Step 2 of first-boot setup (applies directly to Caddy via Runtime Bridge!)
   app.post("/api/setup/domain", async (c) => {
     try {
@@ -480,6 +535,161 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     }
   });
 
+  app.get("/api/git/credentials", (c) => {
+    return c.json({ credentials: store.listGitCredentials() });
+  });
+
+  app.post("/api/git/credentials", async (c) => {
+    try {
+      assertSecureTransport(c, transportOptions);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "HTTPS required." },
+        403,
+      );
+    }
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+
+    let rawToken = "";
+    try {
+      const body = CreateGitCredentialBodySchema.parse(await c.req.json());
+      rawToken = body.token;
+      const verified = await verifyGithubToken(rawToken, {
+        apiBaseUrl: options.githubApiBaseUrl,
+        fetchFn: options.githubFetchFn,
+      });
+      const label =
+        body.label?.trim() ||
+        (verified.accountLogin
+          ? `GitHub (@${verified.accountLogin})`
+          : "GitHub Token");
+      const record = store.createGitCredential({
+        provider: "github",
+        label,
+        token: rawToken,
+        accountLogin: verified.accountLogin,
+        ...(body.isDefault !== undefined ? { isDefault: body.isDefault } : {}),
+      });
+      store.recordAudit({
+        actor: "user",
+        action: "git.credential_added",
+        summary: `Connected GitHub access token "${record.label}" (${record.tokenHint})`,
+        riskLevel: "medium",
+      });
+      return c.json(
+        {
+          credential: record,
+          accountLogin: verified.accountLogin,
+          accessibleRepoCount: verified.accessibleRepoCount,
+          warning: verified.warning,
+        },
+        201,
+      );
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error: scrubTokenFromText(error, rawToken) }, status);
+    }
+  });
+
+  app.post("/api/git/credentials/:id/default", (c) => {
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+    const id = c.req.param("id");
+    const updated = store.setDefaultGitCredential(id);
+    if (!updated) {
+      return c.json({ error: "GitHub access token not found." }, 404);
+    }
+    store.recordAudit({
+      actor: "user",
+      action: "git.credential_default_updated",
+      summary: `Set "${updated.label}" (${updated.tokenHint}) as default GitHub token`,
+      riskLevel: "low",
+    });
+    return c.json({ ok: true, credential: updated });
+  });
+
+  app.post("/api/git/credentials/:id/test", async (c) => {
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+    const id = c.req.param("id");
+    const secret = store.getGitCredentialSecretForRuntime(id);
+    if (!secret) {
+      return c.json({ error: "GitHub access token not found." }, 404);
+    }
+    try {
+      const verified = await verifyGithubToken(secret.token, {
+        apiBaseUrl: options.githubApiBaseUrl,
+        fetchFn: options.githubFetchFn,
+      });
+      store.touchGitCredentialLastUsed(id);
+      if (
+        verified.accountLogin &&
+        verified.accountLogin !== secret.record.accountLogin
+      ) {
+        store.updateGitCredentialMeta(id, {
+          accountLogin: verified.accountLogin,
+        });
+      }
+      const latest = store.getGitCredential(id)!;
+      return c.json({
+        ok: true,
+        credential: latest,
+        accountLogin: verified.accountLogin,
+        accessibleRepoCount: verified.accessibleRepoCount,
+        warning: verified.warning,
+      });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json(
+        { error: scrubTokenFromText(error, secret.token) },
+        status,
+      );
+    }
+  });
+
+  app.delete("/api/git/credentials/:id", (c) => {
+    const id = c.req.param("id");
+    const existing = store.getGitCredential(id);
+    if (!existing) {
+      return c.json({ error: "GitHub access token not found." }, 404);
+    }
+    store.deleteGitCredential(id);
+    store.recordAudit({
+      actor: "user",
+      action: "git.credential_deleted",
+      summary: `Removed GitHub access token "${existing.label}" (${existing.tokenHint})`,
+      riskLevel: "medium",
+    });
+    return c.json({ ok: true });
+  });
+
+  app.get("/api/git/repos", async (c) => {
+    try {
+      const credentialId = c.req.query("credentialId")?.trim() || undefined;
+      const query = c.req.query("query")?.trim() || undefined;
+      const rawLimit = Number.parseInt(c.req.query("limit") ?? "50", 10);
+      const limit = Number.isFinite(rawLimit)
+        ? Math.min(Math.max(rawLimit, 1), 100)
+        : 50;
+      const result = await executor.listGithubRepos({
+        ...(credentialId ? { credentialId } : {}),
+        ...(query ? { query } : {}),
+        limit,
+      });
+      return c.json(result);
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
   app.get("/api/deployments", (c) => {
     const slug = c.req.query("slug")?.trim() || undefined;
     const rawLimit = Number.parseInt(c.req.query("limit") ?? "20", 10);
@@ -523,6 +733,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         apps,
         pendingApprovals,
         activeMcpTokens: tokens,
+        githubConnected: store.listGitCredentials().length > 0,
         setup: store.getSetupState(),
       });
     } catch (err) {
@@ -958,52 +1169,6 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   // ---------------------------------------------------------------------------
   // VPSAgent Self-Update (Owner-only + strict same-origin CSRF guard)
   // ---------------------------------------------------------------------------
-
-  const assertSameOriginPost = (
-    c: Parameters<Parameters<typeof app.use>[1]>[0],
-  ): Response | null => {
-    const fetchSite = c.req.header("sec-fetch-site")?.trim().toLowerCase();
-    if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
-      return c.json(
-        { error: "Cross-origin or sibling-site update request blocked." },
-        403,
-      );
-    }
-    const origin = c.req.header("origin")?.trim();
-    if (origin) {
-      let parsedOrigin: URL;
-      try {
-        parsedOrigin = new URL(origin);
-      } catch {
-        return c.json({ error: "Invalid Origin header." }, 403);
-      }
-      const expectedHost = (getRequestHost(c, trustProxy) || "").toLowerCase();
-      if (!expectedHost || parsedOrigin.host.toLowerCase() !== expectedHost) {
-        return c.json(
-          { error: "Cross-origin update request blocked." },
-          403,
-        );
-      }
-      const expectedProto = getRequestProtocol(c, trustProxy);
-      if (
-        expectedProto === "https" &&
-        parsedOrigin.protocol.toLowerCase() !== "https:"
-      ) {
-        return c.json(
-          { error: "HTTPS Origin is required for update requests." },
-          403,
-        );
-      }
-    }
-    const contentType = (c.req.header("content-type") || "").toLowerCase();
-    if (!contentType.includes("application/json")) {
-      return c.json(
-        { error: "Content-Type: application/json is required." },
-        415,
-      );
-    }
-    return null;
-  };
 
   const unavailableUpdateStatus = {
     state: "idle" as const,

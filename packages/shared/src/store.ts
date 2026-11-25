@@ -11,11 +11,13 @@ import {
   hashMcpToken,
 } from "./mcp.js";
 import {
+  formatGitTokenHint,
   redactSecrets,
   redactStructuredValue,
   validateAppSlug,
   validateDomain,
   validateEnvKey,
+  validateGitAccessToken,
 } from "./safety.js";
 import {
   type Actor,
@@ -34,6 +36,9 @@ import {
   type DeploymentRecord,
   DeploymentRecordSchema,
   type DeploymentStatus,
+  type GitCredentialRecord,
+  GitCredentialRecordSchema,
+  type GitProvider,
   type RiskLevel,
   type SetupState,
   SetupStateSchema,
@@ -59,8 +64,22 @@ interface AppRow {
   last_commit_sha: string | null;
   detected_runtime: string | null;
   env_example_keys_json: string;
+  git_credential_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface GitCredentialRow {
+  id: string;
+  provider: GitProvider;
+  label: string;
+  account_login: string | null;
+  token_enc: string;
+  token_hint: string;
+  is_default: number;
+  created_at: string;
+  updated_at: string;
+  last_used_at: string | null;
 }
 
 interface DeploymentRow {
@@ -353,6 +372,19 @@ export class RegistryStore {
         value_json TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS git_credentials (
+        id TEXT PRIMARY KEY,
+        provider TEXT NOT NULL CHECK (provider IN ('github')),
+        label TEXT NOT NULL,
+        account_login TEXT,
+        token_enc TEXT NOT NULL,
+        token_hint TEXT NOT NULL,
+        is_default INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_used_at TEXT
+      );
     `);
     this.ensureColumn("apps", "probe_http", "INTEGER NOT NULL DEFAULT 1");
     this.ensureColumn("apps", "probe_path", "TEXT NOT NULL DEFAULT '/'");
@@ -363,6 +395,7 @@ export class RegistryStore {
       "env_example_keys_json",
       "TEXT NOT NULL DEFAULT '[]'",
     );
+    this.ensureColumn("apps", "git_credential_id", "TEXT");
     this.ensureColumn("approval_requests", "token_id", "TEXT");
     this.ensureColumn("audit_events", "actor_token_id", "TEXT");
     this.ensureColumn(
@@ -482,12 +515,14 @@ export class RegistryStore {
       | "lastCommitSha"
       | "detectedRuntime"
       | "envExampleKeys"
+      | "gitCredentialId"
     > & {
       probeHttp?: boolean;
       probePath?: string;
       lastCommitSha?: string | null;
       detectedRuntime?: string | null;
       envExampleKeys?: string[];
+      gitCredentialId?: string | null;
       createdAt?: string;
       updatedAt?: string;
     },
@@ -515,6 +550,10 @@ export class RegistryStore {
         input.envExampleKeys !== undefined
           ? input.envExampleKeys
           : (existing?.envExampleKeys ?? []),
+      gitCredentialId:
+        input.gitCredentialId !== undefined
+          ? input.gitCredentialId
+          : (existing?.gitCredentialId ?? null),
       createdAt: existing?.createdAt ?? input.createdAt ?? now,
       updatedAt: input.updatedAt ?? now,
     });
@@ -525,8 +564,8 @@ export class RegistryStore {
           slug, name, source_type, image, git_repo_url, git_branch, dockerfile_path,
           domain, folder_path, internal_port, probe_http, probe_path, status, cpu_limit,
           memory_limit_mb, companions_json, last_commit_sha, detected_runtime,
-          env_example_keys_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          env_example_keys_json, git_credential_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(slug) DO UPDATE SET
           name = excluded.name,
           source_type = excluded.source_type,
@@ -546,6 +585,7 @@ export class RegistryStore {
           last_commit_sha = excluded.last_commit_sha,
           detected_runtime = excluded.detected_runtime,
           env_example_keys_json = excluded.env_example_keys_json,
+          git_credential_id = excluded.git_credential_id,
           updated_at = excluded.updated_at`,
       )
       .run(
@@ -568,6 +608,7 @@ export class RegistryStore {
         record.lastCommitSha,
         record.detectedRuntime,
         JSON.stringify(record.envExampleKeys),
+        record.gitCredentialId,
         record.createdAt,
         record.updatedAt,
       );
@@ -619,6 +660,7 @@ export class RegistryStore {
       detectedRuntime?: string | null;
       envExampleKeys?: string[];
       internalPort?: number;
+      gitCredentialId?: string | null;
     },
   ): AppRecord | null {
     const existing = this.getApp(slug);
@@ -642,11 +684,15 @@ export class RegistryStore {
       patch.internalPort !== undefined
         ? patch.internalPort
         : existing.internalPort;
+    const nextCredentialId =
+      patch.gitCredentialId !== undefined
+        ? patch.gitCredentialId
+        : existing.gitCredentialId;
     this.db
       .prepare(
         `UPDATE apps
          SET last_commit_sha = ?, detected_runtime = ?, env_example_keys_json = ?,
-             internal_port = ?, updated_at = ?
+             internal_port = ?, git_credential_id = ?, updated_at = ?
          WHERE slug = ?`,
       )
       .run(
@@ -654,6 +700,7 @@ export class RegistryStore {
         nextRuntime,
         JSON.stringify(nextEnvKeys),
         nextPort,
+        nextCredentialId,
         now,
         slug,
       );
@@ -690,6 +737,7 @@ export class RegistryStore {
       lastCommitSha: row.last_commit_sha ?? null,
       detectedRuntime: row.detected_runtime ?? null,
       envExampleKeys,
+      gitCredentialId: row.git_credential_id ?? null,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     });
@@ -1464,5 +1512,225 @@ export class RegistryStore {
       return false;
     }
     return crypto.timingSafeEqual(candidate, stored);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Private GitHub Credentials (encrypted at rest, never returned to callers)
+  // ---------------------------------------------------------------------------
+
+  private mapGitCredentialRow(row: GitCredentialRow): GitCredentialRecord {
+    return GitCredentialRecordSchema.parse({
+      id: row.id,
+      provider: row.provider,
+      label: row.label,
+      accountLogin: row.account_login ?? null,
+      tokenHint: row.token_hint,
+      isDefault: row.is_default !== 0,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      lastUsedAt: row.last_used_at ?? null,
+    });
+  }
+
+  createGitCredential(input: {
+    provider?: GitProvider | undefined;
+    label: string;
+    token: string;
+    accountLogin?: string | null | undefined;
+    isDefault?: boolean | undefined;
+  }): GitCredentialRecord {
+    const provider: GitProvider = input.provider ?? "github";
+    const safeToken = validateGitAccessToken(input.token);
+    const label = input.label.trim().slice(0, 80);
+    if (!label) {
+      throw new Error("GitHub credential label cannot be empty.");
+    }
+    const accountLogin = input.accountLogin?.trim()
+      ? input.accountLogin.trim().slice(0, 100)
+      : null;
+    const id = `ghc_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const now = new Date().toISOString();
+    const tokenEnc = encryptValue(safeToken, this.encryptionKey);
+    const tokenHint = formatGitTokenHint(safeToken);
+
+    this.db.exec("BEGIN IMMEDIATE;");
+    try {
+      const existingCountRow = this.db
+        .prepare("SELECT COUNT(*) AS cnt FROM git_credentials")
+        .get() as { cnt: number };
+      const shouldBeDefault =
+        Number(existingCountRow.cnt) === 0 || input.isDefault === true;
+      if (shouldBeDefault) {
+        this.db.prepare("UPDATE git_credentials SET is_default = 0").run();
+      }
+      this.db
+        .prepare(
+          `INSERT INTO git_credentials (
+            id, provider, label, account_login, token_enc, token_hint,
+            is_default, created_at, updated_at, last_used_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+        )
+        .run(
+          id,
+          provider,
+          label,
+          accountLogin,
+          tokenEnc,
+          tokenHint,
+          shouldBeDefault ? 1 : 0,
+          now,
+          now,
+        );
+      this.db.exec("COMMIT;");
+    } catch (err) {
+      this.db.exec("ROLLBACK;");
+      throw err;
+    }
+
+    return this.getGitCredential(id)!;
+  }
+
+  listGitCredentials(): GitCredentialRecord[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM git_credentials ORDER BY is_default DESC, created_at DESC",
+      )
+      .all() as unknown as GitCredentialRow[];
+    return rows.map((row) => this.mapGitCredentialRow(row));
+  }
+
+  getGitCredential(id: string): GitCredentialRecord | null {
+    const row = this.db
+      .prepare("SELECT * FROM git_credentials WHERE id = ?")
+      .get(id) as GitCredentialRow | undefined;
+    return row ? this.mapGitCredentialRow(row) : null;
+  }
+
+  getDefaultGitCredential(): GitCredentialRecord | null {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM git_credentials ORDER BY is_default DESC, created_at DESC LIMIT 1",
+      )
+      .get() as GitCredentialRow | undefined;
+    return row ? this.mapGitCredentialRow(row) : null;
+  }
+
+  /** Internal runtime helper: decrypts a saved GitHub token strictly for bridge/API requests. */
+  getGitCredentialSecretForRuntime(
+    id: string,
+  ): { record: GitCredentialRecord; token: string } | null {
+    const row = this.db
+      .prepare("SELECT * FROM git_credentials WHERE id = ?")
+      .get(id) as GitCredentialRow | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      record: this.mapGitCredentialRow(row),
+      token: decryptValue(row.token_enc, this.encryptionKey),
+    };
+  }
+
+  touchGitCredentialLastUsed(id: string): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        "UPDATE git_credentials SET last_used_at = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(now, now, id);
+  }
+
+  setDefaultGitCredential(id: string): GitCredentialRecord | null {
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE;");
+    try {
+      const existing = this.db
+        .prepare("SELECT id FROM git_credentials WHERE id = ?")
+        .get(id) as { id: string } | undefined;
+      if (!existing) {
+        this.db.exec("ROLLBACK;");
+        return null;
+      }
+      this.db.prepare("UPDATE git_credentials SET is_default = 0").run();
+      this.db
+        .prepare(
+          "UPDATE git_credentials SET is_default = 1, updated_at = ? WHERE id = ?",
+        )
+        .run(now, id);
+      this.db.exec("COMMIT;");
+    } catch (err) {
+      this.db.exec("ROLLBACK;");
+      throw err;
+    }
+    return this.getGitCredential(id);
+  }
+
+  updateGitCredentialMeta(
+    id: string,
+    patch: { label?: string | undefined; accountLogin?: string | null | undefined },
+  ): GitCredentialRecord | null {
+    const existing = this.getGitCredential(id);
+    if (!existing) {
+      return null;
+    }
+    const now = new Date().toISOString();
+    const nextLabel =
+      patch.label !== undefined
+        ? patch.label.trim().slice(0, 80) || existing.label
+        : existing.label;
+    const nextAccountLogin =
+      patch.accountLogin !== undefined
+        ? patch.accountLogin?.trim()
+          ? patch.accountLogin.trim().slice(0, 100)
+          : null
+        : existing.accountLogin;
+    this.db
+      .prepare(
+        "UPDATE git_credentials SET label = ?, account_login = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(nextLabel, nextAccountLogin, now, id);
+    return this.getGitCredential(id);
+  }
+
+  deleteGitCredential(id: string): boolean {
+    let deleted = false;
+    this.db.exec("BEGIN IMMEDIATE;");
+    try {
+      const existing = this.db
+        .prepare("SELECT is_default FROM git_credentials WHERE id = ?")
+        .get(id) as { is_default: number } | undefined;
+      if (!existing) {
+        this.db.exec("ROLLBACK;");
+        return false;
+      }
+      const res = this.db
+        .prepare("DELETE FROM git_credentials WHERE id = ?")
+        .run(id);
+      deleted = Number(res.changes) > 0;
+      this.db
+        .prepare(
+          "UPDATE apps SET git_credential_id = NULL WHERE git_credential_id = ?",
+        )
+        .run(id);
+      if (deleted && existing.is_default !== 0) {
+        const nextRow = this.db
+          .prepare(
+            "SELECT id FROM git_credentials ORDER BY created_at DESC LIMIT 1",
+          )
+          .get() as { id: string } | undefined;
+        if (nextRow) {
+          this.db
+            .prepare(
+              "UPDATE git_credentials SET is_default = 1, updated_at = ? WHERE id = ?",
+            )
+            .run(new Date().toISOString(), nextRow.id);
+        }
+      }
+      this.db.exec("COMMIT;");
+    } catch (err) {
+      this.db.exec("ROLLBACK;");
+      throw err;
+    }
+    return deleted;
   }
 }

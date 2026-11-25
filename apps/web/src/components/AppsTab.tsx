@@ -7,8 +7,10 @@ import {
   Hammer,
   KeyRound,
   Loader2,
+  Lock,
   Play,
   Plus,
+  RefreshCw,
   Rocket,
   RotateCw,
   Search,
@@ -24,7 +26,9 @@ import {
   type AppRecord,
   type CompanionService,
   type DeploymentRecord,
+  type GitCredentialRecord,
   type GitInspectResult,
+  type GithubRepoSummary,
   type InspectResult,
 } from "../api";
 import { formatSafetyCheckHealth, type HealthBadge } from "../health-display";
@@ -69,12 +73,14 @@ type DrawerSection = "deployments" | "logs" | "domain" | "env" | "security";
 interface AppsTabProps {
   apps: AppRecord[];
   appsBaseDomain: string | null;
+  gitCredentials?: GitCredentialRecord[];
   deepLink?: {
     slug: string;
     section: DrawerSection;
     deploymentId?: string;
   } | null;
   onConsumeDeepLink?: () => void;
+  onOpenGithubSettings?: () => void;
   onRefresh: () => Promise<void>;
   onInspectSync?: (inspect: InspectResult) => void;
 }
@@ -82,8 +88,10 @@ interface AppsTabProps {
 export function AppsTab({
   apps,
   appsBaseDomain,
+  gitCredentials = [],
   deepLink,
   onConsumeDeepLink,
+  onOpenGithubSettings,
   onRefresh,
   onInspectSync,
 }: AppsTabProps) {
@@ -98,6 +106,11 @@ export function AppsTab({
   const [image, setImage] = useState("nginxinc/nginx-unprivileged:alpine");
   const [gitRepoUrl, setGitRepoUrl] = useState("");
   const [gitBranch, setGitBranch] = useState("");
+  const [gitCredentialId, setGitCredentialId] = useState("");
+  const [githubRepos, setGithubRepos] = useState<GithubRepoSummary[]>([]);
+  const [reposLoading, setReposLoading] = useState(false);
+  const [repoFilter, setRepoFilter] = useState("");
+  const [reposError, setReposError] = useState<string | null>(null);
   const [dockerfilePath, setDockerfilePath] = useState("auto");
   const [internalPort, setInternalPort] = useState("");
   const [domain, setDomain] = useState("");
@@ -214,9 +227,65 @@ export function AppsTab({
     return () => window.clearInterval(timer);
   }, [onRefresh, openDrawerBySlug, section, selectedSlug, trackedDeployment]);
 
+  const loadGithubRepos = useCallback(async () => {
+    if (gitCredentials.length === 0) {
+      setGithubRepos([]);
+      return;
+    }
+    setReposLoading(true);
+    setReposError(null);
+    try {
+      const res = await api.listGithubRepos({ limit: 50 });
+      setGithubRepos(res.repos);
+      if (res.errors.length > 0 && res.repos.length === 0) {
+        setReposError(res.errors[0]!.error);
+      }
+    } catch (err) {
+      setReposError(
+        err instanceof Error
+          ? err.message
+          : "Could not load your GitHub repositories.",
+      );
+    } finally {
+      setReposLoading(false);
+    }
+  }, [gitCredentials.length]);
+
+  useEffect(() => {
+    if (showCreate && sourceType === "git" && gitCredentials.length > 0) {
+      void loadGithubRepos();
+    }
+  }, [gitCredentials.length, loadGithubRepos, showCreate, sourceType]);
+
+  const handleSelectGithubRepo = (repo: GithubRepoSummary) => {
+    setGitRepoUrl(repo.htmlUrl);
+    setGitBranch(repo.defaultBranch ?? "");
+    setGitCredentialId(repo.credentialId);
+    setGitPreview(null);
+    if (!slug.trim()) {
+      const cleanedSlug = repo.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 48);
+      if (cleanedSlug.length >= 2) {
+        setSlug(cleanedSlug);
+      }
+    }
+    if (!name.trim()) {
+      const displayName = repo.name
+        .replace(/[-_.]+/g, " ")
+        .replace(/\b\w/g, (ch) => ch.toUpperCase())
+        .slice(0, 100);
+      if (displayName) {
+        setName(displayName);
+      }
+    }
+  };
+
   const handleInspectGit = async () => {
     if (!gitRepoUrl.trim()) {
-      setError("Paste a public HTTPS GitHub link first.");
+      setError("Paste an HTTPS GitHub link first.");
       return;
     }
     setInspectingGit(true);
@@ -227,9 +296,13 @@ export function AppsTab({
         gitRepoUrl.trim(),
         gitBranch.trim() || null,
         dockerfilePath.trim() || "auto",
+        gitCredentialId || null,
       );
       const info = res.inspect;
       setGitPreview(info);
+      if (info.gitCredentialId && !gitCredentialId) {
+        setGitCredentialId(info.gitCredentialId);
+      }
       if (!name.trim()) setName(info.suggestedName);
       if (!slug.trim()) setSlug(info.suggestedSlug);
       if (!gitBranch.trim() && info.resolvedBranch) {
@@ -327,6 +400,9 @@ export function AppsTab({
           image: sourceType === "image" ? image.trim() : null,
           gitRepoUrl: sourceType === "git" ? gitRepoUrl.trim() : null,
           gitBranch: sourceType === "git" ? gitBranch.trim() || null : null,
+          ...(sourceType === "git" && gitCredentialId
+            ? { gitCredentialId }
+            : {}),
           dockerfilePath:
             sourceType === "git"
               ? dockerfilePath.trim() || "auto"
@@ -353,6 +429,8 @@ export function AppsTab({
       setName("");
       setGitRepoUrl("");
       setGitBranch("");
+      setGitCredentialId("");
+      setRepoFilter("");
       setDockerfilePath("auto");
       setInternalPort("");
       setDomain("");
@@ -444,13 +522,21 @@ export function AppsTab({
             Apps
           </h1>
           <p className="mt-1 text-sm text-[#9CA3AF]">
-            Deploy public GitHub repos (auto-detected or Dockerfile) or Docker
-            images inside isolated Locked Apartments.
+            Deploy public or private GitHub repos (auto-detected or Dockerfile)
+            or Docker images inside isolated Locked Apartments.
           </p>
         </div>
         <button
           type="button"
-          onClick={() => setShowCreate((v) => !v)}
+          onClick={() => {
+            setShowCreate((v) => {
+              if (v) {
+                setGitCredentialId("");
+                setRepoFilter("");
+              }
+              return !v;
+            });
+          }}
           className="btn-press inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 cursor-pointer"
         >
           <Plus className="h-4 w-4" />
@@ -609,10 +695,125 @@ export function AppsTab({
               aria-labelledby="app-source-tab-git"
               className="space-y-4"
             >
+              {gitCredentials.length > 0 ? (
+                <div className="surface-well rounded-lg p-3.5 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-white">
+                      <Lock className="h-3.5 w-3.5 text-emerald-400" />
+                      Your GitHub repositories
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={repoFilter}
+                        onChange={(e) => setRepoFilter(e.target.value)}
+                        placeholder="Filter repos..."
+                        className="field-input rounded-md px-2.5 py-1 text-xs w-44"
+                      />
+                      <button
+                        type="button"
+                        disabled={reposLoading}
+                        onClick={() => void loadGithubRepos()}
+                        className="btn-press inline-flex items-center gap-1 rounded-md border border-white/[0.1] bg-[#111317] px-2.5 py-1 text-xs text-[#D1D5DB] hover:text-white disabled:opacity-50 cursor-pointer"
+                      >
+                        <RefreshCw
+                          className={`h-3 w-3 ${reposLoading ? "animate-spin" : ""}`}
+                        />
+                        Refresh
+                      </button>
+                    </div>
+                  </div>
+
+                  {reposError && (
+                    <p className="text-xs text-rose-300">{reposError}</p>
+                  )}
+
+                  {reposLoading && githubRepos.length === 0 ? (
+                    <p className="text-xs text-[#9CA3AF]">
+                      Loading your accessible repositories...
+                    </p>
+                  ) : (
+                    (() => {
+                      const needle = repoFilter.trim().toLowerCase();
+                      const filtered = needle
+                        ? githubRepos.filter(
+                            (r) =>
+                              r.fullName.toLowerCase().includes(needle) ||
+                              (r.description ?? "")
+                                .toLowerCase()
+                                .includes(needle),
+                          )
+                        : githubRepos;
+                      if (filtered.length === 0) {
+                        return (
+                          <p className="text-xs text-[#9CA3AF]">
+                            {githubRepos.length === 0
+                              ? "No repositories returned for your saved token yet — check Contents: Read-only permission or paste a repo URL below."
+                              : "No repositories match that filter."}
+                          </p>
+                        );
+                      }
+                      return (
+                        <div className="max-h-44 overflow-y-auto divide-y divide-white/[0.06] rounded-md border border-white/[0.08] bg-[#090A0C]">
+                          {filtered.map((repo) => {
+                            const selected =
+                              gitRepoUrl.trim().replace(/\/+$/, "") ===
+                              repo.htmlUrl;
+                            return (
+                              <button
+                                key={`${repo.credentialId}:${repo.fullName}`}
+                                type="button"
+                                onClick={() => handleSelectGithubRepo(repo)}
+                                className={`w-full text-left px-3 py-2 flex items-center justify-between gap-3 text-xs cursor-pointer transition-colors ${
+                                  selected
+                                    ? "bg-emerald-500/12 text-white"
+                                    : "hover:bg-white/[0.04] text-[#D1D5DB]"
+                                }`}
+                              >
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-mono font-medium truncate">
+                                      {repo.fullName}
+                                    </span>
+                                    {repo.private ? (
+                                      <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 shrink-0">
+                                        <Lock className="h-2.5 w-2.5" />
+                                        Private
+                                      </span>
+                                    ) : (
+                                      <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-[#9CA3AF] shrink-0">
+                                        Public
+                                      </span>
+                                    )}
+                                  </div>
+                                  {repo.description && (
+                                    <p className="text-[11px] text-[#6B7280] truncate mt-0.5">
+                                      {repo.description}
+                                    </p>
+                                  )}
+                                </div>
+                                <div className="text-right shrink-0 text-[11px] text-[#6B7280] font-mono">
+                                  {repo.defaultBranch ?? "main"}
+                                  {gitCredentials.length > 1 && (
+                                    <span className="block text-[10px] text-[#9CA3AF] font-sans">
+                                      {repo.credentialLabel}
+                                    </span>
+                                  )}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()
+                  )}
+                </div>
+              ) : null}
+
               <div className="flex flex-wrap gap-2.5 items-end">
                 <div className="flex-1 min-w-[260px]">
                   <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
-                    Public HTTPS GitHub repo URL
+                    HTTPS GitHub repo URL (public or private)
                   </label>
                   <input
                     type="url"
@@ -637,6 +838,44 @@ export function AppsTab({
                   {inspectingGit ? "Inspecting..." : "Inspect & auto-fill"}
                 </button>
               </div>
+
+              {gitCredentials.length === 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/[0.08] bg-[#0C0E12] px-3.5 py-2 text-xs text-[#9CA3AF]">
+                  <span>Deploying a private GitHub repo?</span>
+                  {onOpenGithubSettings && (
+                    <button
+                      type="button"
+                      onClick={onOpenGithubSettings}
+                      className="btn-press inline-flex items-center gap-1 text-emerald-400 hover:text-emerald-300 font-medium cursor-pointer"
+                    >
+                      <Lock className="h-3 w-3" />
+                      Connect GitHub in Settings
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {gitCredentials.length > 1 && (
+                <div>
+                  <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                    GitHub access token
+                  </label>
+                  <select
+                    value={gitCredentialId}
+                    onChange={(e) => setGitCredentialId(e.target.value)}
+                    className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
+                  >
+                    <option value="">Auto (public or default token)</option>
+                    {gitCredentials.map((cred) => (
+                      <option key={cred.id} value={cred.id}>
+                        {cred.label}
+                        {cred.accountLogin ? ` (@${cred.accountLogin})` : ""}
+                        {cred.isDefault ? " — Default" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
               {gitPreview && (
                 <div className="rounded-lg border border-sky-500/30 bg-sky-500/[0.08] p-3.5 space-y-1.5 text-xs">
@@ -830,7 +1069,11 @@ export function AppsTab({
           <div className="flex justify-end gap-2.5 pt-1">
             <button
               type="button"
-              onClick={() => setShowCreate(false)}
+              onClick={() => {
+                setShowCreate(false);
+                setGitCredentialId("");
+                setRepoFilter("");
+              }}
               className="btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-4 py-2 text-[13px] font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
             >
               Cancel
@@ -853,9 +1096,9 @@ export function AppsTab({
             No apps running yet
           </p>
           <p className="text-xs text-[#9CA3AF] max-w-md mx-auto">
-            Launch a public GitHub repo or Docker image directly, or create a
-            visitor pass in AI Keys &amp; Settings so your AI agent can deploy
-            for you.
+            Launch a public or private GitHub repo or Docker image directly, or
+            create a visitor pass in AI Keys &amp; Settings so your AI agent can
+            deploy for you.
           </p>
           <button
             type="button"
@@ -929,6 +1172,15 @@ export function AppsTab({
                           <span className="inline-flex items-center gap-1 font-mono text-[#9CA3AF]">
                             <GitBranch className="h-3 w-3 text-[#6B7280]" />
                             {app.lastCommitSha.slice(0, 7)}
+                          </span>
+                        </>
+                      )}
+                      {app.gitCredentialId && (
+                        <>
+                          <span className="text-[#4B5563]">&middot;</span>
+                          <span className="inline-flex items-center gap-1 text-amber-300">
+                            <Lock className="h-3 w-3" />
+                            Private repo
                           </span>
                         </>
                       )}

@@ -10,6 +10,7 @@ import { createVpsAgentApp } from "./app.js";
 export * from "./app.js";
 export * from "./auth.js";
 export * from "./executor.js";
+export * from "./github.js";
 export * from "./mcp-gateway.js";
 
 function startServerFromEnv(): void {

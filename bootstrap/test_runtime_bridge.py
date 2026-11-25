@@ -1735,6 +1735,198 @@ sys.exit(0)
         )
         self.assertEqual(svc.core_update_status(check_remote=False)["state"], "failed")
 
+    def test_private_github_clone_auth_pinning_cleanup_and_redaction(self) -> None:
+        import base64
+
+        priv_dir = os.path.join(self.tmp, "private-git")
+        os.makedirs(priv_dir, exist_ok=True)
+        record_file = os.path.join(priv_dir, "git_seen.json")
+        docker_seen_file = os.path.join(priv_dir, "docker_seen.json")
+
+        token = "github_pat_11PRIVATETOKEN_99887766"
+        expected_b64 = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+
+        git_py = os.path.join(priv_dir, "fake_git.py")
+        Path(git_py).write_text(
+            f"""import json, os, stat, sys
+args = sys.argv[1:]
+if "clone" in args:
+    cfg_path = os.environ.get("GIT_CONFIG_GLOBAL", "")
+    cfg_text = ""
+    cfg_mode = None
+    if cfg_path and os.path.exists(cfg_path):
+        cfg_mode = stat.S_IMODE(os.stat(cfg_path).st_mode)
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            cfg_text = fh.read()
+    dst = args[-1]
+    os.makedirs(dst, exist_ok=True)
+    with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as df:
+        df.write("FROM alpine:3.20\\nEXPOSE 8080\\n")
+    with open({record_file!r}, "w", encoding="utf-8") as out:
+        json.dump({{
+            "args": args,
+            "cfgPath": cfg_path,
+            "cfgInsideClone": bool(cfg_path and os.path.abspath(cfg_path).startswith(os.path.abspath(dst))),
+            "cfgMode": cfg_mode,
+            "cfgText": cfg_text,
+            "envVals": list(os.environ.values()),
+        }}, out)
+    sys.exit(0)
+if "rev-parse" in args:
+    if "--abbrev-ref" in args:
+        print("main")
+    else:
+        print("11223344556677889900aabbccddeeff00112233")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        git_sh = os.path.join(priv_dir, "fake-git")
+        Path(git_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{git_py}" "$@"\n', encoding="utf-8")
+        os.chmod(git_sh, 0o755)
+
+        docker_py = os.path.join(priv_dir, "fake_docker.py")
+        Path(docker_py).write_text(
+            f"""import json, os, sys
+args = sys.argv[1:]
+if args[:1] == ["build"]:
+    ctx_dir = args[-1]
+    parent_dir = os.path.dirname(ctx_dir)
+    auth_conf_exists = os.path.exists(os.path.join(parent_dir, "git-auth.conf"))
+    with open({docker_seen_file!r}, "w", encoding="utf-8") as out:
+        json.dump({{"authConfStillPresent": auth_conf_exists, "filesInCtx": os.listdir(ctx_dir)}}, out)
+    print("Built private app image")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        docker_sh = os.path.join(priv_dir, "fake-docker")
+        Path(docker_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n', encoding="utf-8")
+        os.chmod(docker_sh, 0o755)
+
+        svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+
+        inspected = svc.inspect_git(
+            {"gitRepoUrl": "https://github.com/acme/private-demo", "gitToken": token}
+        )
+        self.assertTrue(inspected["usedAuth"])
+        self.assertEqual(inspected["detectedRuntime"], "dockerfile")
+        seen = json.loads(Path(record_file).read_text(encoding="utf-8"))
+        self.assertFalse(seen["cfgInsideClone"])
+        self.assertEqual(seen["cfgMode"], 0o600)
+        self.assertIn('[http "https://github.com/"]', seen["cfgText"])
+        self.assertIn(f"Authorization: Basic {expected_b64}", seen["cfgText"])
+        self.assertFalse(any(token in a for a in seen["args"]))
+        self.assertFalse(any(token in v for v in seen["envVals"]))
+
+        built = svc.build_git(
+            {
+                "slug": "priv-demo",
+                "gitRepoUrl": "https://github.com/acme/private-demo",
+                "gitToken": token,
+            }
+        )
+        self.assertTrue(built["ok"])
+        self.assertTrue(built["usedAuth"])
+        docker_seen = json.loads(Path(docker_seen_file).read_text(encoding="utf-8"))
+        self.assertFalse(docker_seen["authConfStillPresent"])
+        self.assertNotIn("git-auth.conf", docker_seen["filesInCtx"])
+
+        # Token cannot be sent to non-github.com hosts or non-443 ports
+        for bad_url in (
+            "https://gitlab.com/acme/private-demo",
+            "https://github.com:8443/acme/private-demo",
+        ):
+            with self.assertRaises(rb.BridgeRequestError) as host_ctx:
+                svc.inspect_git({"gitRepoUrl": bad_url, "gitToken": token})
+            self.assertEqual(host_ctx.exception.status_code, 400)
+
+        # Invalid token characters (newlines / quotes / spaces) rejected
+        for bad_tok in ("bad token\n[http]", 'ghp_1234"quote', "short"):
+            with self.assertRaises(rb.BridgeRequestError) as tok_ctx:
+                svc.inspect_git(
+                    {"gitRepoUrl": "https://github.com/acme/private-demo", "gitToken": bad_tok}
+                )
+            self.assertEqual(tok_ctx.exception.status_code, 400)
+
+        # Git 401/403 errors return HTTP 401 and scrub both raw token and basic base64
+        fail_git_py = os.path.join(priv_dir, "fail_git.py")
+        Path(fail_git_py).write_text(
+            f"""import sys
+sys.stderr.write("remote: Repository not found. fatal: Authentication failed for token={token} basic={expected_b64}\\n")
+sys.exit(128)
+""",
+            encoding="utf-8",
+        )
+        fail_git_sh = os.path.join(priv_dir, "fail-git")
+        Path(fail_git_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{fail_git_py}" "$@"\n', encoding="utf-8")
+        os.chmod(fail_git_sh, 0o755)
+        svc_fail = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=docker_sh,
+            git_bin=fail_git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+        with self.assertRaises(rb.BridgeRequestError) as anon_ctx:
+            svc_fail.inspect_git({"gitRepoUrl": "https://github.com/acme/private-demo"})
+        self.assertEqual(anon_ctx.exception.status_code, 401)
+
+        with self.assertRaises(rb.BridgeRequestError) as auth_ctx:
+            svc_fail.inspect_git(
+                {"gitRepoUrl": "https://github.com/acme/private-demo", "gitToken": token}
+            )
+        self.assertEqual(auth_ctx.exception.status_code, 401)
+        self.assertNotIn(token, str(auth_ctx.exception))
+        self.assertNotIn(expected_b64, str(auth_ctx.exception))
+
+        # Docker build output also scrubs raw token and basic base64
+        leak_docker_py = os.path.join(priv_dir, "leak_docker.py")
+        Path(leak_docker_py).write_text(
+            f"""import sys
+print("Step 1: token={token}")
+sys.stderr.write("ERROR basic={expected_b64}\\n")
+sys.exit(1)
+""",
+            encoding="utf-8",
+        )
+        leak_docker_sh = os.path.join(priv_dir, "leak-docker")
+        Path(leak_docker_sh).write_text(f'#!/usr/bin/env sh\nexec "{sys.executable}" "{leak_docker_py}" "$@"\n', encoding="utf-8")
+        os.chmod(leak_docker_sh, 0o755)
+        svc_leak = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=leak_docker_sh,
+            git_bin=git_sh,
+            runtime_token="secret-token-for-unit-test-1234",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+        with self.assertRaises(rb.BridgeRequestError) as leak_ctx:
+            svc_leak.build_git(
+                {
+                    "slug": "priv-demo",
+                    "gitRepoUrl": "https://github.com/acme/private-demo",
+                    "gitToken": token,
+                }
+            )
+        self.assertEqual(leak_ctx.exception.status_code, 502)
+        joined = "\n".join([str(leak_ctx.exception), *leak_ctx.exception.build_log_tail])
+        self.assertNotIn(token, joined)
+        self.assertNotIn(expected_b64, joined)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ Exposes a strict, schema-validated allowlist of operations:
 from __future__ import annotations
 
 import argparse
+import base64
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -139,6 +140,7 @@ SERVICE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 IMAGE_REF_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._/:@-]{1,200}$")
 ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 GIT_BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9._/-]{1,120}$")
+GIT_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{8,512}$")
 DOCKERFILE_PATH_PATTERN = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
 MEM_LIMIT_PATTERN = re.compile(r"^(\d+)([kmgKMG]?)$")
 NUMERIC_USER_PATTERN = re.compile(r"^(\d+)(?::(\d+))?$")
@@ -222,6 +224,7 @@ DISALLOWED_ENV_EXACT = frozenset(
 PEM_KEY_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
 )
+URL_CREDS_RE = re.compile(r"\b(https?://)([^:@\s/]+):([^@\s/]+)@", re.IGNORECASE)
 AUTH_HEADER_RE = re.compile(
     r"\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}", re.IGNORECASE
 )
@@ -230,11 +233,15 @@ JSON_SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 ENV_OR_YAML_SECRET_RE = re.compile(
-    r'\b([A-Za-z0-9_]*(?:key|token|secret|password|passwd|pass|passphrase|credential|auth)[A-Za-z0-9_]*)\s*([:=])\s*("[^"]*"|\'[^\']*\'|[^\s,;]+)',
+    r'\b([A-Za-z0-9_]*(?:key|token|secret|password|passwd|pass|passphrase|credential|auth)[A-Za-z0-9_]*)\s*([:=])\s*(?!\[REDACTED\]@)("[^"]*"|\'[^\']*\'|[^\s,;]+)',
     re.IGNORECASE,
 )
 KNOWN_TOKEN_RE = re.compile(
     r"\b(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|vpsmcp_[A-Za-z0-9_-]{16,}|\d{6,12}:AA[A-Za-z0-9_-]{25,})\b"
+)
+GIT_AUTH_ERROR_RE = re.compile(
+    r"(?:authentication failed|could not read username|terminal prompts disabled|repository not found|returned error:\s*40[134]|access denied|invalid username or (?:password|token))",
+    re.IGNORECASE,
 )
 
 DnsResolver = Callable[[str, int], list[str]]
@@ -278,6 +285,7 @@ def redact_secrets(text: str) -> str:
     if not text:
         return ""
     result = PEM_KEY_RE.sub("[REDACTED_PRIVATE_KEY]", text)
+    result = URL_CREDS_RE.sub(r"\1\2:[REDACTED]@", result)
     result = AUTH_HEADER_RE.sub(r"\1 [REDACTED]", result)
     result = JSON_SECRET_RE.sub(r'"\1":"[REDACTED]"', result)
     result = ENV_OR_YAML_SECRET_RE.sub(
@@ -285,6 +293,36 @@ def redact_secrets(text: str) -> str:
         result,
     )
     return KNOWN_TOKEN_RE.sub("[REDACTED]", result)
+
+
+def _scrub_secret_values(text: str, secret_values: list[str] | None = None) -> str:
+    scrubbed = redact_secrets(text)
+    if secret_values:
+        for val in secret_values:
+            if val:
+                scrubbed = scrubbed.replace(val, "[REDACTED]")
+    return scrubbed
+
+
+def validate_git_token(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise BridgeRequestError(400, "Invalid GitHub access token format.")
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    if not GIT_TOKEN_PATTERN.match(trimmed):
+        raise BridgeRequestError(400, "Invalid GitHub access token format.")
+    return trimmed
+
+
+def assert_github_host_for_token(repo_host: str, repo_port: int) -> None:
+    if repo_host != "github.com" or repo_port != 443:
+        raise BridgeRequestError(
+            400,
+            "GitHub access tokens can only be used with https://github.com repositories.",
+        )
 
 
 def validate_slug(raw: Any) -> str:
@@ -2712,19 +2750,30 @@ class RuntimeService:
         timeout: float = 120,
         check: bool = True,
         cwd: str | None = None,
+        extra_env: dict[str, str] | None = None,
+        secret_values: list[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return self._run_cmd(
-            [self.git_bin, *args],
-            label="Git",
-            timeout=timeout,
-            check=check,
-            cwd=cwd,
-            extra_env={
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_ALLOW_PROTOCOL": "https",
-            },
-        )
+        env = {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_ALLOW_PROTOCOL": "https",
+        }
+        if extra_env:
+            env.update(extra_env)
+        try:
+            return self._run_cmd(
+                [self.git_bin, *args],
+                label="Git",
+                timeout=timeout,
+                check=check,
+                cwd=cwd,
+                extra_env=env,
+            )
+        except BridgeRequestError as exc:
+            raise BridgeRequestError(
+                exc.status_code,
+                _scrub_secret_values(str(exc), secret_values),
+            ) from exc
 
     def _compose_down_by_project(self, slug: str) -> None:
         with tempfile.TemporaryDirectory(
@@ -2809,7 +2858,7 @@ class RuntimeService:
                     "detail": f"Workload {slug} {action} -> {status}",
                 }
 
-    def _clone_public_repo(
+    def _clone_repo(
         self,
         repo_url: str,
         repo_host: str,
@@ -2818,31 +2867,81 @@ class RuntimeService:
         branch: str | None,
         clone_dir: str,
         clone_timeout: float,
+        *,
+        git_token: str | None = None,
     ) -> tuple[str | None, str | None]:
-        with _PinnedGitConnectProxy(
-            repo_host,
-            repo_port,
-            validated_ips,
-            connect_timeout=min(15.0, clone_timeout),
-        ) as proxy:
-            clone_args = [
-                "clone",
-                "--depth",
-                "1",
-                "--single-branch",
-                "-c",
-                "protocol.file.allow=never",
-                "-c",
-                "http.followRedirects=false",
-                "-c",
-                "core.symlinks=false",
-                "-c",
-                f"http.proxy=http://127.0.0.1:{proxy.port}",
-            ]
-            if branch:
-                clone_args.extend(["--branch", branch])
-            clone_args.extend(["--", repo_url, clone_dir])
-            self._run_git(clone_args, timeout=clone_timeout, check=True)
+        parent_dir = os.path.dirname(clone_dir)
+        git_cfg_path = os.path.join(
+            parent_dir, "git-auth.conf" if git_token else "git-empty.conf"
+        )
+        secret_values: list[str] = []
+        if git_token:
+            assert_github_host_for_token(repo_host, repo_port)
+            basic_b64 = base64.b64encode(
+                f"x-access-token:{git_token}".encode("utf-8")
+            ).decode("ascii")
+            secret_values = [git_token, basic_b64]
+            cfg_content = (
+                '[http "https://github.com/"]\n'
+                f"\textraHeader = Authorization: Basic {basic_b64}\n"
+            )
+        else:
+            cfg_content = ""
+
+        fd = os.open(git_cfg_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(cfg_content)
+        os.chmod(git_cfg_path, 0o600)
+
+        try:
+            with _PinnedGitConnectProxy(
+                repo_host,
+                repo_port,
+                validated_ips,
+                connect_timeout=min(15.0, clone_timeout),
+            ) as proxy:
+                clone_args = [
+                    "clone",
+                    "--depth",
+                    "1",
+                    "--single-branch",
+                    "-c",
+                    "protocol.file.allow=never",
+                    "-c",
+                    "http.followRedirects=false",
+                    "-c",
+                    "core.symlinks=false",
+                    "-c",
+                    f"http.proxy=http://127.0.0.1:{proxy.port}",
+                ]
+                if branch:
+                    clone_args.extend(["--branch", branch])
+                clone_args.extend(["--", repo_url, clone_dir])
+                self._run_git(
+                    clone_args,
+                    timeout=clone_timeout,
+                    check=True,
+                    extra_env={"GIT_CONFIG_GLOBAL": git_cfg_path},
+                    secret_values=secret_values,
+                )
+        except BridgeRequestError as exc:
+            scrubbed = _scrub_secret_values(str(exc), secret_values)
+            if exc.status_code == 502 and GIT_AUTH_ERROR_RE.search(scrubbed):
+                if git_token is None:
+                    raise BridgeRequestError(
+                        401,
+                        "Authentication required: this repository appears to be private or does not exist.",
+                    ) from exc
+                raise BridgeRequestError(
+                    401,
+                    "GitHub authentication failed: the access token was rejected for this repository (verify it has not expired and has Read-only Contents permission for this repo).",
+                ) from exc
+            raise BridgeRequestError(exc.status_code, scrubbed) from exc
+        finally:
+            try:
+                os.unlink(git_cfg_path)
+            except FileNotFoundError:
+                pass
 
         rev_proc = self._run_git(
             ["-C", clone_dir, "rev-parse", "HEAD"], timeout=10, check=False
@@ -2866,10 +2965,34 @@ class RuntimeService:
         )
         return commit_sha, resolved_branch
 
+    def _clone_public_repo(
+        self,
+        repo_url: str,
+        repo_host: str,
+        repo_port: int,
+        validated_ips: list[str],
+        branch: str | None,
+        clone_dir: str,
+        clone_timeout: float,
+    ) -> tuple[str | None, str | None]:
+        return self._clone_repo(
+            repo_url,
+            repo_host,
+            repo_port,
+            validated_ips,
+            branch,
+            clone_dir,
+            clone_timeout,
+            git_token=None,
+        )
+
     def inspect_git(self, payload: dict[str, Any]) -> dict[str, Any]:
         repo_url, repo_host, repo_port, validated_ips = validate_git_repo_url_with_ips(
             payload.get("gitRepoUrl"), dns_resolver=self.dns_resolver
         )
+        git_token = validate_git_token(payload.get("gitToken"))
+        if git_token:
+            assert_github_host_for_token(repo_host, repo_port)
         branch = validate_git_branch(payload.get("gitBranch"))
         dockerfile_rel = validate_dockerfile_path(payload.get("dockerfilePath"))
         raw_timeout = payload.get("timeoutSeconds", 45)
@@ -2887,7 +3010,7 @@ class RuntimeService:
         os.chmod(build_dir, 0o700)
         clone_dir = os.path.join(build_dir, "repo")
         try:
-            commit_sha, resolved_branch = self._clone_public_repo(
+            commit_sha, resolved_branch = self._clone_repo(
                 repo_url,
                 repo_host,
                 repo_port,
@@ -2895,11 +3018,13 @@ class RuntimeService:
                 branch,
                 clone_dir,
                 float(raw_timeout),
+                git_token=git_token,
             )
             info = _inspect_cloned_repo(
                 clone_dir, repo_url, resolved_branch, commit_sha, dockerfile_rel
             )
             info.pop("generatedDockerfile", None)
+            info["usedAuth"] = bool(git_token)
             return info
         finally:
             shutil.rmtree(build_dir, ignore_errors=True)
@@ -2909,6 +3034,14 @@ class RuntimeService:
         repo_url, repo_host, repo_port, validated_ips = validate_git_repo_url_with_ips(
             payload.get("gitRepoUrl"), dns_resolver=self.dns_resolver
         )
+        git_token = validate_git_token(payload.get("gitToken"))
+        secret_values: list[str] = []
+        if git_token:
+            assert_github_host_for_token(repo_host, repo_port)
+            basic_b64 = base64.b64encode(
+                f"x-access-token:{git_token}".encode("utf-8")
+            ).decode("ascii")
+            secret_values = [git_token, basic_b64]
         branch = validate_git_branch(payload.get("gitBranch"))
         raw_df = payload.get("dockerfilePath")
         dockerfile_rel = (
@@ -2943,7 +3076,7 @@ class RuntimeService:
             clone_dir = os.path.join(build_dir, "repo")
             try:
                 clone_timeout = max(5.0, min(total_timeout_s * 0.4, 90.0))
-                commit_sha, resolved_branch = self._clone_public_repo(
+                commit_sha, resolved_branch = self._clone_repo(
                     repo_url,
                     repo_host,
                     repo_port,
@@ -2951,6 +3084,7 @@ class RuntimeService:
                     branch,
                     clone_dir,
                     clone_timeout,
+                    git_token=git_token,
                 )
 
                 inspected = _inspect_cloned_repo(
@@ -3002,7 +3136,7 @@ class RuntimeService:
                 combined = "\n".join(
                     p for p in (build_proc.stdout, build_proc.stderr) if p
                 )
-                redacted = redact_secrets(combined)
+                redacted = _scrub_secret_values(combined, secret_values)
                 log_tail = [
                     line[:MAX_LOG_LINE_CHARS]
                     for line in redacted.splitlines()
@@ -3013,7 +3147,10 @@ class RuntimeService:
                     err_excerpt = log_tail[-1] if log_tail else "unknown Docker build error"
                     raise BridgeRequestError(
                         502,
-                        f"Docker build failed (exit {build_proc.returncode}): {err_excerpt}",
+                        _scrub_secret_values(
+                            f"Docker build failed (exit {build_proc.returncode}): {err_excerpt}",
+                            secret_values,
+                        ),
                         build_log_tail=log_tail,
                     )
 
@@ -3026,6 +3163,7 @@ class RuntimeService:
                     "buildLogTail": log_tail,
                     "detectedRuntime": inspected["detectedRuntime"],
                     "usedAutoDockerfile": used_auto_dockerfile,
+                    "usedAuth": bool(git_token),
                     "suggestedPort": inspected["suggestedPort"],
                     "envExampleKeys": [
                         item["key"] for item in inspected["envExampleKeys"]
