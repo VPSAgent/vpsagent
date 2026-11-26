@@ -27,6 +27,7 @@ TAILSCALE_IP=""
 TAILSCALE_DNS_NAME=""
 TAILSCALE_HTTPS_CERTS="false"
 TAILSCALE_SERVE_URL=""
+TAILSCALE_SERVE_CONFLICT=""
 
 SOURCE_PATH="${BASH_SOURCE[0]:-}"
 if [[ -n "${SOURCE_PATH}" && -f "${SOURCE_PATH}" ]]; then
@@ -366,6 +367,7 @@ detect_tailscale_info() {
   TAILSCALE_DNS_NAME=""
   TAILSCALE_HTTPS_CERTS="false"
   TAILSCALE_SERVE_URL=""
+  TAILSCALE_SERVE_CONFLICT=""
 
   if ! command -v tailscale >/dev/null 2>&1; then
     return
@@ -423,6 +425,7 @@ https_certs = (
 )
 
 serve_url = ""
+serve_conflict = ""
 raw_serve = os.environ.get("TS_SERVE_JSON") or ""
 if raw_serve.strip():
     try:
@@ -430,28 +433,56 @@ if raw_serve.strip():
     except Exception:
         sv = {}
     web = sv.get("Web") if isinstance(sv, dict) else None
-    if isinstance(web, dict) and raw_dns:
-        entry = web.get(f"{raw_dns}:443")
-        if not isinstance(entry, dict):
-            for k, v in web.items():
-                if isinstance(k, str) and k.endswith(":443") and isinstance(v, dict):
-                    entry = v
-                    break
-        if isinstance(entry, dict):
+    if isinstance(web, dict):
+        candidate_keys = []
+        if raw_dns and f"{raw_dns}:443" in web:
+            candidate_keys.append(f"{raw_dns}:443")
+        for k in web:
+            if isinstance(k, str) and k.endswith(":443") and k not in candidate_keys:
+                candidate_keys.append(k)
+        for k in candidate_keys:
+            entry = web.get(k)
+            if not isinstance(entry, dict):
+                continue
             handlers = entry.get("Handlers")
-            root_h = handlers.get("/") if isinstance(handlers, dict) else None
-            proxy = root_h.get("Proxy") if isinstance(root_h, dict) else None
-            if isinstance(proxy, str) and proxy.strip().rstrip("/").lower() in (
-                "http://127.0.0.1:3001",
-                "http://localhost:3001",
-            ):
-                serve_url = f"https://{raw_dns}"
+            if not isinstance(handlers, dict):
+                continue
+            root_h = handlers.get("/")
+            if isinstance(root_h, dict):
+                proxy = root_h.get("Proxy")
+                if isinstance(proxy, str) and proxy.strip():
+                    cleaned = proxy.strip()
+                    if cleaned.rstrip("/").lower() in (
+                        "http://127.0.0.1:3001",
+                        "http://localhost:3001",
+                    ):
+                        if raw_dns:
+                            serve_url = f"https://{raw_dns}"
+                    elif not serve_conflict:
+                        serve_conflict = cleaned
+                elif not serve_conflict:
+                    serve_conflict = f"existing handler on {k}"
+            mcp_h = handlers.get("/mcp")
+            if isinstance(mcp_h, dict):
+                mcp_proxy = mcp_h.get("Proxy")
+                if isinstance(mcp_proxy, str) and mcp_proxy.strip():
+                    cleaned_mcp = mcp_proxy.strip()
+                    if cleaned_mcp.rstrip("/").lower() not in (
+                        "http://127.0.0.1:3001",
+                        "http://localhost:3001",
+                    ):
+                        serve_conflict = f"/mcp -> {cleaned_mcp}"
+                        serve_url = ""
+                else:
+                    serve_conflict = f"/mcp on {k}"
+                    serve_url = ""
 
 print(backend)
 print(ts_ip)
 print(raw_dns)
 print(https_certs)
 print(serve_url)
+print(serve_conflict)
 PY
   )"
 
@@ -462,6 +493,7 @@ PY
       IFS= read -r TAILSCALE_DNS_NAME || true
       IFS= read -r TAILSCALE_HTTPS_CERTS || true
       IFS= read -r TAILSCALE_SERVE_URL || true
+      IFS= read -r TAILSCALE_SERVE_CONFLICT || true
     } <<< "${parsed_lines}"
   fi
 }
@@ -486,6 +518,14 @@ configure_tailscale() {
   fi
 
   if [[ "${TAILSCALE_BACKEND_STATE}" == "Running" && -n "${TAILSCALE_DNS_NAME}" ]]; then
+    if [[ -n "${TAILSCALE_SERVE_CONFLICT}" ]]; then
+      log "Warning: Tailscale Serve port 443 is already forwarding to ${TAILSCALE_SERVE_CONFLICT}. Keeping your existing route; open AI Keys & Settings -> Tailscale private access if you want to replace it."
+      return
+    fi
+    if [[ -n "${TAILSCALE_SERVE_URL}" ]]; then
+      log "Tailscale private HTTPS is already active at ${TAILSCALE_SERVE_URL}."
+      return
+    fi
     log "Enabling Tailscale private HTTPS (tailscale serve) for ${TAILSCALE_DNS_NAME}..."
     if ! tailscale serve --bg --https=443 http://127.0.0.1:3001 >/dev/null 2>&1; then
       log "Note: Could not enable Tailscale Serve automatically. Enable MagicDNS and HTTPS Certificates at https://login.tailscale.com/admin/dns, then click Enable private HTTPS in the dashboard."

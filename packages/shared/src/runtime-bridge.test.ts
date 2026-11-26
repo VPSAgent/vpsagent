@@ -780,7 +780,7 @@ if args[:3] == ["serve", "--bg", "--https=443"]:
     save(st)
     sys.exit(0)
 
-if args == ["serve", "--https=443", "off"]:
+if args == ["serve", "--https=443", "--set-path=/", "off"]:
     st["serve"] = False
     save(st)
     sys.exit(0)

@@ -551,9 +551,9 @@ export function KeysSettingsTab({
 
   const newRawToken = newCreatedToken?.rawToken ?? null;
   const selectedSnippetEndpoint =
-    endpointSource === "tailscale" && snippets?.tailscale
+    endpointSource === "tailscale" && snippets?.tailscale?.httpsReady
       ? snippets.tailscale
-      : endpointSource === "domain" && snippets?.customDomain
+      : endpointSource === "domain" && snippets?.customDomain?.httpsReady
         ? snippets.customDomain
         : null;
   const activeSnippetVariant = selectedSnippetEndpoint?.snippets ?? snippets;
@@ -1353,7 +1353,9 @@ export function KeysSettingsTab({
             <button
               type="button"
               disabled={tailscaleLoading || tailscaleBusy}
-              onClick={() => void loadTailscaleStatus()}
+              onClick={() =>
+                void Promise.all([loadTailscaleStatus(), onRefresh()])
+              }
               className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0C0E12] px-3 py-2 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] disabled:opacity-50 cursor-pointer"
             >
               <RefreshCw

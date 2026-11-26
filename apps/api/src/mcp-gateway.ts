@@ -19,6 +19,8 @@ import {
 import {
   type TransportContextOptions,
   assertSecureTransport,
+  getRequestHost,
+  normalizeHostWithoutDefaultPort,
   validateMcpHostAndOrigin,
 } from "./auth.js";
 import {
@@ -1213,25 +1215,69 @@ function isRepoBoundToAllowedApp(
   return false;
 }
 
-export function enforceMcpBoundary(
+const tailscaleReconcileLastCheck = new WeakMap<RegistryStore, number>();
+const TAILSCALE_RECONCILE_COOLDOWN_MS = 5_000;
+
+export async function enforceMcpBoundary(
   c: Context,
   store: RegistryStore,
   transportOptions: TransportContextOptions,
-): { ok: true } | { ok: false; response: Response } {
-  const setup = store.getSetupState();
+  bridge?: RuntimeBridge,
+): Promise<{ ok: true } | { ok: false; response: Response }> {
+  let setup = store.getSetupState();
   try {
     const transport = assertSecureTransport(c, transportOptions);
-    validateMcpHostAndOrigin(c, {
-      setupDomain: setup.domain,
-      httpsActive: setup.httpsActive,
-      additionalAllowedHttpsHosts:
-        setup.tailscaleServeEnabled && setup.tailscaleDomain
-          ? [setup.tailscaleDomain]
-          : [],
-      transport,
-      trustProxy: transportOptions.trustProxy,
-    });
-    return { ok: true };
+    const checkHostAndOrigin = (currentSetup: typeof setup) =>
+      validateMcpHostAndOrigin(c, {
+        setupDomain: currentSetup.domain,
+        httpsActive: currentSetup.httpsActive,
+        additionalAllowedHttpsHosts:
+          currentSetup.tailscaleServeEnabled && currentSetup.tailscaleDomain
+            ? [currentSetup.tailscaleDomain]
+            : [],
+        transport,
+        trustProxy: transportOptions.trustProxy,
+      });
+
+    try {
+      checkHostAndOrigin(setup);
+      return { ok: true };
+    } catch (firstErr) {
+      if (
+        transport.isHttps &&
+        !setup.tailscaleServeEnabled &&
+        bridge?.getTailscaleStatus
+      ) {
+        const rawHost = getRequestHost(c, transportOptions.trustProxy);
+        const normalizedHost = normalizeHostWithoutDefaultPort(rawHost, true);
+        if (normalizedHost.endsWith(".ts.net")) {
+          const now = Date.now();
+          const lastCheck = tailscaleReconcileLastCheck.get(store) ?? 0;
+          if (now - lastCheck >= TAILSCALE_RECONCILE_COOLDOWN_MS) {
+            tailscaleReconcileLastCheck.set(store, now);
+            try {
+              const ts = await bridge.getTailscaleStatus();
+              const nextDomain = ts.dnsName || null;
+              const nextEnabled = Boolean(ts.serveEnabled && ts.dnsName);
+              if (
+                setup.tailscaleDomain !== nextDomain ||
+                setup.tailscaleServeEnabled !== nextEnabled
+              ) {
+                setup = store.updateSetupState({
+                  tailscaleDomain: nextDomain,
+                  tailscaleServeEnabled: nextEnabled,
+                });
+              }
+            } catch {
+              // Ignore bridge errors and fall through to original rejection
+            }
+          }
+          checkHostAndOrigin(setup);
+          return { ok: true };
+        }
+      }
+      throw firstErr;
+    }
   } catch (err) {
     return {
       ok: false,
@@ -1371,7 +1417,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
   }
 
   return async (c: Context) => {
-    const guard = enforceMcpBoundary(c, store, transportOptions);
+    const guard = await enforceMcpBoundary(c, store, transportOptions, bridge);
     if (!guard.ok) {
       return guard.response;
     }
@@ -2116,10 +2162,10 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           let tailscale = null;
           if (bridge.getTailscaleStatus) {
             try {
-              tailscale = await bridge.getTailscaleStatus();
-              const nextDomain = tailscale.dnsName || null;
+              const rawTs = await bridge.getTailscaleStatus();
+              const nextDomain = rawTs.dnsName || null;
               const nextEnabled = Boolean(
-                tailscale.serveEnabled && tailscale.dnsName,
+                rawTs.serveEnabled && rawTs.dnsName,
               );
               if (
                 setup.tailscaleDomain !== nextDomain ||
@@ -2130,6 +2176,10 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
                   tailscaleServeEnabled: nextEnabled,
                 });
               }
+              tailscale = {
+                ...rawTs,
+                loginUrl: null,
+              };
             } catch {
               tailscale = null;
             }

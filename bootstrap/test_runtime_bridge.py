@@ -2242,10 +2242,13 @@ class TestRuntimeBridgeTailscale(unittest.TestCase):
         serve_cmd_rc: int = 0,
         serve_cmd_stderr: str = "",
         systemctl_active: bool = False,
+        serve_stateful: bool = False,
     ) -> tuple[str, str, str, str]:
         sub_dir = tempfile.mkdtemp(dir=self.tmp_dir)
         calls_file = os.path.join(sub_dir, "ts-calls.jsonl")
         seen_key_file = os.path.join(sub_dir, "ts-seen-key.txt")
+        serve_state_file = os.path.join(sub_dir, "ts-serve-state.json")
+        Path(serve_state_file).write_text(serve_stdout, encoding="utf-8")
         ts_py = os.path.join(sub_dir, "fake_tailscale.py")
         Path(ts_py).write_text(
             f"""import json, os, sys
@@ -2259,7 +2262,10 @@ if args == ["status", "--json"]:
     sys.exit({status_rc!r})
 
 if args == ["serve", "status", "--json"]:
-    sys.stdout.write({serve_stdout!r})
+    if {serve_stateful!r} and os.path.exists({serve_state_file!r}):
+        sys.stdout.write(open({serve_state_file!r}, "r", encoding="utf-8").read())
+    else:
+        sys.stdout.write({serve_stdout!r})
     sys.exit(0)
 
 if args[:1] == ["up"]:
@@ -2275,6 +2281,19 @@ if args[:1] == ["up"]:
     sys.exit({up_rc!r})
 
 if args[:1] == ["serve"]:
+    if {serve_stateful!r} and {serve_cmd_rc!r} == 0:
+        data = json.loads(open({serve_state_file!r}, "r", encoding="utf-8").read() or "{{}}")
+        web = data.setdefault("Web", {{}})
+        host_key = "my-vps.tail42.ts.net:443"
+        entry = web.setdefault(host_key, {{}})
+        handlers = entry.setdefault("Handlers", {{}})
+        if args == ["serve", "--https=443", "--set-path=/", "off"]:
+            handlers.pop("/", None)
+        elif args == ["serve", "--https=443", "--set-path=/mcp", "off"]:
+            handlers.pop("/mcp", None)
+        elif len(args) >= 4 and args[1] == "--bg" and args[2] == "--https=443":
+            handlers["/"] = {{"Proxy": args[3]}}
+        open({serve_state_file!r}, "w", encoding="utf-8").write(json.dumps(data))
     sys.stderr.write({serve_cmd_stderr!r})
     sys.exit({serve_cmd_rc!r})
 
@@ -2473,7 +2492,7 @@ sys.exit(0)
 
         # Enable succeeds and passes --bg --https=443 http://127.0.0.1:3001
         ts_ok, sys_ok, calls_file, _ = self._make_fake_tailscale(
-            status_stdout=running_json, serve_stdout="{}"
+            status_stdout=running_json, serve_stdout="{}", serve_stateful=True
         )
         svc_ok = self._service(tailscale_bin=ts_ok, systemctl_bin=sys_ok)
         res_on = svc_ok.set_tailscale_serve({"enabled": True})
@@ -2487,11 +2506,49 @@ sys.exit(0)
         self.assertIn(
             ["serve", "--bg", "--https=443", "http://127.0.0.1:3001"], calls
         )
-        self.assertIn(["serve", "--https=443", "off"], calls)
+        self.assertIn(["serve", "--https=443", "--set-path=/", "off"], calls)
+
+        # /mcp path conflict is detected even when / points to VPSAgent, and force=True clears /mcp
+        ts_mcp_conflict, sys_mcp_conflict, calls_mcp_conflict, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:3001"},
+                                "/mcp": {"Proxy": "http://127.0.0.1:9000"},
+                            }
+                        }
+                    }
+                }
+            ),
+        )
+        svc_mcp_conflict = self._service(
+            tailscale_bin=ts_mcp_conflict, systemctl_bin=sys_mcp_conflict
+        )
+        mcp_conflict_status = svc_mcp_conflict.tailscale_status()
+        self.assertFalse(mcp_conflict_status["serveEnabled"])
+        self.assertEqual(
+            mcp_conflict_status["serveConflict"], "/mcp -> http://127.0.0.1:9000"
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_mcp_conflict:
+            svc_mcp_conflict.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_mcp_conflict.exception.status_code, 409)
+        svc_mcp_conflict.set_tailscale_serve({"enabled": True, "force": True})
+        mcp_calls = [
+            json.loads(line)
+            for line in Path(calls_mcp_conflict).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(
+            ["serve", "--https=443", "--set-path=/mcp", "off"], mcp_calls
+        )
 
         # Conflict returns 409 unless force=True
         ts_conflict, sys_conflict, calls_conflict, _ = self._make_fake_tailscale(
             status_stdout=running_json,
+            serve_stateful=True,
             serve_stdout=json.dumps(
                 {
                     "Web": {
@@ -2542,6 +2599,24 @@ sys.exit(0)
         self.assertIn(
             "https://login.tailscale.com/f/serve?node=n123",
             str(cm_admin.exception),
+        )
+
+        # Even when tailscale serve exits 0 after printing instructions, must fail closed (422)
+        ts_zero_exit, sys_zero_exit, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout="{}",
+            serve_cmd_rc=0,
+            serve_cmd_stderr="To enable Serve, visit: https://login.tailscale.com/f/serve?node=zero",
+        )
+        svc_zero_exit = self._service(
+            tailscale_bin=ts_zero_exit, systemctl_bin=sys_zero_exit
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_zero:
+            svc_zero_exit.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_zero.exception.status_code, 422)
+        self.assertIn(
+            "https://login.tailscale.com/f/serve?node=zero",
+            str(cm_zero.exception),
         )
 
     def test_connect_tailscale_login_and_authkey_security(self) -> None:

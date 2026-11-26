@@ -355,8 +355,8 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   );
 
   // Streamable HTTP spec: return 405 Method Not Allowed on GET /mcp when SSE is not offered
-  app.get("/mcp", (c) => {
-    const guard = enforceMcpBoundary(c, store, transportOptions);
+  app.get("/mcp", async (c) => {
+    const guard = await enforceMcpBoundary(c, store, transportOptions, bridge);
     if (!guard.ok) {
       return guard.response;
     }
@@ -368,8 +368,8 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
 
   // Streamable HTTP spec: close & invalidate a server-issued session via DELETE /mcp
-  app.delete("/mcp", (c) => {
-    const guard = enforceMcpBoundary(c, store, transportOptions);
+  app.delete("/mcp", async (c) => {
+    const guard = await enforceMcpBoundary(c, store, transportOptions, bridge);
     if (!guard.ok) {
       return guard.response;
     }

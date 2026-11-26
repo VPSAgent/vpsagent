@@ -288,7 +288,7 @@ describe("Tailscale API, MCP Gateway, CSRF & Fallback", () => {
       expect(tokRes.status).toBe(201);
       const rawToken = ((await tokRes.json()) as { rawToken: string }).rawToken;
 
-      // 1. Initial Tailscale status (needs_login)
+      // 1. Initial Tailscale status (needs_login) — dashboard sees loginUrl, but MCP get_setup_status redacts loginUrl
       const statusRes1 = await app.request("/api/tailscale/status", {
         headers: { cookie, host: "localhost:3002" },
       });
@@ -301,6 +301,30 @@ describe("Tailscale API, MCP Gateway, CSRF & Fallback", () => {
       expect(statusBody1.status.loginUrl).toBe(
         "https://login.tailscale.com/a/initial-login",
       );
+
+      const pendingMcpStatus = await app.request("http://localhost:3002/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${rawToken}`,
+          host: "localhost:3002",
+          "x-forwarded-for": "127.0.0.1",
+        },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 9,
+          method: "tools/call",
+          params: { name: "get_setup_status", arguments: {} },
+        }),
+      });
+      expect(pendingMcpStatus.status).toBe(200);
+      const pendingRpc = (await pendingMcpStatus.json()) as {
+        result: { content: Array<{ text: string }> };
+      };
+      const pendingPayload = JSON.parse(pendingRpc.result.content[0]!.text) as {
+        tailscale: { loginUrl: string | null };
+      };
+      expect(pendingPayload.tailscale.loginUrl).toBeNull();
 
       // 2. Connect guard: blocked on remote HTTP & cross-origin POST, scrubs authKey on error
       const remoteHttpConnect = await app.request(
@@ -588,6 +612,83 @@ describe("Tailscale API, MCP Gateway, CSRF & Fallback", () => {
       const allAuditText = JSON.stringify(store.listAuditEvents({ limit: 50 }));
       expect(allAuditText).not.toContain("tskey-auth-kValidConnect1234");
       expect(allAuditText).not.toContain("tskey-auth-kFailScrubTest1234");
+    } finally {
+      store.close();
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("reconciles live Tailscale Serve status on /mcp when store predates headless setup", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpsagent-ts-sync-"));
+    const appsRoot = path.join(tempDir, "apps");
+    fs.mkdirSync(appsRoot, { recursive: true });
+    const store = new RegistryStore(path.join(tempDir, "registry.db"), {
+      encryptionSecret: "tailscale-sync-encryption-secret",
+    });
+    const { bridge } = createTailscaleMockBridge({
+      initialStatus: {
+        installed: true,
+        serviceActive: true,
+        connected: true,
+        backendState: "running",
+        tailscaleIp: "100.64.0.77",
+        tailscaleIps: ["100.64.0.77"],
+        hostname: "my-vps",
+        dnsName: "my-vps.tail1234.ts.net",
+        tailnetName: "tail1234.ts.net",
+        magicDnsEnabled: true,
+        httpsCertsAvailable: true,
+        loginUrl: null,
+        serveEnabled: true,
+        serveTarget: "http://127.0.0.1:3001",
+        serveUrl: "https://my-vps.tail1234.ts.net",
+        mcpUrl: "https://my-vps.tail1234.ts.net/mcp",
+        serveConflict: null,
+        cliVersion: "1.78.1",
+        detail: null,
+      },
+    });
+
+    const { app } = createVpsAgentApp({
+      store,
+      bridge,
+      appsRoot,
+      sessionSecret: "tailscale-sync-session-secret",
+      trustProxy: true,
+      isLocalListener: false,
+      defaultPeerIp: "172.18.0.2",
+    });
+
+    try {
+      store.setAdminPassphrase("correct-horse-battery");
+      store.updateSetupState({
+        claimed: true,
+        claimedAt: new Date().toISOString(),
+        tailscaleDomain: null,
+        tailscaleServeEnabled: false,
+      });
+      const { rawToken } = store.createMcpToken({
+        name: "Headless TS Key",
+        scope: "read-only",
+        allowedSlugs: [],
+      });
+
+      const reconciledMcp = await app.request(
+        "https://my-vps.tail1234.ts.net/mcp",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${rawToken}`,
+            "x-forwarded-proto": "https",
+            "x-forwarded-host": "my-vps.tail1234.ts.net",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 14, method: "ping" }),
+        },
+      );
+      expect(reconciledMcp.status).toBe(200);
+      expect(store.getSetupState().tailscaleServeEnabled).toBe(true);
+      expect(store.getSetupState().tailscaleDomain).toBe("my-vps.tail1234.ts.net");
     } finally {
       store.close();
       fs.rmSync(tempDir, { recursive: true, force: true });

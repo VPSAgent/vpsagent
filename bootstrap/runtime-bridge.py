@@ -5031,6 +5031,9 @@ class RuntimeService:
                 candidate_keys.append(key)
 
         other_proxy: str | None = None
+        root_matched = False
+        root_proxy: str | None = None
+        mcp_conflict: str | None = None
         for key in candidate_keys:
             entry = web.get(key)
             if not isinstance(entry, dict):
@@ -5039,16 +5042,29 @@ class RuntimeService:
             if not isinstance(handlers, dict):
                 continue
             root_handler = handlers.get("/")
-            if not isinstance(root_handler, dict):
-                continue
-            proxy = root_handler.get("Proxy")
-            if isinstance(proxy, str) and proxy.strip():
-                cleaned_proxy = proxy.strip()
-                if self._is_matching_serve_target(cleaned_proxy):
-                    return True, cleaned_proxy, None
-                if other_proxy is None:
-                    other_proxy = cleaned_proxy
+            if isinstance(root_handler, dict):
+                proxy = root_handler.get("Proxy")
+                if isinstance(proxy, str) and proxy.strip():
+                    cleaned_proxy = proxy.strip()
+                    if self._is_matching_serve_target(cleaned_proxy):
+                        root_matched = True
+                        root_proxy = cleaned_proxy
+                    elif other_proxy is None:
+                        other_proxy = cleaned_proxy
+            mcp_handler = handlers.get("/mcp")
+            if isinstance(mcp_handler, dict):
+                mcp_proxy = mcp_handler.get("Proxy")
+                if isinstance(mcp_proxy, str) and mcp_proxy.strip():
+                    cleaned_mcp = mcp_proxy.strip()
+                    if not self._is_matching_serve_target(cleaned_mcp):
+                        mcp_conflict = f"/mcp -> {cleaned_mcp}"
+                elif mcp_conflict is None:
+                    mcp_conflict = f"/mcp on {key}"
 
+        if mcp_conflict is not None:
+            return False, mcp_conflict, mcp_conflict
+        if root_matched:
+            return True, root_proxy, None
         if other_proxy is not None:
             return False, other_proxy, other_proxy
         for key in candidate_keys:
@@ -5324,6 +5340,20 @@ class RuntimeService:
                         f"VPSAgent's private local proxy port ({self._tailscale_target_host}:{self._tailscale_target_port}) is not open yet. Run the VPSAgent updater or re-run bootstrap/install.sh once so Docker publishes the private loopback port.",
                     )
 
+                if force and status["serveConflict"] and str(status["serveConflict"]).startswith("/mcp"):
+                    self._run_cmd(
+                        [
+                            self.tailscale_bin,
+                            "serve",
+                            "--https=443",
+                            "--set-path=/mcp",
+                            "off",
+                        ],
+                        label="Tailscale",
+                        timeout=15,
+                        check=False,
+                    )
+
                 proc = self._run_cmd(
                     [
                         self.tailscale_bin,
@@ -5336,14 +5366,14 @@ class RuntimeService:
                     timeout=25,
                     check=False,
                 )
+                raw_out = (proc.stderr or "") + "\n" + (proc.stdout or "")
+                action_match = TAILSCALE_LOGIN_URL_RE.search(raw_out)
+                action_url = (
+                    _normalize_tailscale_url(action_match.group(0))
+                    if action_match
+                    else None
+                )
                 if proc.returncode != 0:
-                    raw_out = (proc.stderr or "") + "\n" + (proc.stdout or "")
-                    action_match = TAILSCALE_LOGIN_URL_RE.search(raw_out)
-                    action_url = (
-                        _normalize_tailscale_url(action_match.group(0))
-                        if action_match
-                        else None
-                    )
                     if action_url:
                         raise BridgeRequestError(
                             422,
@@ -5356,6 +5386,17 @@ class RuntimeService:
                     )
 
                 updated = self.tailscale_status()
+                if not updated["serveEnabled"]:
+                    if action_url:
+                        raise BridgeRequestError(
+                            422,
+                            f"Tailscale Serve needs HTTPS enabled in your Tailscale DNS settings first. Open {action_url} to enable it, then try again.",
+                        )
+                    raise BridgeRequestError(
+                        422,
+                        redact_secrets(raw_out.strip())
+                        or "Tailscale Serve did not activate on port 443. Check MagicDNS and HTTPS Certificates in your Tailscale DNS settings.",
+                    )
                 return {
                     "ok": True,
                     "status": updated,
@@ -5370,7 +5411,7 @@ class RuntimeService:
                     f'Refusing to turn off Tailscale Serve port 443 because it is forwarding to another service ({status["serveConflict"]}).',
                 )
             proc = self._run_cmd(
-                [self.tailscale_bin, "serve", "--https=443", "off"],
+                [self.tailscale_bin, "serve", "--https=443", "--set-path=/", "off"],
                 label="Tailscale",
                 timeout=20,
                 check=False,

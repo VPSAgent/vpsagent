@@ -253,6 +253,66 @@ print_ready_banner
         self.assertIn("serve --bg --https=443 http://127.0.0.1:3001", calls_text)
         self.assertNotIn(secret_auth_key, calls_text)
 
+    def test_tailscale_install_preserves_existing_conflicting_serve_route(
+        self,
+    ) -> None:
+        bin_dir = Path(self.tmp) / "bin-conflict"
+        bin_dir.mkdir()
+        ts_calls = Path(self.tmp) / "ts-conflict-calls.log"
+        vpsagent_root = Path(self.tmp) / "var-lib-vpsagent-conflict"
+        vpsagent_root.mkdir(parents=True)
+
+        (bin_dir / "tailscale").write_text(
+            f"""#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+with open({str(ts_calls)!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+
+if args == ["status", "--json"]:
+    print(json.dumps({{
+        "BackendState": "Running",
+        "Self": {{"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]}},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }}))
+    sys.exit(0)
+
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({{
+        "Web": {{
+            "vps-node.tail99.ts.net:443": {{
+                "Handlers": {{"/": {{"Proxy": "http://127.0.0.1:9000"}}}}
+            }}
+        }}
+    }}))
+    sys.exit(0)
+
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_dir / "tailscale", 0o755)
+
+        script = f"""
+set -euo pipefail
+export PATH="{bin_dir}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+configure_tailscale
+"""
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("http://127.0.0.1:9000", proc.stdout)
+        calls_text = ts_calls.read_text(encoding="utf-8")
+        self.assertNotIn("serve --bg --https=443", calls_text)
+
 
 if __name__ == "__main__":
     unittest.main()
