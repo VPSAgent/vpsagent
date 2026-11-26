@@ -157,6 +157,8 @@ MAX_RELEASE_ARCHIVE_BYTES = 100 * 1024 * 1024
 MAX_RELEASE_EXTRACT_BYTES = 256 * 1024 * 1024
 MAX_RELEASE_EXTRACT_MEMBERS = 10_000
 MAX_RELEASE_NOTES_CHARS = 1500
+ACTIVE_SOURCE_FILENAME = "active-source.json"
+MAX_ACTIVE_SOURCE_BYTES = 16 * 1024
 
 PROBE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=-]{0,127}$")
 SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,46}[a-z0-9]$")
@@ -2511,20 +2513,53 @@ def is_release_newer(
     if not isinstance(latest_tag, str) or not latest_tag.strip():
         return False
     latest = latest_tag.strip()
-    if (
-        isinstance(current_release_tag, str)
-        and current_release_tag.strip()
-        and current_release_tag.strip() == latest
-    ):
+    cur_tag = (
+        current_release_tag.strip()
+        if isinstance(current_release_tag, str) and current_release_tag.strip()
+        else None
+    )
+    if cur_tag and cur_tag == latest:
         return False
-    cmp_val = compare_versions(current_version, latest)
+    cur_candidate = (
+        cur_tag
+        if cur_tag and parse_semver(cur_tag) is not None
+        else current_version
+    )
+    cmp_val = compare_versions(cur_candidate, latest)
     if cmp_val is not None:
         return cmp_val < 0
-    cur_norm = normalize_version_label(current_version)
+    cur_norm = normalize_version_label(cur_candidate)
     lat_norm = normalize_version_label(latest)
     if not cur_norm:
         return bool(lat_norm)
     return cur_norm != lat_norm
+
+
+def is_release_older(
+    current_version: str | None,
+    target_tag: str | None,
+    *,
+    current_release_tag: str | None = None,
+) -> bool:
+    if not isinstance(target_tag, str) or not target_tag.strip():
+        return False
+    target = target_tag.strip()
+    cur_tag = (
+        current_release_tag.strip()
+        if isinstance(current_release_tag, str) and current_release_tag.strip()
+        else None
+    )
+    if cur_tag and cur_tag == target:
+        return False
+    cur_candidate = (
+        cur_tag
+        if cur_tag and parse_semver(cur_tag) is not None
+        else current_version
+    )
+    cmp_val = compare_versions(cur_candidate, target)
+    if cmp_val is None:
+        return False
+    return cmp_val > 0
 
 
 def parse_sha256_checksum(
@@ -2728,52 +2763,64 @@ def safe_extract_release_tarball(archive_path: str, dest_dir: str) -> dict[str, 
     return {"version": version}
 
 
-def _upsert_env_file_var(env_path: str, key: str, value: str) -> None:
-    if not ENV_KEY_PATTERN.match(key):
-        raise ValueError(f"Invalid environment variable key: {key}")
-    if any(ch in value for ch in ("\r", "\n", "\x00")):
-        raise ValueError("Environment variable value contains invalid characters.")
-    if os.path.islink(env_path):
-        raise RuntimeError(f"Security boundary violation: {env_path} cannot be a symlink.")
+def _active_source_path(vpsagent_root: str) -> str:
+    return os.path.join(vpsagent_root, ACTIVE_SOURCE_FILENAME)
 
-    existing_lines: list[str] = []
-    st_uid: int | None = None
-    st_gid: int | None = None
-    if os.path.isfile(env_path):
-        st = os.stat(env_path)
-        st_uid, st_gid = st.st_uid, st.st_gid
-        with open(env_path, "r", encoding="utf-8") as fh:
-            existing_lines = fh.read().splitlines()
 
-    updated = False
-    out_lines: list[str] = []
-    prefix = f"{key}="
-    for line in existing_lines:
-        if line.startswith(prefix):
-            out_lines.append(f"{key}={value}")
-            updated = True
-        else:
-            out_lines.append(line)
-    if not updated:
-        out_lines.append(f"{key}={value}")
+def _read_active_source_file(vpsagent_root: str) -> dict[str, Any] | None:
+    if not vpsagent_root or not os.path.isdir(vpsagent_root):
+        return None
+    path = _active_source_path(vpsagent_root)
+    if not os.path.lexists(path):
+        return None
+    try:
+        raw = _read_regular_file_nofollow(
+            path, MAX_ACTIVE_SOURCE_BYTES, ACTIVE_SOURCE_FILENAME
+        )
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except (BridgeRequestError, OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
 
-    payload = "\n".join(out_lines) + "\n"
-    parent = os.path.dirname(os.path.abspath(env_path))
-    tmp_path = os.path.join(parent, f".env.tmp.{os.getpid()}")
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(payload)
-    os.chmod(tmp_path, 0o600)
-    if (
-        st_uid is not None
-        and st_gid is not None
-        and hasattr(os, "geteuid")
-        and os.geteuid() == 0
-    ):
+
+def _write_active_source_file(
+    vpsagent_root: str,
+    repo_dir: str,
+    *,
+    release_tag: str | None = None,
+    release_repo: str | None = None,
+) -> None:
+    if not isinstance(repo_dir, str) or not repo_dir.strip():
+        raise ValueError("Active source repoDir cannot be empty.")
+    clean_repo = os.path.abspath(repo_dir.strip())
+    if any(ch in clean_repo for ch in ("\r", "\n", "\x00")):
+        raise ValueError("Active source repoDir contains invalid characters.")
+    path = _active_source_path(vpsagent_root)
+    if os.path.islink(path):
+        raise RuntimeError(f"Security boundary violation: {path} cannot be a symlink.")
+    payload: dict[str, Any] = {
+        "repoDir": clean_repo,
+        "updatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    if isinstance(release_tag, str) and release_tag.strip():
+        payload["releaseTag"] = release_tag.strip()
+    if isinstance(release_repo, str) and RELEASE_REPO_PATTERN.match(release_repo.strip()):
+        payload["releaseRepo"] = release_repo.strip()
+    parent = os.path.dirname(os.path.abspath(path))
+    tmp_path = os.path.join(parent, f".{ACTIVE_SOURCE_FILENAME}.tmp.{os.getpid()}")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.write("\n")
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, path)
+    except Exception:
         try:
-            os.chown(tmp_path, st_uid, st_gid)
+            if os.path.lexists(tmp_path):
+                os.unlink(tmp_path)
         except OSError:
             pass
-    os.replace(tmp_path, env_path)
+        raise
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
@@ -2874,19 +2921,42 @@ class RuntimeService:
                 self.vpsagent_root = os.path.dirname(os.path.abspath(apps_root))
             else:
                 self.vpsagent_root = "/var/lib/vpsagent"
+        active_source = _read_active_source_file(self.vpsagent_root)
+        active_repo_raw = (
+            active_source.get("repoDir")
+            if active_source and isinstance(active_source.get("repoDir"), str)
+            else ""
+        ).strip()
+        active_repo = (
+            active_repo_raw
+            if active_repo_raw and os.path.isdir(active_repo_raw)
+            else ""
+        )
+
         resolved_repo = (
             repo_dir.strip()
             if isinstance(repo_dir, str) and repo_dir.strip()
-            else os.environ.get("VPSAGENT_REPO_DIR", "").strip()
+            else active_repo or os.environ.get("VPSAGENT_REPO_DIR", "").strip()
         )
         if not resolved_repo and os.path.isdir("/opt/vpsagent/.git"):
             resolved_repo = "/opt/vpsagent"
         self.repo_dir = os.path.abspath(resolved_repo) if resolved_repo else None
+        active_release_repo = (
+            active_source.get("releaseRepo")
+            if active_source and isinstance(active_source.get("releaseRepo"), str)
+            else ""
+        ).strip()
         raw_release_repo = (
             release_repo.strip()
             if release_repo is not None
             else os.environ.get("VPSAGENT_RELEASE_REPO", "").strip()
         )
+        if (
+            not raw_release_repo
+            and release_repo is None
+            and RELEASE_REPO_PATTERN.match(active_release_repo)
+        ):
+            raw_release_repo = active_release_repo
         if raw_release_repo and not RELEASE_REPO_PATTERN.match(raw_release_repo):
             raise ValueError(f"Invalid release repository slug: {raw_release_repo}")
         self.release_repo: str | None = raw_release_repo or None
@@ -5642,6 +5712,40 @@ class RuntimeService:
 
         raise RuntimeError("Release download exceeded maximum redirect limit.")
 
+    def _select_asset_download_url(self, asset: dict[str, Any]) -> str | None:
+        raw_api = asset.get("url")
+        raw_browser = asset.get("browser_download_url")
+        api_url = (
+            raw_api.strip()
+            if isinstance(raw_api, str) and raw_api.strip()
+            else None
+        )
+        browser_url = (
+            raw_browser.strip()
+            if isinstance(raw_browser, str) and raw_browser.strip()
+            else None
+        )
+        if self.release_github_token and api_url:
+            try:
+                api_base = urlparse(self.release_api_base)
+                base_scheme = api_base.scheme.lower()
+                base_host = (api_base.hostname or "").lower().strip("[]").rstrip(".")
+                base_port = api_base.port or (443 if base_scheme == "https" else 80)
+
+                cand = urlparse(api_url)
+                cand_scheme = cand.scheme.lower()
+                cand_host = (cand.hostname or "").lower().strip("[]").rstrip(".")
+                cand_port = cand.port or (443 if cand_scheme == "https" else 80)
+                if (cand_scheme, cand_host, cand_port) == (
+                    base_scheme,
+                    base_host,
+                    base_port,
+                ):
+                    return api_url
+            except ValueError:
+                pass
+        return browser_url or api_url
+
     def _parse_github_release_payload(
         self, release_repo: str, rel: dict[str, Any]
     ) -> dict[str, Any] | None:
@@ -5694,12 +5798,11 @@ class RuntimeService:
         checksum_assets: list[dict[str, Any]] = []
         for asset in assets:
             name = asset.get("name")
-            dl_url = asset.get("browser_download_url")
-            if not isinstance(name, str) or not isinstance(dl_url, str):
+            dl_s = self._select_asset_download_url(asset)
+            if not isinstance(name, str) or not dl_s:
                 continue
             name_s = name.strip()
-            dl_s = dl_url.strip()
-            if not name_s or not dl_s:
+            if not name_s:
                 continue
             lower_name = name_s.lower()
             if lower_name.endswith((".sha256", ".sha256sum")) or lower_name in (
@@ -5730,7 +5833,7 @@ class RuntimeService:
 
         if chosen_asset is not None:
             asset_name = str(chosen_asset.get("name", "")).strip() or None
-            download_url = str(chosen_asset.get("browser_download_url", "")).strip() or None
+            download_url = self._select_asset_download_url(chosen_asset)
             raw_digest = chosen_asset.get("digest")
             if isinstance(raw_digest, str) and raw_digest.lower().startswith("sha256:"):
                 hex_part = raw_digest.split(":", 1)[1].strip()
@@ -5742,7 +5845,7 @@ class RuntimeService:
                 for cs in checksum_assets:
                     cs_name = str(cs.get("name", "")).strip()
                     if cs_name in exact_names:
-                        checksum_url = str(cs.get("browser_download_url", "")).strip() or None
+                        checksum_url = self._select_asset_download_url(cs)
                         checksum_asset_name = cs_name
                         break
                 if checksum_url is None:
@@ -5753,7 +5856,7 @@ class RuntimeService:
                             "sha256sums.txt",
                             "checksums.txt",
                         ):
-                            checksum_url = str(cs.get("browser_download_url", "")).strip() or None
+                            checksum_url = self._select_asset_download_url(cs)
                             checksum_asset_name = cs_name
                             break
         else:
@@ -5891,6 +5994,7 @@ class RuntimeService:
         if not repo_dir or not os.path.isdir(repo_dir):
             return {
                 "hasGit": False,
+                "hasLocalSource": False,
                 "canGitUpdate": False,
                 "canReleaseUpdate": bool(has_core_env),
                 "canUpdate": False,
@@ -5912,7 +6016,10 @@ class RuntimeService:
                 "hasCoreEnv": has_core_env,
             }
 
-        version = self._read_repo_package_version(repo_dir)
+        has_local_source = os.path.isfile(
+            os.path.join(repo_dir, "bootstrap", "docker-compose.core.yml")
+        )
+        pkg_version = self._read_repo_package_version(repo_dir)
         release_meta = self._read_release_metadata(repo_dir)
         current_release_tag = (
             str(release_meta.get("tag")).strip()
@@ -5931,12 +6038,25 @@ class RuntimeService:
             if release_meta and isinstance(release_meta.get("commit"), str) and release_meta.get("commit").strip()
             else None
         )
-        if not version and release_meta and isinstance(release_meta.get("version"), str):
-            version = release_meta["version"].strip() or None
+        tag_version = (
+            normalize_version_label(current_release_tag)
+            if current_release_tag and parse_semver(current_release_tag) is not None
+            else None
+        )
+        meta_version = (
+            release_meta["version"].strip() or None
+            if release_meta and isinstance(release_meta.get("version"), str)
+            else None
+        )
 
         git_dir = os.path.join(repo_dir, ".git")
         if not os.path.exists(git_dir):
             installed_from = "release" if release_meta else "unknown"
+            version = (
+                tag_version or meta_version or pkg_version
+                if release_meta
+                else pkg_version or tag_version or meta_version
+            )
             can_release = bool(has_core_env)
             reason = (
                 None
@@ -5945,6 +6065,7 @@ class RuntimeService:
             )
             return {
                 "hasGit": False,
+                "hasLocalSource": has_local_source,
                 "canGitUpdate": False,
                 "canReleaseUpdate": can_release,
                 "canUpdate": can_release,
@@ -5962,11 +6083,13 @@ class RuntimeService:
                 "hasCoreEnv": has_core_env,
             }
 
+        version = pkg_version or tag_version or meta_version
         head_proc = self._run_repo_git(repo_dir, ["rev-parse", "HEAD"], timeout=10)
         head_err = (head_proc.stderr or "").strip()
         if head_proc.returncode != 0 and "dubious ownership" in head_err.lower():
             return {
                 "hasGit": True,
+                "hasLocalSource": has_local_source,
                 "canGitUpdate": False,
                 "canReleaseUpdate": bool(has_core_env),
                 "canUpdate": False,
@@ -6020,6 +6143,7 @@ class RuntimeService:
                 reason = "No 'origin' Git remote is configured for VPSAgent."
             return {
                 "hasGit": True,
+                "hasLocalSource": has_local_source,
                 "canGitUpdate": False,
                 "canReleaseUpdate": bool(has_core_env and not dirty),
                 "canUpdate": False,
@@ -6067,6 +6191,7 @@ class RuntimeService:
 
         return {
             "hasGit": True,
+            "hasLocalSource": has_local_source,
             "canGitUpdate": not dirty and not diverged,
             "canReleaseUpdate": bool(has_core_env and not dirty),
             "canUpdate": not dirty and not diverged,
@@ -6111,25 +6236,33 @@ class RuntimeService:
         unavailable_reason = repo_info.get("unavailableReason")
         if repo_info.get("dirtyWorkingTree"):
             can_update = False
-        elif update_source == "release" and state.get("_releaseDownloadUrl"):
-            can_update = bool(repo_info.get("hasCoreEnv"))
-            if can_update:
-                unavailable_reason = None
-            else:
-                unavailable_reason = f"Core .env file not found in {self.vpsagent_root}."
-        elif not repo_info.get("hasGit"):
+        elif update_source == "release":
             if not repo_info.get("hasCoreEnv"):
                 can_update = False
                 unavailable_reason = f"Core .env file not found in {self.vpsagent_root}."
+            elif state.get("_releaseDownloadUrl"):
+                can_update = True
+                unavailable_reason = None
+            elif not repo_info.get("hasGit") and repo_info.get("hasLocalSource"):
+                can_update = True
+                unavailable_reason = None
             elif release_status in ("no_releases", "unavailable"):
                 can_update = False
                 unavailable_reason = (
                     state.get("releaseNote")
                     or "No GitHub release is published yet to update from."
                 )
-            elif resolved_release_repo:
+            elif release_status == "up_to_date":
+                can_update = False
+                unavailable_reason = (
+                    state.get("releaseNote")
+                    or "Installed version is newer than the latest published release."
+                )
+            elif resolved_release_repo and release_status == "unchecked":
                 can_update = True
                 unavailable_reason = None
+            else:
+                can_update = False
         else:
             can_update = bool(repo_info.get("canGitUpdate"))
 
@@ -6201,18 +6334,42 @@ class RuntimeService:
             has_installable_release = bool(
                 release_result and release_result.get("status") == "ok"
             )
+            release_newer = False
+            if has_installable_release and release_result is not None:
+                release_newer = is_release_newer(
+                    repo_info["currentVersion"],
+                    release_result["tag"],
+                    current_release_tag=repo_info.get("currentReleaseTag"),
+                )
+
             latest_commit: str | None = None
             latest_subject: str | None = None
             latest_date: str | None = None
             commits_behind = 0
 
-            if repo_info.get("hasGit") and repo_info["repoDir"] and repo_info["branch"]:
+            # Skip git fetch completely once GitHub Releases already offers a newer release
+            if (
+                not (has_installable_release and release_newer)
+                and repo_info.get("hasGit")
+                and repo_info["repoDir"]
+                and repo_info["branch"]
+            ):
                 repo_dir = repo_info["repoDir"]
                 branch = repo_info["branch"]
-                fetch_proc = self._run_repo_git(
-                    repo_dir, ["fetch", "--prune", "origin", branch], timeout=45
-                )
-                if fetch_proc.returncode != 0:
+                git_fetch_timeout = 15 if has_installable_release else 30
+                fetch_proc: subprocess.CompletedProcess[str] | None = None
+                try:
+                    fetch_proc = self._run_repo_git(
+                        repo_dir,
+                        ["fetch", "--prune", "origin", branch],
+                        timeout=git_fetch_timeout,
+                    )
+                except BridgeRequestError:
+                    if not has_installable_release:
+                        raise
+                    fetch_proc = None
+
+                if fetch_proc is not None and fetch_proc.returncode != 0:
                     if not has_installable_release:
                         detail = (
                             fetch_proc.stderr
@@ -6223,7 +6380,7 @@ class RuntimeService:
                             502,
                             f"Could not check for updates: {redact_secrets(detail)}",
                         )
-                else:
+                elif fetch_proc is not None:
                     # Re-inspect after fetch so diverged-branch status reflects the latest origin/<branch>
                     repo_info = self._inspect_core_repo()
                     remote_ref = f"origin/{branch}"
@@ -6308,11 +6465,6 @@ class RuntimeService:
                 cs_asset_name = release_result["checksumAssetName"]
                 asset_digest = release_result["assetDigestSha256"]
 
-                release_newer = is_release_newer(
-                    repo_info["currentVersion"],
-                    latest_tag,
-                    current_release_tag=repo_info.get("currentReleaseTag"),
-                )
                 if release_newer:
                     release_status = "available"
                     update_source = "release"
@@ -6320,6 +6472,21 @@ class RuntimeService:
                     message = f"New VPSAgent release {latest_tag} is ready to install."
                 else:
                     release_status = "up_to_date"
+                    release_older = is_release_older(
+                        repo_info["currentVersion"],
+                        latest_tag,
+                        current_release_tag=repo_info.get("currentReleaseTag"),
+                    )
+                    if release_older or repo_info.get("hasLocalSource"):
+                        # Never cache an older release (or redundant download when local source exists)
+                        dl_url = None
+                        cs_url = None
+                        cs_asset_name = None
+                        asset_digest = None
+                    if release_older:
+                        checksum_available = False
+                        checksum_status = "none"
+
                     if git_update_available:
                         update_source = "git"
                         update_available = True
@@ -6339,6 +6506,10 @@ class RuntimeService:
                             else "git"
                         )
                         update_available = False
+                        if release_older:
+                            release_note = (
+                                f"Installed version is newer than the latest published release ({latest_tag})."
+                            )
                         ver = repo_info["currentVersion"]
                         message = (
                             f"VPSAgent v{ver} is up to date."
@@ -6430,10 +6601,23 @@ class RuntimeService:
                 self._update_state["logs"] = logs[-MAX_BUILD_LOG_LINES:]
             self._persist_update_state(self._update_state)
 
+    @staticmethod
+    def _caddyfile_changed_in_snapshots(
+        config_snapshots: list[tuple[str, bytes | None, bytes]],
+    ) -> bool:
+        for dst_path, old_content, written_content in config_snapshots:
+            if (
+                os.path.basename(dst_path) == "Caddyfile"
+                and old_content != written_content
+            ):
+                return True
+        return False
+
     def _sync_core_configs(self, repo_dir: str) -> list[tuple[str, bytes | None, bytes]]:
         """
         Copies updated Caddyfile and docker-compose.core.yml into `self.vpsagent_root`
         while snapshotting originals for safe rollback (never touching `00-default.caddy`).
+        If any file write fails, restores all previously written files before raising.
         """
         config_snapshots: list[tuple[str, bytes | None, bytes]] = []
         bootstrap_dir = os.path.join(repo_dir, "bootstrap")
@@ -6448,25 +6632,29 @@ class RuntimeService:
         ):
             if os.path.isfile(src_path) and os.path.isdir(self.vpsagent_root):
                 old_content: bytes | None = None
-                if os.path.isfile(dst_path):
-                    with open(dst_path, "rb") as fh:
-                        old_content = fh.read()
-                with open(src_path, "rb") as fh:
-                    written_content = fh.read()
+                write_started = False
                 try:
+                    if os.path.isfile(dst_path):
+                        with open(dst_path, "rb") as fh:
+                            old_content = fh.read()
+                    with open(src_path, "rb") as fh:
+                        written_content = fh.read()
+                    write_started = True
                     with open(dst_path, "wb") as fh:
                         fh.write(written_content)
                 except OSError:
-                    # Immediately restore original file if write/close failed after truncation
-                    try:
-                        if old_content is None:
-                            if os.path.isfile(dst_path):
-                                os.unlink(dst_path)
-                        else:
-                            with open(dst_path, "wb") as rfh:
-                                rfh.write(old_content)
-                    except OSError:
-                        pass
+                    if write_started:
+                        try:
+                            if old_content is None:
+                                if os.path.isfile(dst_path):
+                                    os.unlink(dst_path)
+                            else:
+                                with open(dst_path, "wb") as rfh:
+                                    rfh.write(old_content)
+                        except OSError:
+                            pass
+                    if config_snapshots:
+                        self._restore_core_configs(config_snapshots)
                     raise
                 config_snapshots.append((dst_path, old_content, written_content))
         return config_snapshots
@@ -6539,6 +6727,148 @@ class RuntimeService:
         except OSError:
             pass
 
+    def _run_core_compose_up(
+        self,
+        source_dir: str,
+        *,
+        log_output: bool = True,
+        timeout: int = 600,
+    ) -> subprocess.CompletedProcess[str]:
+        compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
+        env_file = os.path.join(self.vpsagent_root, ".env")
+        if not os.path.isfile(compose_dst) or not os.path.isfile(env_file):
+            raise RuntimeError(
+                f"Core stack files not found in {self.vpsagent_root} (expected docker-compose.yml and .env)."
+            )
+        proc = subprocess.run(
+            [
+                self.docker_bin,
+                "compose",
+                "--project-directory",
+                self.vpsagent_root,
+                "-f",
+                compose_dst,
+                "--env-file",
+                env_file,
+                "up",
+                "-d",
+                "--build",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+            env={**os.environ, "VPSAGENT_REPO_DIR": source_dir},
+        )
+        if log_output:
+            combined_out = (
+                (proc.stdout or "") + "\n" + (proc.stderr or "")
+            ).splitlines()
+            for line in combined_out[-40:]:
+                if line.strip():
+                    self._append_update_log(line)
+        return proc
+
+    def _install_bridge_script_if_changed(
+        self, source_dir: str
+    ) -> tuple[bool, bytes | None]:
+        bridge_src = os.path.join(source_dir, "bootstrap", "runtime-bridge.py")
+        bridge_dst = os.path.join(self.vpsagent_root, "runtime-bridge.py")
+        if not (os.path.isfile(bridge_src) and os.path.isdir(self.vpsagent_root)):
+            return False, None
+        with open(bridge_src, "rb") as fh:
+            new_bytes = fh.read()
+        old_bytes: bytes | None = None
+        if os.path.isfile(bridge_dst):
+            with open(bridge_dst, "rb") as fh:
+                old_bytes = fh.read()
+        if old_bytes == new_bytes:
+            return False, old_bytes
+        tmp_bridge = f"{bridge_dst}.tmp.{os.getpid()}"
+        try:
+            with open(tmp_bridge, "wb") as fh:
+                fh.write(new_bytes)
+            os.chmod(tmp_bridge, 0o750)
+            os.replace(tmp_bridge, bridge_dst)
+            tmp_bridge = None
+        finally:
+            if tmp_bridge and os.path.lexists(tmp_bridge):
+                try:
+                    os.unlink(tmp_bridge)
+                except OSError:
+                    pass
+        self._append_update_log(
+            "Updated host Runtime Bridge script; scheduling seamless restart...",
+            phase="restarting",
+            message="Finishing update and restarting background bridge...",
+        )
+        return True, old_bytes
+
+    def _restore_bridge_script(self, old_bytes: bytes | None) -> str | None:
+        bridge_dst = os.path.join(self.vpsagent_root, "runtime-bridge.py")
+        rb_tmp = f"{bridge_dst}.rollback.{os.getpid()}"
+        try:
+            if old_bytes is not None:
+                with open(rb_tmp, "wb") as fh:
+                    fh.write(old_bytes)
+                os.chmod(rb_tmp, 0o750)
+                os.replace(rb_tmp, bridge_dst)
+                return "Restored previous runtime-bridge.py script."
+            if os.path.lexists(bridge_dst):
+                os.unlink(bridge_dst)
+                return "Removed newly installed runtime-bridge.py script."
+        except OSError as exc:
+            try:
+                if os.path.lexists(rb_tmp):
+                    os.unlink(rb_tmp)
+            except OSError:
+                pass
+            return f"Failed to restore runtime-bridge.py: {redact_secrets(str(exc))}"
+        return None
+
+    def _rollback_restored_caddy_if_needed(
+        self, rollback_notes: list[str], *, was_active: bool
+    ) -> None:
+        if not was_active:
+            return
+        if not any(
+            "Caddyfile" in note and "Restored previous configuration files" in note
+            for note in rollback_notes
+        ):
+            return
+        try:
+            with self._caddy_lock:
+                self._validate_and_reload_caddy()
+            rollback_notes.append("Reloaded Caddy with restored configuration.")
+        except Exception as exc:
+            rollback_notes.append(
+                f"Warning: Caddy reload during rollback failed: {redact_secrets(str(exc))}"
+            )
+
+    def _schedule_bridge_restart(self) -> None:
+        time.sleep(0.25)
+        try:
+            is_active = self._run_cmd(
+                [self.systemctl_bin, "is-active", "vpsagent-runtime.service"],
+                label="systemd",
+                timeout=5,
+                check=False,
+            )
+            if is_active.returncode == 0:
+                self._run_cmd(
+                    [
+                        self.systemctl_bin,
+                        "restart",
+                        "--no-block",
+                        "vpsagent-runtime.service",
+                    ],
+                    label="systemd",
+                    timeout=10,
+                    check=False,
+                )
+        except Exception:
+            pass
+
     def start_core_update(self, payload: dict[str, Any]) -> dict[str, Any]:
         requested_source: str | None = None
         if isinstance(payload, dict) and payload.get("source") is not None:
@@ -6581,6 +6911,17 @@ class RuntimeService:
                 raise BridgeRequestError(
                     400, f"Core .env file not found in {self.vpsagent_root}."
                 )
+
+            if (
+                requested_source in (None, "auto")
+                and not repo_info.get("hasGit")
+                and state_snapshot.get("checkedAt")
+                and not state_snapshot.get("updateAvailable")
+                and repo_info.get("hasLocalSource")
+                and repo_info.get("repoDir")
+            ):
+                return self._start_local_release_rebuild(repo_info)
+
             release_target: dict[str, Any]
             if cached_dl_url and state_snapshot.get("latestReleaseTag"):
                 release_target = {
@@ -6613,6 +6954,43 @@ class RuntimeService:
                         or "No GitHub release is available to install yet.",
                     )
                 release_target = fetched
+
+            if is_release_older(
+                repo_info.get("currentVersion"),
+                release_target.get("tag"),
+                current_release_tag=repo_info.get("currentReleaseTag"),
+            ):
+                if (
+                    requested_source in (None, "auto")
+                    and not repo_info.get("hasGit")
+                    and repo_info.get("hasLocalSource")
+                    and repo_info.get("repoDir")
+                ):
+                    return self._start_local_release_rebuild(repo_info)
+                cur_label = (
+                    repo_info.get("currentReleaseTag")
+                    or (
+                        f"v{repo_info['currentVersion']}"
+                        if repo_info.get("currentVersion")
+                        else "current install"
+                    )
+                )
+                raise BridgeRequestError(
+                    400,
+                    f"Refusing to downgrade VPSAgent from {cur_label} to older release {release_target['tag']}.",
+                )
+
+            if (
+                not is_release_newer(
+                    repo_info.get("currentVersion"),
+                    release_target.get("tag"),
+                    current_release_tag=repo_info.get("currentReleaseTag"),
+                )
+                and not repo_info.get("hasGit")
+                and repo_info.get("hasLocalSource")
+                and repo_info.get("repoDir")
+            ):
+                return self._start_local_release_rebuild(repo_info)
 
             now_iso = datetime.now(timezone.utc).isoformat()
             with self._update_lock:
@@ -6717,8 +7095,161 @@ class RuntimeService:
             "status": self._build_update_status_response(repo_info, snapshot),
         }
 
+    def _start_local_release_rebuild(self, repo_info: dict[str, Any]) -> dict[str, Any]:
+        repo_dir = str(repo_info["repoDir"])
+        label = (
+            repo_info.get("currentReleaseTag")
+            or (
+                f"v{repo_info['currentVersion']}"
+                if repo_info.get("currentVersion")
+                else "installed build"
+            )
+        )
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._update_lock:
+            if self._update_state.get("state") == "updating":
+                raise BridgeRequestError(
+                    409, "A VPSAgent update is already in progress."
+                )
+            self._update_state = {
+                **self._update_state,
+                "state": "updating",
+                "phase": "syncing",
+                "updateSource": "release",
+                "startedAt": now_iso,
+                "finishedAt": None,
+                "error": None,
+                "message": f"Rebuilding VPSAgent {label}...",
+                "logs": [f"Starting local rebuild of installed VPSAgent {label}..."],
+            }
+            self._persist_update_state(self._update_state)
+            snapshot = dict(self._update_state)
+
+        worker = threading.Thread(
+            target=self._run_core_rebuild_local_worker,
+            args=(repo_dir,),
+            name="vpsagent-release-rebuild",
+            daemon=False,
+        )
+        worker.start()
+        return {
+            "ok": True,
+            "started": True,
+            "status": self._build_update_status_response(repo_info, snapshot),
+        }
+
+    def _run_core_rebuild_local_worker(self, repo_dir: str) -> None:
+        bridge_changed = False
+        bridge_written = False
+        old_bridge_bytes: bytes | None = None
+        core_activated = False
+        caddy_reloaded = False
+        config_snapshots: list[tuple[str, bytes | None, bytes]] = []
+        try:
+            env_file = os.path.join(self.vpsagent_root, ".env")
+            if not os.path.isdir(repo_dir):
+                raise RuntimeError(f"VPSAgent source directory not found: {repo_dir}.")
+            if not os.path.isfile(env_file):
+                raise RuntimeError(f"Core .env file not found in {self.vpsagent_root}.")
+
+            self._append_update_log(
+                "Syncing VPSAgent configuration files...",
+                phase="syncing",
+                message="Preparing updated server configuration...",
+            )
+            config_snapshots = self._sync_core_configs(repo_dir)
+
+            self._append_update_log(
+                "Rebuilding and restarting VPSAgent core container...",
+                phase="building",
+                message="Rebuilding VPSAgent (this usually takes 1-2 minutes)...",
+            )
+            compose_proc = self._run_core_compose_up(repo_dir)
+            if compose_proc.returncode != 0:
+                raise RuntimeError(
+                    f"Docker rebuild failed (exit {compose_proc.returncode})."
+                )
+            core_activated = True
+
+            if self._caddyfile_changed_in_snapshots(config_snapshots):
+                self._append_update_log("Validating and reloading Caddy configuration...")
+                with self._caddy_lock:
+                    self._validate_and_reload_caddy()
+                caddy_reloaded = True
+
+            bridge_changed, old_bridge_bytes = self._install_bridge_script_if_changed(
+                repo_dir
+            )
+            bridge_written = bridge_changed
+
+            new_info = self._inspect_core_repo()
+            label = (
+                new_info.get("currentReleaseTag")
+                or (
+                    f"v{new_info['currentVersion']}"
+                    if new_info.get("currentVersion")
+                    else "installed build"
+                )
+            )
+            done_msg = f"Rebuilt VPSAgent {label}."
+            finished_iso = datetime.now(timezone.utc).isoformat()
+            with self._update_lock:
+                self._update_state = {
+                    **self._update_state,
+                    "state": "succeeded",
+                    "phase": "completed",
+                    "checkedAt": finished_iso,
+                    "finishedAt": finished_iso,
+                    "updateAvailable": False,
+                    "error": None,
+                    "message": done_msg,
+                    "logs": (list(self._update_state.get("logs") or []) + [done_msg])[
+                        -MAX_BUILD_LOG_LINES:
+                    ],
+                }
+                self._persist_update_state(self._update_state)
+
+            if bridge_changed:
+                self._schedule_bridge_restart()
+        except Exception as exc:
+            err_text = redact_secrets(str(exc))
+            rollback_notes: list[str] = []
+            if bridge_written:
+                note = self._restore_bridge_script(old_bridge_bytes)
+                if note:
+                    rollback_notes.append(note)
+            rollback_notes.extend(self._restore_core_configs(config_snapshots))
+            self._rollback_restored_caddy_if_needed(
+                rollback_notes, was_active=(caddy_reloaded or core_activated)
+            )
+            if core_activated and os.path.isdir(repo_dir):
+                try:
+                    self._run_core_compose_up(repo_dir, log_output=False, timeout=300)
+                except Exception:
+                    pass
+            finished_iso = datetime.now(timezone.utc).isoformat()
+            with self._update_lock:
+                extra_logs = [f"ERROR: {err_text}", *rollback_notes]
+                self._update_state = {
+                    **self._update_state,
+                    "state": "failed",
+                    "phase": "failed",
+                    "finishedAt": finished_iso,
+                    "error": err_text,
+                    "message": "VPSAgent rebuild failed.",
+                    "logs": (
+                        list(self._update_state.get("logs") or []) + extra_logs
+                    )[-MAX_BUILD_LOG_LINES:],
+                }
+                self._persist_update_state(self._update_state)
+
     def _run_core_update_release_worker(self, release_target: dict[str, Any]) -> None:
         bridge_changed = False
+        bridge_written = False
+        old_bridge_bytes: bytes | None = None
+        core_activated = False
+        caddy_reloaded = False
+        source_persisted = False
         config_snapshots: list[tuple[str, bytes | None, bytes]] = []
         tmp_dir: str | None = None
         staging_dir: str | None = None
@@ -6729,8 +7260,38 @@ class RuntimeService:
         actual_sha256: str | None = None
         tag = str(release_target["tag"]).strip()
         release_repo = str(release_target.get("releaseRepo") or DEFAULT_RELEASE_REPO)
+        prev_repo_dir = self.repo_dir
+        active_src_path = _active_source_path(self.vpsagent_root)
+        had_active_source = os.path.isfile(active_src_path) and not os.path.islink(
+            active_src_path
+        )
+        prev_active_source_bytes: bytes | None = None
+        if had_active_source:
+            try:
+                with open(active_src_path, "rb") as afh:
+                    prev_active_source_bytes = afh.read()
+            except OSError:
+                prev_active_source_bytes = None
 
         try:
+            repo_info_now = self._inspect_core_repo()
+            if is_release_older(
+                repo_info_now.get("currentVersion"),
+                tag,
+                current_release_tag=repo_info_now.get("currentReleaseTag"),
+            ):
+                cur_label = (
+                    repo_info_now.get("currentReleaseTag")
+                    or (
+                        f"v{repo_info_now['currentVersion']}"
+                        if repo_info_now.get("currentVersion")
+                        else "current install"
+                    )
+                )
+                raise RuntimeError(
+                    f"Refusing to downgrade VPSAgent from {cur_label} to older release {tag}."
+                )
+
             env_file = os.path.join(self.vpsagent_root, ".env")
             if not os.path.isfile(env_file):
                 raise RuntimeError(
@@ -6790,7 +7351,7 @@ class RuntimeService:
                 try:
                     cs_status, _cs_headers, cs_body, _ = self._fetch_release_http(
                         checksum_url,
-                        accept="text/plain, application/octet-stream",
+                        accept="application/octet-stream",
                         max_bytes=MAX_CHECKSUM_FILE_BYTES,
                         timeout=20.0,
                     )
@@ -6853,9 +7414,13 @@ class RuntimeService:
             staging_dir = tempfile.mkdtemp(prefix=f".staging-{safe_tag}-", dir=releases_dir)
             os.chmod(staging_dir, 0o755)
             extracted = safe_extract_release_tarball(archive_path, staging_dir)
+            tag_version = (
+                normalize_version_label(tag) if parse_semver(tag) is not None else None
+            )
             resolved_ver = (
-                extracted.get("version")
+                tag_version
                 or release_target.get("version")
+                or extracted.get("version")
                 or normalize_version_label(tag)
                 or tag
             )
@@ -6896,74 +7461,40 @@ class RuntimeService:
             config_snapshots = self._sync_core_configs(final_release_dir)
 
             # Step 5: Rebuild & restart vpsagent-core container
-            compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
-            if not os.path.isfile(compose_dst) or not os.path.isfile(env_file):
-                raise RuntimeError(
-                    f"Core stack files not found in {self.vpsagent_root} (expected docker-compose.yml and .env)."
-                )
             self._append_update_log(
                 "Rebuilding and restarting VPSAgent core container...",
                 phase="building",
                 message="Rebuilding VPSAgent (this usually takes 1-2 minutes)...",
             )
-            compose_env = {**os.environ, "VPSAGENT_REPO_DIR": final_release_dir}
-            compose_proc = subprocess.run(
-                [
-                    self.docker_bin,
-                    "compose",
-                    "--project-directory",
-                    self.vpsagent_root,
-                    "-f",
-                    compose_dst,
-                    "--env-file",
-                    env_file,
-                    "up",
-                    "-d",
-                    "--build",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=False,
-                env=compose_env,
-            )
-            combined_out = (
-                (compose_proc.stdout or "") + "\n" + (compose_proc.stderr or "")
-            ).splitlines()
-            for line in combined_out[-40:]:
-                if line.strip():
-                    self._append_update_log(line)
+            compose_proc = self._run_core_compose_up(final_release_dir)
             if compose_proc.returncode != 0:
                 raise RuntimeError(
                     f"Docker rebuild failed (exit {compose_proc.returncode})."
                 )
+            core_activated = True
 
-            # Step 6: Persist VPSAGENT_REPO_DIR cleanly in .env (preserves all secrets)
-            _upsert_env_file_var(env_file, "VPSAGENT_REPO_DIR", final_release_dir)
+            # Step 5b: Validate and reload Caddy if Caddyfile changed
+            if self._caddyfile_changed_in_snapshots(config_snapshots):
+                self._append_update_log("Validating and reloading Caddy configuration...")
+                with self._caddy_lock:
+                    self._validate_and_reload_caddy()
+                caddy_reloaded = True
+
+            # Step 6: Install updated runtime-bridge.py if changed (before persisting active-source.json)
+            bridge_changed, old_bridge_bytes = self._install_bridge_script_if_changed(
+                final_release_dir
+            )
+            bridge_written = bridge_changed
+
+            # Step 7: Persist non-secret active-source pointer cleanly (never reads or rewrites .env)
+            _write_active_source_file(
+                self.vpsagent_root,
+                final_release_dir,
+                release_tag=tag,
+                release_repo=release_repo,
+            )
             self.repo_dir = final_release_dir
-
-            # Step 7: Install updated runtime-bridge.py if changed
-            bridge_src = os.path.join(final_release_dir, "bootstrap", "runtime-bridge.py")
-            bridge_dst = os.path.join(self.vpsagent_root, "runtime-bridge.py")
-            if os.path.isfile(bridge_src) and os.path.isdir(self.vpsagent_root):
-                with open(bridge_src, "rb") as fh:
-                    new_bytes = fh.read()
-                old_bytes: bytes | None = None
-                if os.path.isfile(bridge_dst):
-                    with open(bridge_dst, "rb") as fh:
-                        old_bytes = fh.read()
-                if old_bytes != new_bytes:
-                    tmp_bridge = f"{bridge_dst}.tmp.{os.getpid()}"
-                    with open(tmp_bridge, "wb") as fh:
-                        fh.write(new_bytes)
-                    os.chmod(tmp_bridge, 0o750)
-                    os.replace(tmp_bridge, bridge_dst)
-                    bridge_changed = True
-                    self._append_update_log(
-                        "Updated host Runtime Bridge script; scheduling seamless restart...",
-                        phase="restarting",
-                        message="Finishing update and restarting background bridge...",
-                    )
+            source_persisted = True
 
             if backup_release_dir and os.path.isdir(backup_release_dir):
                 shutil.rmtree(backup_release_dir, ignore_errors=True)
@@ -7001,37 +7532,64 @@ class RuntimeService:
                 self._persist_update_state(self._update_state)
 
             if bridge_changed:
-                time.sleep(0.25)
-                try:
-                    is_active = self._run_cmd(
-                        [self.systemctl_bin, "is-active", "vpsagent-runtime.service"],
-                        label="systemd",
-                        timeout=5,
-                        check=False,
-                    )
-                    if is_active.returncode == 0:
-                        self._run_cmd(
-                            [
-                                self.systemctl_bin,
-                                "restart",
-                                "--no-block",
-                                "vpsagent-runtime.service",
-                            ],
-                            label="systemd",
-                            timeout=10,
-                            check=False,
-                        )
-                except Exception:
-                    pass
+                self._schedule_bridge_restart()
         except Exception as exc:
             err_text = _scrub_secret_values(
                 str(exc),
                 [self.release_github_token] if self.release_github_token else None,
             )
-            rollback_notes = self._restore_core_configs(config_snapshots)
-            if final_release_dir and (
-                swapped_new_release
-                or (backup_release_dir and os.path.isdir(backup_release_dir))
+            rollback_notes: list[str] = []
+            if source_persisted:
+                self.repo_dir = prev_repo_dir
+                try:
+                    if had_active_source and prev_active_source_bytes is not None:
+                        tmp_act = f"{active_src_path}.rollback.{os.getpid()}"
+                        with open(tmp_act, "wb") as afh:
+                            afh.write(prev_active_source_bytes)
+                        os.chmod(tmp_act, 0o644)
+                        os.replace(tmp_act, active_src_path)
+                    elif os.path.lexists(active_src_path):
+                        os.unlink(active_src_path)
+                    rollback_notes.append("Restored previous active source pointer.")
+                except OSError as src_exc:
+                    rollback_notes.append(
+                        f"Failed to restore active source pointer: {redact_secrets(str(src_exc))}"
+                    )
+
+            if bridge_written:
+                note = self._restore_bridge_script(old_bridge_bytes)
+                if note:
+                    rollback_notes.append(note)
+
+            rollback_notes.extend(self._restore_core_configs(config_snapshots))
+            self._rollback_restored_caddy_if_needed(
+                rollback_notes, was_active=(caddy_reloaded or core_activated)
+            )
+
+            stack_rolled_back = False
+            if core_activated and prev_repo_dir and os.path.isdir(prev_repo_dir):
+                try:
+                    rb_proc = self._run_core_compose_up(
+                        prev_repo_dir, log_output=False, timeout=300
+                    )
+                    if rb_proc.returncode == 0:
+                        stack_rolled_back = True
+                        rollback_notes.append(
+                            "Rebuilt core container back to previous source."
+                        )
+                except Exception:
+                    pass
+
+            has_same_tag_backup = bool(
+                backup_release_dir and os.path.isdir(backup_release_dir)
+            )
+            can_remove_new_release = bool(
+                not core_activated
+                or has_same_tag_backup
+                or (stack_rolled_back and self.repo_dir != final_release_dir)
+            )
+            if final_release_dir and can_remove_new_release and (
+                swapped_new_release or has_same_tag_backup
             ):
                 try:
                     if os.path.isdir(final_release_dir):
@@ -7044,6 +7602,16 @@ class RuntimeService:
                         )
                 except OSError:
                     pass
+            elif (
+                core_activated
+                and final_release_dir
+                and os.path.isdir(final_release_dir)
+                and not can_remove_new_release
+            ):
+                rollback_notes.append(
+                    f"Preserved {final_release_dir} because the new core container was already started and rollback did not revert it."
+                )
+
             finished_iso = datetime.now(timezone.utc).isoformat()
             with self._update_lock:
                 extra_logs = [f"ERROR: {err_text}", *rollback_notes]
@@ -7074,6 +7642,10 @@ class RuntimeService:
 
     def _run_core_update_worker(self, repo_dir: str, branch: str) -> None:
         bridge_changed = False
+        bridge_written = False
+        old_bridge_bytes: bytes | None = None
+        core_activated = False
+        caddy_reloaded = False
         prev_commit: str | None = None
         after_commit: str | None = None
         merged_new_commit = False
@@ -7139,73 +7711,30 @@ class RuntimeService:
             config_snapshots = self._sync_core_configs(repo_dir)
 
             # Step 3: Rebuild and restart vpsagent-core stack
-            bootstrap_dir = os.path.join(repo_dir, "bootstrap")
-            compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
-            env_file = os.path.join(self.vpsagent_root, ".env")
-            if not os.path.isfile(compose_dst) or not os.path.isfile(env_file):
-                raise RuntimeError(
-                    f"Core stack files not found in {self.vpsagent_root} (expected docker-compose.yml and .env)."
-                )
-
             self._append_update_log(
                 "Rebuilding and restarting VPSAgent core container...",
                 phase="building",
                 message="Rebuilding VPSAgent (this usually takes 1-2 minutes)...",
             )
-            compose_env = {**os.environ, "VPSAGENT_REPO_DIR": repo_dir}
-            compose_proc = subprocess.run(
-                [
-                    self.docker_bin,
-                    "compose",
-                    "--project-directory",
-                    self.vpsagent_root,
-                    "-f",
-                    compose_dst,
-                    "--env-file",
-                    env_file,
-                    "up",
-                    "-d",
-                    "--build",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=False,
-                env=compose_env,
-            )
-            combined_out = (
-                (compose_proc.stdout or "") + "\n" + (compose_proc.stderr or "")
-            ).splitlines()
-            for line in combined_out[-40:]:
-                if line.strip():
-                    self._append_update_log(line)
+            compose_proc = self._run_core_compose_up(repo_dir)
             if compose_proc.returncode != 0:
                 raise RuntimeError(
                     f"Docker rebuild failed (exit {compose_proc.returncode})."
                 )
+            core_activated = True
+
+            # Step 3b: Validate and reload Caddy if Caddyfile changed
+            if self._caddyfile_changed_in_snapshots(config_snapshots):
+                self._append_update_log("Validating and reloading Caddy configuration...")
+                with self._caddy_lock:
+                    self._validate_and_reload_caddy()
+                caddy_reloaded = True
 
             # Step 4: Install updated runtime-bridge.py if changed
-            bridge_src = os.path.join(bootstrap_dir, "runtime-bridge.py")
-            bridge_dst = os.path.join(self.vpsagent_root, "runtime-bridge.py")
-            if os.path.isfile(bridge_src) and os.path.isdir(self.vpsagent_root):
-                with open(bridge_src, "rb") as fh:
-                    new_bytes = fh.read()
-                old_bytes: bytes | None = None
-                if os.path.isfile(bridge_dst):
-                    with open(bridge_dst, "rb") as fh:
-                        old_bytes = fh.read()
-                if old_bytes != new_bytes:
-                    tmp_bridge = f"{bridge_dst}.tmp.{os.getpid()}"
-                    with open(tmp_bridge, "wb") as fh:
-                        fh.write(new_bytes)
-                    os.chmod(tmp_bridge, 0o750)
-                    os.replace(tmp_bridge, bridge_dst)
-                    bridge_changed = True
-                    self._append_update_log(
-                        "Updated host Runtime Bridge script; scheduling seamless restart...",
-                        phase="restarting",
-                        message="Finishing update and restarting background bridge...",
-                    )
+            bridge_changed, old_bridge_bytes = self._install_bridge_script_if_changed(
+                repo_dir
+            )
+            bridge_written = bridge_changed
 
             # Record success BEFORE restarting runtime-bridge.service so status survives restart
             new_info = self._inspect_core_repo()
@@ -7240,34 +7769,22 @@ class RuntimeService:
                 self._persist_update_state(self._update_state)
 
             if bridge_changed:
-                time.sleep(0.25)
-                try:
-                    is_active = self._run_cmd(
-                        [self.systemctl_bin, "is-active", "vpsagent-runtime.service"],
-                        label="systemd",
-                        timeout=5,
-                        check=False,
-                    )
-                    if is_active.returncode == 0:
-                        self._run_cmd(
-                            [
-                                self.systemctl_bin,
-                                "restart",
-                                "--no-block",
-                                "vpsagent-runtime.service",
-                            ],
-                            label="systemd",
-                            timeout=10,
-                            check=False,
-                        )
-                except Exception:
-                    pass
+                self._schedule_bridge_restart()
         except Exception as exc:
             err_text = redact_secrets(str(exc))
-            rollback_notes = self._restore_core_configs(config_snapshots)
+            rollback_notes: list[str] = []
+            if bridge_written:
+                note = self._restore_bridge_script(old_bridge_bytes)
+                if note:
+                    rollback_notes.append(note)
+            rollback_notes.extend(self._restore_core_configs(config_snapshots))
+            self._rollback_restored_caddy_if_needed(
+                rollback_notes, was_active=(caddy_reloaded or core_activated)
+            )
 
             # Only roll back Git checkout if it is still clean and at the exact merged commit
             # (never discard local edits the owner made while Docker was building).
+            rolled_back_git = False
             if merged_new_commit and prev_commit:
                 try:
                     cur_head_proc = self._run_repo_git(
@@ -7290,6 +7807,7 @@ class RuntimeService:
                             repo_dir, ["reset", "--hard", prev_commit], timeout=20
                         )
                         if rb_proc.returncode == 0:
+                            rolled_back_git = True
                             rollback_notes.append(
                                 f"Rolled source checkout back to running commit {prev_commit[:7]}."
                             )
@@ -7297,6 +7815,11 @@ class RuntimeService:
                         rollback_notes.append(
                             "Skipped automatic Git rollback because local changes were detected in the checkout during the build."
                         )
+                except Exception:
+                    pass
+            if core_activated and rolled_back_git and os.path.isdir(repo_dir):
+                try:
+                    self._run_core_compose_up(repo_dir, log_output=False, timeout=300)
                 except Exception:
                     pass
             finished_iso = datetime.now(timezone.utc).isoformat()
@@ -7558,15 +8081,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--repo-dir",
-        default=os.environ.get("VPSAGENT_REPO_DIR", ""),
+        default=None,
     )
     parser.add_argument(
         "--release-repo",
-        default=os.environ.get("VPSAGENT_RELEASE_REPO", ""),
+        default=None,
     )
     parser.add_argument(
         "--release-api-base",
-        default=os.environ.get("VPSAGENT_RELEASE_API_BASE", ""),
+        default=None,
     )
     parser.add_argument(
         "--check-update",
@@ -7673,6 +8196,20 @@ def main(argv: list[str] | None = None) -> int:
         status_deadline_s=args.status_deadline,
         health_interval_s=args.health_interval,
     )
+    if (
+        service.repo_dir
+        and os.path.isdir(service.repo_dir)
+        and os.path.isdir(service.vpsagent_root)
+        and not os.path.lexists(_active_source_path(service.vpsagent_root))
+    ):
+        try:
+            _write_active_source_file(
+                service.vpsagent_root,
+                service.repo_dir,
+                release_repo=service.release_repo,
+            )
+        except OSError:
+            pass
     handler_cls = make_handler(service)
 
     server: socketserver.BaseServer

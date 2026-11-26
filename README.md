@@ -39,7 +39,7 @@ Open **AI Keys & Settings → VPSAgent updates** in your dashboard and click **C
 You can also check for newer releases directly from your server shell:
 
 ```bash
-python3 /var/lib/vpsagent/runtime-bridge.py --check-update
+sudo python3 /var/lib/vpsagent/runtime-bridge.py --check-update
 ```
 
 **Manual shell fallback:** pull the latest code in your checkout and re-run the installer:

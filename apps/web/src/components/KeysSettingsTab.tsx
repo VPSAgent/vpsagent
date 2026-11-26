@@ -325,8 +325,9 @@ export function KeysSettingsTab({
     };
     try {
       const source =
-        updateStatus?.updateSource === "release" ||
-        updateStatus?.updateSource === "git"
+        updateStatus?.updateAvailable &&
+        (updateStatus?.updateSource === "release" ||
+          updateStatus?.updateSource === "git")
           ? updateStatus.updateSource
           : "auto";
       const res = await api.applySystemUpdate(source);

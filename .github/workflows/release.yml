@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to package (defaults to github.ref_name)"
+        description: "Release tag to package (e.g. v2.1.0; required when dispatched from a branch)"
         required: false
         type: string
 
@@ -25,14 +25,38 @@ jobs:
 
       - name: Build release archive and SHA-256 checksums
         env:
-          INPUT_TAG: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          TAG="${INPUT_TAG:-$REF_NAME}"
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            TAG="${REF_NAME}"
+          elif [[ -n "${INPUT_TAG}" ]]; then
+            TAG="${INPUT_TAG}"
+          elif [[ "${REF_TYPE}" == "tag" ]]; then
+            TAG="${REF_NAME}"
+          else
+            echo "Error: specify inputs.tag (e.g. v2.1.0) when dispatching manually from a branch." >&2
+            exit 1
+          fi
+
+          if [[ ! "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z._-]+)?$ ]]; then
+            echo "Error: invalid release tag '${TAG}' (expected vX.Y.Z)." >&2
+            exit 1
+          fi
+
+          git fetch --force --tags origin
+          if git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null 2>&1; then
+            ARCHIVE_COMMIT="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          else
+            ARCHIVE_COMMIT="$(git rev-parse HEAD)"
+          fi
+
           ARCHIVE="vpsagent-${TAG}.tar.gz"
           mkdir -p dist-release
-          git archive --format=tar.gz --prefix="vpsagent-${TAG}/" -o "dist-release/${ARCHIVE}" HEAD
+          git archive --format=tar.gz --prefix="vpsagent-${TAG}/" -o "dist-release/${ARCHIVE}" "${ARCHIVE_COMMIT}"
           (
             cd dist-release
             sha256sum "${ARCHIVE}" > SHA256SUMS
@@ -44,6 +68,7 @@ jobs:
           fi
           {
             echo "TAG=${TAG}"
+            echo "TARGET_COMMITISH=${ARCHIVE_COMMIT}"
             echo "ARCHIVE=dist-release/${ARCHIVE}"
             echo "CHECKSUMS=dist-release/SHA256SUMS"
             echo "IS_PRERELEASE=${IS_PRERELEASE}"
@@ -53,6 +78,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG }}
+          target_commitish: ${{ env.TARGET_COMMITISH }}
           name: "VPSAgent ${{ env.TAG }}"
           prerelease: ${{ env.IS_PRERELEASE }}
           generate_release_notes: true

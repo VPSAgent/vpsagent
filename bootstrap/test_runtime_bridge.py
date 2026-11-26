@@ -1541,7 +1541,10 @@ sys.exit(0)
         self.assertEqual(final_status["currentVersion"], "2.0.0-alpha.2")
         self.assertFalse(final_status["updateAvailable"])
         self.assertEqual(final_status["commitsBehind"], 0)
-        self.assertIn("up -d --build", Path(docker_log).read_text(encoding="utf-8"))
+        docker_calls_text = Path(docker_log).read_text(encoding="utf-8")
+        self.assertIn("up -d --build", docker_calls_text)
+        self.assertIn("exec vpsagent-caddy caddy validate", docker_calls_text)
+        self.assertIn("exec vpsagent-caddy caddy reload", docker_calls_text)
         self.assertEqual(
             Path(os.path.join(vpsagent_root, "runtime-bridge.py")).read_text(encoding="utf-8"),
             "# bridge v2\n",
@@ -2569,9 +2572,12 @@ sys.exit(0)
             subprocess.run(["git", "clone", "--branch", "main", remote_dir, current_repo], check=True, env=git_env)
 
             docker_fail_flag = os.path.join(self.tmp, "rel-docker-fail.flag")
+            docker_call_log = os.path.join(self.tmp, "rel-docker-calls.log")
             docker_py = os.path.join(self.tmp, "rel_fake_docker.py")
             Path(docker_py).write_text(
                 f"""import os, sys
+with open({docker_call_log!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\\n")
 if os.path.exists({docker_fail_flag!r}):
     sys.stderr.write("simulated release docker fail\\n")
     sys.exit(1)
@@ -2699,12 +2705,24 @@ sys.exit(0)
             self.assertFalse(ok_status["updateAvailable"])
 
             expected_rel_dir = os.path.join(vpsagent_root, "releases", "v2.1.0")
+            # Core .env must remain byte-for-byte untouched and 0600 (never read/rewritten by bridge)
             self.assertEqual(stat.S_IMODE(os.stat(env_file).st_mode), 0o600)
-            env_after = Path(env_file).read_text(encoding="utf-8")
-            self.assertIn(f"VPSAGENT_REPO_DIR={expected_rel_dir}\n", env_after)
-            self.assertIn("VPSAGENT_RUNTIME_TOKEN=test-secret-token-value-123456\n", env_after)
-            self.assertIn("VPSAGENT_SESSION_SECRET=keep-session-secret-intact\n", env_after)
-            self.assertIn("VPSAGENT_ENCRYPTION_SECRET=keep-encryption-secret-intact\n", env_after)
+            self.assertEqual(Path(env_file).read_text(encoding="utf-8"), initial_env)
+
+            active_source_file = os.path.join(vpsagent_root, "active-source.json")
+            self.assertEqual(stat.S_IMODE(os.stat(active_source_file).st_mode), 0o644)
+            active_source = json.loads(
+                Path(active_source_file).read_text(encoding="utf-8")
+            )
+            self.assertEqual(active_source["repoDir"], expected_rel_dir)
+            self.assertEqual(active_source["releaseTag"], "v2.1.0")
+            self.assertEqual(active_source["releaseRepo"], "VPSAgent/vpsagent")
+            self.assertNotIn("keep-session-secret-intact", Path(active_source_file).read_text(encoding="utf-8"))
+
+            rel_docker_text = Path(docker_call_log).read_text(encoding="utf-8")
+            self.assertIn("exec vpsagent-caddy caddy validate", rel_docker_text)
+            self.assertIn("exec vpsagent-caddy caddy reload", rel_docker_text)
+
             self.assertEqual(
                 Path(os.path.join(vpsagent_root, "runtime-bridge.py")).read_text(encoding="utf-8"),
                 "# bridge-release-2.1.0\n",
@@ -2721,14 +2739,30 @@ sys.exit(0)
                 time.sleep(0.05)
             self.assertIn("restart --no-block vpsagent-runtime.service", sys_log)
 
-            # Re-check on release-only install (no .git dir) reports up_to_date & canUpdate=True
-            rechecked = svc.core_update_status(check_remote=True)
-            self.assertEqual(rechecked["releaseStatus"], "up_to_date")
-            self.assertFalse(rechecked["updateAvailable"])
-            self.assertTrue(rechecked["canUpdate"])
-            self.assertEqual(rechecked["installedFrom"], "release")
+            # Restarted service (even with stale VPSAGENT_REPO_DIR in env) reads active-source.json
+            from unittest import mock
 
-            # 5. CLI --check-update --json works cleanly on release-only install
+            with mock.patch.dict(os.environ, {"VPSAGENT_REPO_DIR": current_repo}):
+                restarted_svc = rb.RuntimeService(
+                    apps_root=os.path.join(vpsagent_root, "apps"),
+                    caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+                    caddy_container="vpsagent-caddy",
+                    docker_bin=docker_sh,
+                    systemctl_bin=sys_sh,
+                    vpsagent_root=vpsagent_root,
+                    repo_dir=None,
+                    release_repo="VPSAgent/vpsagent",
+                    release_api_base=f"http://127.0.0.1:{api_port}",
+                    allow_unauthenticated=True,
+                )
+                self.assertEqual(restarted_svc.repo_dir, os.path.abspath(expected_rel_dir))
+                rechecked = restarted_svc.core_update_status(check_remote=True)
+                self.assertEqual(rechecked["releaseStatus"], "up_to_date")
+                self.assertFalse(rechecked["updateAvailable"])
+                self.assertTrue(rechecked["canUpdate"])
+                self.assertEqual(rechecked["installedFrom"], "release")
+
+            # 5. CLI --check-update --json discovers active-source.json WITHOUT --repo-dir
             import contextlib
             stdout_buf = io.StringIO()
             with contextlib.redirect_stdout(stdout_buf):
@@ -2740,8 +2774,6 @@ sys.exit(0)
                         os.path.join(vpsagent_root, "caddy", "apps.d"),
                         "--vpsagent-root",
                         vpsagent_root,
-                        "--repo-dir",
-                        expected_rel_dir,
                         "--release-repo",
                         "VPSAgent/vpsagent",
                         "--release-api-base",
@@ -2752,6 +2784,7 @@ sys.exit(0)
                 )
             self.assertEqual(exit_code, 0)
             cli_payload = json.loads(stdout_buf.getvalue())
+            self.assertEqual(cli_payload["repoDir"], os.path.abspath(expected_rel_dir))
             self.assertEqual(cli_payload["currentVersion"], "2.1.0")
             self.assertEqual(cli_payload["latestReleaseTag"], "v2.1.0")
             self.assertEqual(cli_payload["releaseStatus"], "up_to_date")
@@ -2797,6 +2830,691 @@ sys.exit(0)
             api_srv.server_close()
             cdn_srv.shutdown()
             cdn_srv.server_close()
+
+    def test_release_downgrade_prevention_and_local_rebuild(self) -> None:
+        import hashlib
+        import io
+        import tarfile
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            for name, content in {
+                "vpsagent-v1.9.0/package.json": b'{"name":"vpsagent","version":"1.9.0"}',
+                "vpsagent-v1.9.0/bootstrap/Dockerfile": b"FROM node:24-alpine\n",
+                "vpsagent-v1.9.0/bootstrap/docker-compose.core.yml": b"services: {}\n",
+                "vpsagent-v1.9.0/bootstrap/Caddyfile": b"# v1.9\n",
+                "vpsagent-v1.9.0/bootstrap/runtime-bridge.py": b"# bridge v1.9\n",
+            }.items():
+                ti = tarfile.TarInfo(name=name)
+                ti.size = len(content)
+                ti.mode = 0o644
+                tf.addfile(ti, io.BytesIO(content))
+        old_tar = buf.getvalue()
+        old_sha = hashlib.sha256(old_tar).hexdigest()
+
+        download_hits: list[str] = []
+
+        class MockServer(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                if self.path.endswith("/releases/latest"):
+                    rel = {
+                        "tag_name": "v1.9.0",
+                        "name": "VPSAgent v1.9.0",
+                        "html_url": "https://github.com/VPSAgent/vpsagent/releases/tag/v1.9.0",
+                        "body": "Older stable release.",
+                        "published_at": "2026-10-01T12:00:00Z",
+                        "prerelease": False,
+                        "draft": False,
+                        "assets": [
+                            {
+                                "name": "vpsagent-v1.9.0.tar.gz",
+                                "browser_download_url": f"http://127.0.0.1:{srv_port}/dl/vpsagent-v1.9.0.tar.gz",
+                            },
+                            {
+                                "name": "SHA256SUMS",
+                                "browser_download_url": f"http://127.0.0.1:{srv_port}/dl/SHA256SUMS",
+                            },
+                        ],
+                    }
+                    raw = json.dumps(rel).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                if self.path.startswith("/dl/"):
+                    download_hits.append(self.path)
+                    body = (
+                        f"{old_sha}  vpsagent-v1.9.0.tar.gz\n".encode("utf-8")
+                        if self.path.endswith("SHA256SUMS")
+                        else old_tar
+                    )
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockServer)
+        srv_port = int(srv.server_address[1])
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        try:
+            vpsagent_root = os.path.join(self.tmp, "dg-root")
+            rel_dir = os.path.join(vpsagent_root, "releases", "v2.0.0-beta.1")
+            os.makedirs(os.path.join(vpsagent_root, "apps"), exist_ok=True)
+            os.makedirs(os.path.join(vpsagent_root, "caddy", "apps.d"), exist_ok=True)
+            os.makedirs(os.path.join(vpsagent_root, "run"), exist_ok=True)
+            os.makedirs(os.path.join(rel_dir, "bootstrap"), exist_ok=True)
+            Path(os.path.join(vpsagent_root, ".env")).write_text(
+                "VPSAGENT_RUNTIME_TOKEN=test-secret-token-value-123456\n", encoding="utf-8"
+            )
+            Path(os.path.join(vpsagent_root, "Caddyfile")).write_text("# beta1\n", encoding="utf-8")
+            Path(os.path.join(vpsagent_root, "docker-compose.yml")).write_text(
+                "services:\n  vpsagent-core:\n    image: vpsagent/core:beta1\n", encoding="utf-8"
+            )
+            Path(os.path.join(rel_dir, "package.json")).write_text(
+                json.dumps({"name": "vpsagent", "version": "2.0.0-beta.1"}), encoding="utf-8"
+            )
+            Path(os.path.join(rel_dir, ".vpsagent-release.json")).write_text(
+                json.dumps({"tag": "v2.0.0-beta.1", "version": "2.0.0-beta.1", "releaseRepo": "VPSAgent/vpsagent"}),
+                encoding="utf-8",
+            )
+            Path(os.path.join(rel_dir, "bootstrap", "Caddyfile")).write_text("# beta1\n", encoding="utf-8")
+            Path(os.path.join(rel_dir, "bootstrap", "docker-compose.core.yml")).write_text(
+                "services:\n  vpsagent-core:\n    image: vpsagent/core:beta1\n", encoding="utf-8"
+            )
+            Path(os.path.join(rel_dir, "bootstrap", "runtime-bridge.py")).write_text(
+                "# bridge beta1\n", encoding="utf-8"
+            )
+            Path(os.path.join(vpsagent_root, "runtime-bridge.py")).write_text(
+                "# bridge beta1\n", encoding="utf-8"
+            )
+
+            docker_calls = os.path.join(self.tmp, "dg-docker.log")
+            docker_py = os.path.join(self.tmp, "dg_fake_docker.py")
+            Path(docker_py).write_text(
+                f"""import os, sys
+with open({docker_calls!r}, "a", encoding="utf-8") as fh:
+    fh.write(os.environ.get("VPSAGENT_REPO_DIR", "") + "::" + " ".join(sys.argv[1:]) + "\\n")
+sys.exit(0)
+""",
+                encoding="utf-8",
+            )
+            docker_sh = os.path.join(self.tmp, "dg-fake-docker")
+            Path(docker_sh).write_text(
+                f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n', encoding="utf-8"
+            )
+            os.chmod(docker_sh, 0o755)
+
+            svc = rb.RuntimeService(
+                apps_root=os.path.join(vpsagent_root, "apps"),
+                caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+                caddy_container="vpsagent-caddy",
+                docker_bin=docker_sh,
+                vpsagent_root=vpsagent_root,
+                repo_dir=rel_dir,
+                release_repo="VPSAgent/vpsagent",
+                release_api_base=f"http://127.0.0.1:{srv_port}",
+                allow_unauthenticated=True,
+            )
+
+            status = svc.core_update_status(check_remote=True)
+            self.assertEqual(status["releaseStatus"], "up_to_date")
+            self.assertFalse(status["updateAvailable"])
+            self.assertTrue(status["canUpdate"])
+            self.assertEqual(status["checksumStatus"], "none")
+            self.assertIn("newer than", (status["releaseNote"] or "").lower())
+
+            # Explicit release apply refuses downgrade to v1.9.0
+            with self.assertRaises(rb.BridgeRequestError) as ctx:
+                svc.start_core_update({"source": "release"})
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertIn("downgrade", str(ctx.exception).lower())
+            self.assertEqual(download_hits, [])
+
+            # Rebuild action ("auto") rebuilds local v2.0.0-beta.1 without downloading v1.9.0
+            rebuild_start = svc.start_core_update({"source": "auto"})
+            self.assertTrue(rebuild_start["ok"])
+            deadline = time.monotonic() + 10.0
+            rebuild_res = rebuild_start["status"]
+            while time.monotonic() < deadline:
+                rebuild_res = svc.core_update_status(check_remote=False)
+                if rebuild_res["state"] in ("succeeded", "failed"):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(rebuild_res["state"], "succeeded", rebuild_res)
+            self.assertEqual(rebuild_res["currentReleaseTag"], "v2.0.0-beta.1")
+            self.assertEqual(rebuild_res["currentVersion"], "2.0.0-beta.1")
+            self.assertEqual(download_hits, [])
+            docker_log_text = Path(docker_calls).read_text(encoding="utf-8")
+            self.assertIn(f"{os.path.abspath(rel_dir)}::compose", docker_log_text)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_release_private_repo_api_asset_download_and_tag_version_priority(self) -> None:
+        import hashlib
+        import io
+        import tarfile
+
+        # Build release archive tagged v2.0.0-alpha.2 where package.json was still left at 2.0.0-alpha.1
+        buf = io.BytesIO()
+        prefix = "vpsagent-v2.0.0-alpha.2"
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            for name, content in {
+                f"{prefix}/package.json": b'{"name":"vpsagent","version":"2.0.0-alpha.1"}',
+                f"{prefix}/bootstrap/Dockerfile": b"FROM node:24-alpine\n",
+                f"{prefix}/bootstrap/docker-compose.core.yml": b"services: {}\n",
+                f"{prefix}/bootstrap/Caddyfile": b"# caddy a2\n",
+                f"{prefix}/bootstrap/runtime-bridge.py": b"# bridge a2\n",
+            }.items():
+                ti = tarfile.TarInfo(name=name)
+                ti.size = len(content)
+                ti.mode = 0o644
+                tf.addfile(ti, io.BytesIO(content))
+        tar_bytes = buf.getvalue()
+        tar_sha = hashlib.sha256(tar_bytes).hexdigest()
+
+        asset_accept_seen: list[str | None] = []
+        cdn_auth_seen: list[str | None] = []
+        token = "ghp_private_repo_token_9988776655"
+
+        class PrivateApiServer(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                if self.headers.get("Authorization") != f"Bearer {token}":
+                    self.send_response(401)
+                    self.end_headers()
+                    return
+                if self.path.endswith("/releases/latest"):
+                    rel = {
+                        "tag_name": "v2.0.0-alpha.2",
+                        "name": "VPSAgent v2.0.0-alpha.2",
+                        "html_url": "https://github.com/VPSAgent/private-vpsagent/releases/tag/v2.0.0-alpha.2",
+                        "body": "Private release",
+                        "published_at": "2026-11-26T12:00:00Z",
+                        "prerelease": True,
+                        "draft": False,
+                        "assets": [
+                            {
+                                "name": "vpsagent-v2.0.0-alpha.2.tar.gz",
+                                "url": f"http://127.0.0.1:{api_port}/repos/VPSAgent/private-vpsagent/releases/assets/101",
+                                "browser_download_url": f"http://127.0.0.1:{cdn_port}/blocked-browser/tar",
+                            },
+                            {
+                                "name": "SHA256SUMS",
+                                "url": f"http://127.0.0.1:{api_port}/repos/VPSAgent/private-vpsagent/releases/assets/102",
+                                "browser_download_url": f"http://127.0.0.1:{cdn_port}/blocked-browser/sums",
+                            },
+                        ],
+                    }
+                    raw = json.dumps(rel).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                if self.path.endswith("/releases/assets/101"):
+                    asset_accept_seen.append(self.headers.get("Accept"))
+                    if self.headers.get("Accept") != "application/octet-stream":
+                        self.send_response(406)
+                        self.end_headers()
+                        return
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{cdn_port}/signed/tar")
+                    self.end_headers()
+                    return
+                if self.path.endswith("/releases/assets/102"):
+                    asset_accept_seen.append(self.headers.get("Accept"))
+                    if self.headers.get("Accept") != "application/octet-stream":
+                        self.send_response(406)
+                        self.end_headers()
+                        return
+                    self.send_response(302)
+                    self.send_header("Location", f"http://127.0.0.1:{cdn_port}/signed/sums")
+                    self.end_headers()
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        class PrivateCdnServer(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                if self.path.startswith("/blocked-browser/"):
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                cdn_auth_seen.append(self.headers.get("Authorization"))
+                if self.path == "/signed/tar":
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(tar_bytes)))
+                    self.end_headers()
+                    self.wfile.write(tar_bytes)
+                    return
+                if self.path == "/signed/sums":
+                    body = f"{tar_sha}  vpsagent-v2.0.0-alpha.2.tar.gz\n".encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        api_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), PrivateApiServer)
+        cdn_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), PrivateCdnServer)
+        api_port = int(api_srv.server_address[1])
+        cdn_port = int(cdn_srv.server_address[1])
+        threading.Thread(target=api_srv.serve_forever, daemon=True).start()
+        threading.Thread(target=cdn_srv.serve_forever, daemon=True).start()
+
+        try:
+            vpsagent_root = os.path.join(self.tmp, "priv-rel-root")
+            os.makedirs(os.path.join(vpsagent_root, "apps"), exist_ok=True)
+            os.makedirs(os.path.join(vpsagent_root, "caddy", "apps.d"), exist_ok=True)
+            os.makedirs(os.path.join(vpsagent_root, "run"), exist_ok=True)
+            Path(os.path.join(vpsagent_root, ".env")).write_text(
+                "VPSAGENT_RUNTIME_TOKEN=test-secret-token-value-123456\n", encoding="utf-8"
+            )
+            Path(os.path.join(vpsagent_root, "Caddyfile")).write_text("# old\n", encoding="utf-8")
+            Path(os.path.join(vpsagent_root, "docker-compose.yml")).write_text(
+                "services:\n  vpsagent-core:\n    image: vpsagent/core:local\n", encoding="utf-8"
+            )
+
+            docker_sh = os.path.join(self.tmp, "priv-rel-docker")
+            Path(docker_sh).write_text("#!/usr/bin/env sh\nexit 0\n", encoding="utf-8")
+            os.chmod(docker_sh, 0o755)
+
+            svc = rb.RuntimeService(
+                apps_root=os.path.join(vpsagent_root, "apps"),
+                caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+                caddy_container="vpsagent-caddy",
+                docker_bin=docker_sh,
+                vpsagent_root=vpsagent_root,
+                release_repo="VPSAgent/private-vpsagent",
+                release_api_base=f"http://127.0.0.1:{api_port}",
+                release_github_token=token,
+                allow_unauthenticated=True,
+            )
+
+            started = svc.start_core_update({"source": "release"})
+            self.assertTrue(started["ok"])
+            deadline = time.monotonic() + 10.0
+            res = started["status"]
+            while time.monotonic() < deadline:
+                res = svc.core_update_status(check_remote=False)
+                if res["state"] in ("succeeded", "failed"):
+                    break
+                time.sleep(0.05)
+
+            self.assertEqual(res["state"], "succeeded", res)
+            self.assertEqual(res["checksumStatus"], "verified")
+            self.assertEqual(res["currentReleaseTag"], "v2.0.0-alpha.2")
+            self.assertEqual(res["currentVersion"], "2.0.0-alpha.2")
+            self.assertEqual(asset_accept_seen, ["application/octet-stream", "application/octet-stream"])
+            self.assertTrue(all(v is None for v in cdn_auth_seen))
+        finally:
+            api_srv.shutdown()
+            api_srv.server_close()
+            cdn_srv.shutdown()
+            cdn_srv.server_close()
+
+    def test_release_post_activation_bridge_failure_rollback_preserves_valid_source(self) -> None:
+        import builtins
+        import hashlib
+        import io
+        import tarfile
+        from unittest import mock
+
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            for name, content in {
+                "vpsagent-v2.1.0/package.json": b'{"name":"vpsagent","version":"2.1.0"}',
+                "vpsagent-v2.1.0/bootstrap/Dockerfile": b"FROM node:24-alpine\n",
+                "vpsagent-v2.1.0/bootstrap/docker-compose.core.yml": b"services: { v: 2 }\n",
+                "vpsagent-v2.1.0/bootstrap/Caddyfile": b"# caddy 2.1\n",
+                "vpsagent-v2.1.0/bootstrap/runtime-bridge.py": b"# bridge 2.1\n",
+            }.items():
+                ti = tarfile.TarInfo(name=name)
+                ti.size = len(content)
+                ti.mode = 0o644
+                tf.addfile(ti, io.BytesIO(content))
+        tar_bytes = buf.getvalue()
+        tar_sha = hashlib.sha256(tar_bytes).hexdigest()
+
+        class MockServer(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                if self.path.endswith("/releases/latest"):
+                    rel = {
+                        "tag_name": "v2.1.0",
+                        "name": "VPSAgent v2.1.0",
+                        "html_url": "https://github.com/VPSAgent/vpsagent/releases/tag/v2.1.0",
+                        "body": "v2.1.0",
+                        "published_at": "2026-11-26T12:00:00Z",
+                        "prerelease": False,
+                        "draft": False,
+                        "assets": [
+                            {
+                                "name": "vpsagent-v2.1.0.tar.gz",
+                                "browser_download_url": f"http://127.0.0.1:{srv_port}/dl/v2.1.0.tar.gz",
+                            },
+                            {
+                                "name": "SHA256SUMS",
+                                "browser_download_url": f"http://127.0.0.1:{srv_port}/dl/SHA256SUMS",
+                            },
+                        ],
+                    }
+                    raw = json.dumps(rel).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                if self.path == "/dl/v2.1.0.tar.gz":
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(tar_bytes)))
+                    self.end_headers()
+                    self.wfile.write(tar_bytes)
+                    return
+                if self.path == "/dl/SHA256SUMS":
+                    body = f"{tar_sha}  vpsagent-v2.1.0.tar.gz\n".encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), MockServer)
+        srv_port = int(srv.server_address[1])
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        try:
+            vpsagent_root = os.path.join(self.tmp, "postfail-root")
+            prev_rel_dir = os.path.join(vpsagent_root, "releases", "v2.0.0")
+            os.makedirs(os.path.join(vpsagent_root, "apps"), exist_ok=True)
+            os.makedirs(os.path.join(vpsagent_root, "caddy", "apps.d"), exist_ok=True)
+            os.makedirs(os.path.join(vpsagent_root, "run"), exist_ok=True)
+            os.makedirs(os.path.join(prev_rel_dir, "bootstrap"), exist_ok=True)
+            Path(os.path.join(vpsagent_root, ".env")).write_text(
+                "VPSAGENT_RUNTIME_TOKEN=test-secret-token-value-123456\n", encoding="utf-8"
+            )
+            Path(os.path.join(vpsagent_root, "Caddyfile")).write_text("# v2.0\n", encoding="utf-8")
+            Path(os.path.join(vpsagent_root, "docker-compose.yml")).write_text(
+                "services: { v: 1 }\n", encoding="utf-8"
+            )
+            Path(os.path.join(vpsagent_root, "runtime-bridge.py")).write_text(
+                "# bridge 2.0\n", encoding="utf-8"
+            )
+            Path(os.path.join(prev_rel_dir, "package.json")).write_text(
+                '{"name":"vpsagent","version":"2.0.0"}', encoding="utf-8"
+            )
+            Path(os.path.join(prev_rel_dir, ".vpsagent-release.json")).write_text(
+                '{"tag":"v2.0.0","version":"2.0.0"}', encoding="utf-8"
+            )
+            Path(os.path.join(prev_rel_dir, "bootstrap", "docker-compose.core.yml")).write_text(
+                "services: { v: 1 }\n", encoding="utf-8"
+            )
+            rb._write_active_source_file(vpsagent_root, prev_rel_dir, release_tag="v2.0.0")
+
+            docker_calls = os.path.join(self.tmp, "postfail-docker.log")
+            rollback_compose_fail = os.path.join(self.tmp, "postfail-rb-fail.flag")
+            docker_py = os.path.join(self.tmp, "postfail_fake_docker.py")
+            Path(docker_py).write_text(
+                f"""import os, sys
+repo = os.environ.get("VPSAGENT_REPO_DIR", "")
+with open({docker_calls!r}, "a", encoding="utf-8") as fh:
+    fh.write(repo + "::" + " ".join(sys.argv[1:]) + "\\n")
+if repo == {os.path.abspath(prev_rel_dir)!r} and os.path.exists({rollback_compose_fail!r}):
+    sys.exit(1)
+sys.exit(0)
+""",
+                encoding="utf-8",
+            )
+            docker_sh = os.path.join(self.tmp, "postfail-fake-docker")
+            Path(docker_sh).write_text(
+                f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n', encoding="utf-8"
+            )
+            os.chmod(docker_sh, 0o755)
+
+            svc = rb.RuntimeService(
+                apps_root=os.path.join(vpsagent_root, "apps"),
+                caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+                caddy_container="vpsagent-caddy",
+                docker_bin=docker_sh,
+                vpsagent_root=vpsagent_root,
+                release_repo="VPSAgent/vpsagent",
+                release_api_base=f"http://127.0.0.1:{srv_port}",
+                allow_unauthenticated=True,
+            )
+
+            target_meta = svc._fetch_latest_github_release("VPSAgent/vpsagent")
+            real_open = builtins.open
+
+            class FailBridgeWriter:
+                def __init__(self, inner: object) -> None:
+                    self._inner = inner
+
+                def __enter__(self) -> "FailBridgeWriter":
+                    return self
+
+                def __exit__(self, *args: object) -> None:
+                    self._inner.close()  # type: ignore[attr-defined]
+
+                def write(self, _data: bytes) -> int:
+                    raise OSError("ENOSPC simulated during runtime-bridge.py write")
+
+            def fail_bridge_open(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+                fh = real_open(file, mode, *args, **kwargs)  # type: ignore[call-overload]
+                if mode == "wb" and os.path.basename(str(file)).startswith("runtime-bridge.py.tmp."):
+                    return FailBridgeWriter(fh)
+                return fh
+
+            with mock.patch.object(builtins, "open", side_effect=fail_bridge_open):
+                svc._run_core_update_release_worker(target_meta)
+
+            res = svc.core_update_status(check_remote=False)
+            self.assertEqual(res["state"], "failed")
+            # Active source and Caddyfile/compose must remain cleanly pointing to prev_rel_dir
+            self.assertEqual(svc.repo_dir, os.path.abspath(prev_rel_dir))
+            self.assertTrue(os.path.isdir(svc.repo_dir))
+            self.assertFalse(os.path.exists(os.path.join(vpsagent_root, "releases", "v2.1.0")))
+            self.assertEqual(
+                json.loads(Path(os.path.join(vpsagent_root, "active-source.json")).read_text(encoding="utf-8"))["repoDir"],
+                os.path.abspath(prev_rel_dir),
+            )
+            self.assertEqual(Path(os.path.join(vpsagent_root, "Caddyfile")).read_text(encoding="utf-8"), "# v2.0\n")
+            docker_log_text = Path(docker_calls).read_text(encoding="utf-8")
+            self.assertIn(f"{os.path.abspath(prev_rel_dir)}::compose", docker_log_text)
+
+            # When rollback compose fails after activation, v2.1.0 is preserved rather than leaving a dangling path
+            Path(rollback_compose_fail).write_text("1", encoding="utf-8")
+            with mock.patch.object(builtins, "open", side_effect=fail_bridge_open):
+                svc._run_core_update_release_worker(target_meta)
+            res2 = svc.core_update_status(check_remote=False)
+            self.assertEqual(res2["state"], "failed")
+            self.assertTrue(os.path.isdir(os.path.join(vpsagent_root, "releases", "v2.1.0")))
+            self.assertTrue(os.path.isdir(svc.repo_dir))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_sync_core_configs_partial_failure_restores_caddyfile(self) -> None:
+        import builtins
+        from unittest import mock
+
+        vpsagent_root = os.path.join(self.tmp, "partial-sync-root")
+        src_dir = os.path.join(self.tmp, "partial-sync-src")
+        os.makedirs(os.path.join(vpsagent_root, "apps"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "caddy", "apps.d"), exist_ok=True)
+        os.makedirs(os.path.join(vpsagent_root, "run"), exist_ok=True)
+        os.makedirs(os.path.join(src_dir, "bootstrap"), exist_ok=True)
+
+        caddy_dst = os.path.join(vpsagent_root, "Caddyfile")
+        compose_dst = os.path.join(vpsagent_root, "docker-compose.yml")
+        Path(caddy_dst).write_text("# original v1 caddyfile\n", encoding="utf-8")
+        Path(compose_dst).write_text("services: { v: 1 }\n", encoding="utf-8")
+        Path(os.path.join(src_dir, "bootstrap", "Caddyfile")).write_text("# new v2 caddyfile\n", encoding="utf-8")
+        Path(os.path.join(src_dir, "bootstrap", "docker-compose.core.yml")).write_text(
+            "services: { v: 2 }\n", encoding="utf-8"
+        )
+
+        svc = rb.RuntimeService(
+            apps_root=os.path.join(vpsagent_root, "apps"),
+            caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+            caddy_container="vpsagent-caddy",
+            vpsagent_root=vpsagent_root,
+            allow_unauthenticated=True,
+        )
+
+        real_open = builtins.open
+        fail_once = {"triggered": False}
+
+        class FailWriter:
+            def __init__(self, inner: object) -> None:
+                self._inner = inner
+
+            def __enter__(self) -> "FailWriter":
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                self._inner.close()  # type: ignore[attr-defined]
+
+            def write(self, _data: bytes) -> int:
+                raise OSError("simulated compose write error")
+
+        def fail_compose_open(file: object, mode: str = "r", *args: object, **kwargs: object) -> object:
+            fh = real_open(file, mode, *args, **kwargs)  # type: ignore[call-overload]
+            if (
+                not fail_once["triggered"]
+                and mode == "wb"
+                and os.path.abspath(str(file)) == os.path.abspath(compose_dst)
+            ):
+                fail_once["triggered"] = True
+                return FailWriter(fh)
+            return fh
+
+        with mock.patch.object(builtins, "open", side_effect=fail_compose_open):
+            with self.assertRaises(OSError):
+                svc._sync_core_configs(src_dir)
+
+        self.assertTrue(fail_once["triggered"])
+        self.assertEqual(Path(caddy_dst).read_text(encoding="utf-8"), "# original v1 caddyfile\n")
+        self.assertEqual(Path(compose_dst).read_text(encoding="utf-8"), "services: { v: 1 }\n")
+
+    def test_release_check_skips_git_fetch_when_newer_release_found(self) -> None:
+        import subprocess
+        from unittest import mock
+
+        class ReleaseOnlyServer(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                if self.path.endswith("/releases/latest"):
+                    rel = {
+                        "tag_name": "v9.9.9",
+                        "name": "VPSAgent v9.9.9",
+                        "html_url": "https://github.com/VPSAgent/vpsagent/releases/tag/v9.9.9",
+                        "body": "Major update",
+                        "published_at": "2026-11-26T12:00:00Z",
+                        "prerelease": False,
+                        "draft": False,
+                        "assets": [
+                            {
+                                "name": "vpsagent-v9.9.9.tar.gz",
+                                "browser_download_url": "https://github.com/VPSAgent/vpsagent/releases/download/v9.9.9/vpsagent-v9.9.9.tar.gz",
+                            }
+                        ],
+                    }
+                    raw = json.dumps(rel).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ReleaseOnlyServer)
+        srv_port = int(srv.server_address[1])
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+        try:
+            vpsagent_root = os.path.join(self.tmp, "skipfetch-root")
+            repo_dir = os.path.join(self.tmp, "skipfetch-repo")
+            os.makedirs(os.path.join(vpsagent_root, "apps"), exist_ok=True)
+            os.makedirs(os.path.join(vpsagent_root, "caddy", "apps.d"), exist_ok=True)
+            os.makedirs(os.path.join(vpsagent_root, "run"), exist_ok=True)
+            os.makedirs(repo_dir, exist_ok=True)
+            Path(os.path.join(vpsagent_root, ".env")).write_text(
+                "VPSAGENT_RUNTIME_TOKEN=test-secret-token-value-123456\n", encoding="utf-8"
+            )
+            git_env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "Test",
+                "GIT_AUTHOR_EMAIL": "test@example.com",
+                "GIT_COMMITTER_NAME": "Test",
+                "GIT_COMMITTER_EMAIL": "test@example.com",
+            }
+            subprocess.run(["git", "-C", repo_dir, "init", "-b", "main"], check=True, env=git_env)
+            Path(os.path.join(repo_dir, "package.json")).write_text(
+                '{"name":"vpsagent","version":"2.0.0-alpha.1"}', encoding="utf-8"
+            )
+            subprocess.run(["git", "-C", repo_dir, "add", "package.json"], check=True, env=git_env)
+            subprocess.run(["git", "-C", repo_dir, "commit", "-m", "init"], check=True, env=git_env)
+            subprocess.run(
+                ["git", "-C", repo_dir, "remote", "add", "origin", "https://github.com/VPSAgent/vpsagent.git"],
+                check=True,
+                env=git_env,
+            )
+
+            svc = rb.RuntimeService(
+                apps_root=os.path.join(vpsagent_root, "apps"),
+                caddy_apps_dir=os.path.join(vpsagent_root, "caddy", "apps.d"),
+                caddy_container="vpsagent-caddy",
+                vpsagent_root=vpsagent_root,
+                repo_dir=repo_dir,
+                release_repo="VPSAgent/vpsagent",
+                release_api_base=f"http://127.0.0.1:{srv_port}",
+                allow_unauthenticated=True,
+            )
+
+            seen_git_cmds: list[list[str]] = []
+            orig_run_git = svc._run_repo_git
+
+            def spy_git(rdir: str, args: list[str], *, timeout: float = 30) -> subprocess.CompletedProcess[str]:
+                seen_git_cmds.append(list(args))
+                return orig_run_git(rdir, args, timeout=timeout)
+
+            with mock.patch.object(svc, "_run_repo_git", side_effect=spy_git):
+                res = svc.core_update_status(check_remote=True)
+
+            self.assertEqual(res["updateSource"], "release")
+            self.assertEqual(res["latestReleaseTag"], "v9.9.9")
+            self.assertTrue(res["updateAvailable"])
+            self.assertFalse(any(cmd and cmd[0] == "fetch" for cmd in seen_git_cmds), seen_git_cmds)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

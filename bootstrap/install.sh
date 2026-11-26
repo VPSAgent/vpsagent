@@ -266,6 +266,30 @@ EOF
   cp "${SCRIPT_DIR}/caddy/apps.d/00-default.caddy" "${VPSAGENT_ROOT}/caddy/apps.d/00-default.caddy"
   write_core_caddy_route
   install -m 0750 "${SCRIPT_DIR}/runtime-bridge.py" "${VPSAGENT_ROOT}/runtime-bridge.py"
+  ACTIVE_SOURCE_ROOT="${VPSAGENT_ROOT}" ACTIVE_SOURCE_REPO="${REPO_ROOT}" python3 - <<'PY'
+import datetime
+import json
+import os
+
+root = os.environ["ACTIVE_SOURCE_ROOT"]
+repo = os.path.abspath(os.environ["ACTIVE_SOURCE_REPO"])
+path = os.path.join(root, "active-source.json")
+if os.path.islink(path):
+    raise SystemExit(f"Refusing to overwrite symlink {path}")
+tmp_path = os.path.join(root, f".active-source.json.tmp.{os.getpid()}")
+with open(tmp_path, "w", encoding="utf-8") as fh:
+    json.dump(
+        {
+            "repoDir": repo,
+            "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        },
+        fh,
+        indent=2,
+    )
+    fh.write("\n")
+os.chmod(tmp_path, 0o644)
+os.replace(tmp_path, path)
+PY
 }
 
 configure_runtime_bridge_service() {
