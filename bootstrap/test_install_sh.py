@@ -3,11 +3,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -133,13 +135,76 @@ start_core_stack
         for key, expected_val in original_secrets.items():
             self.assertEqual(parsed[key], expected_val)
 
-        # 2. Installed runtime-bridge.py must be updated to the new checkout revision
+        # 2. Installed runtime-bridge.py & active-source.json must point to home_checkout cleanly
         installed_bridge = (vpsagent_root / "runtime-bridge.py").read_text(
             encoding="utf-8"
         )
         self.assertIn(marker, installed_bridge)
+        active_source_path = vpsagent_root / "active-source.json"
+        self.assertTrue(active_source_path.is_file())
+        self.assertEqual(stat.S_IMODE(os.stat(active_source_path).st_mode), 0o644)
+        active_source = json.loads(active_source_path.read_text(encoding="utf-8"))
+        self.assertEqual(active_source["repoDir"], str(home_checkout))
 
-        # 3. docker compose up -d --build must explicitly receive the new checkout path
+        # 3. CLI --check-update --json (with VPSAGENT_REPO_DIR unset & no --repo-dir) discovers home_checkout
+        remote_dir = Path(self.tmp) / "bare-remote.git"
+        git_env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "Test",
+            "GIT_AUTHOR_EMAIL": "test@example.com",
+            "GIT_COMMITTER_NAME": "Test",
+            "GIT_COMMITTER_EMAIL": "test@example.com",
+        }
+        subprocess.run(["git", "init", "--bare", str(remote_dir)], check=True, env=git_env)
+        subprocess.run(["git", "-C", str(home_checkout), "init", "-b", "main"], check=True, env=git_env)
+        (home_checkout / "package.json").write_text(
+            '{"name":"vpsagent","version":"2.0.0-alpha.1"}', encoding="utf-8"
+        )
+        subprocess.run(["git", "-C", str(home_checkout), "add", "."], check=True, env=git_env)
+        subprocess.run(["git", "-C", str(home_checkout), "commit", "-m", "init"], check=True, env=git_env)
+        subprocess.run(
+            ["git", "-C", str(home_checkout), "remote", "add", "origin", str(remote_dir)],
+            check=True,
+            env=git_env,
+        )
+        subprocess.run(
+            ["git", "-C", str(home_checkout), "push", "-u", "origin", "main"],
+            check=True,
+            env=git_env,
+        )
+        cli_env = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("VPSAGENT_REPO_DIR", "VPSAGENT_RELEASE_REPO")
+        }
+        cli_proc = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "bootstrap" / "runtime-bridge.py"),
+                "--apps-root",
+                str(vpsagent_root / "apps"),
+                "--caddy-apps-dir",
+                str(vpsagent_root / "caddy" / "apps.d"),
+                "--vpsagent-root",
+                str(vpsagent_root),
+                "--check-update",
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            env=cli_env,
+            check=False,
+        )
+        self.assertEqual(
+            cli_proc.returncode,
+            0,
+            msg=f"CLI --check-update failed: stdout={cli_proc.stdout} stderr={cli_proc.stderr}",
+        )
+        cli_payload = json.loads(cli_proc.stdout)
+        self.assertEqual(cli_payload["repoDir"], str(home_checkout))
+        self.assertEqual(cli_payload["currentVersion"], "2.0.0-alpha.1")
+
+        # 4. docker compose up -d --build must explicitly receive the new checkout path
         docker_call = docker_log.read_text(encoding="utf-8")
         self.assertIn(f"VPSAGENT_REPO_DIR={home_checkout}\n", docker_call)
         self.assertIn("up -d --build", docker_call)

@@ -36,9 +36,55 @@ interface KeysSettingsTabProps {
   snippets: McpSnippets | null;
   setup: SetupState;
   publicIp: string | null;
-  focusSection?: "github" | null;
+  focusSection?: "github" | "updates" | null;
   onConsumeFocusSection?: () => void;
+  initialUpdateStatus?: SystemUpdateStatus | null;
+  onUpdateStatusChange?: (status: SystemUpdateStatus) => void;
   onRefresh: () => Promise<void>;
+}
+
+const RELEASE_UPDATE_STEPS = [
+  { key: "downloading", label: "Download release" },
+  { key: "verifying", label: "Verify SHA-256" },
+  { key: "building", label: "Rebuild VPSAgent" },
+  { key: "restarting", label: "Restart & reconnect" },
+] as const;
+
+const GIT_UPDATE_STEPS = [
+  { key: "fetching", label: "Download code" },
+  { key: "syncing", label: "Update config" },
+  { key: "building", label: "Rebuild VPSAgent" },
+  { key: "restarting", label: "Restart & reconnect" },
+] as const;
+
+function getUpdateStepIndex(
+  phase: string | null,
+  reconnecting: boolean,
+  isRelease: boolean,
+): number {
+  if (reconnecting || phase === "restarting" || phase === "completed") {
+    return 3;
+  }
+  if (isRelease) {
+    if (phase === "building") return 2;
+    if (phase === "verifying" || phase === "extracting" || phase === "syncing") {
+      return 1;
+    }
+    return 0;
+  }
+  if (phase === "building") return 2;
+  if (phase === "syncing") return 1;
+  return 0;
+}
+
+function isSafeHttpsUrl(raw: string | null | undefined): raw is string {
+  if (!raw) return false;
+  try {
+    const u = new URL(raw);
+    return u.protocol === "https:";
+  } catch {
+    return false;
+  }
 }
 
 const SCOPE_LABELS: Record<
@@ -86,6 +132,8 @@ export function KeysSettingsTab({
   publicIp,
   focusSection,
   onConsumeFocusSection,
+  initialUpdateStatus = null,
+  onUpdateStatusChange,
   onRefresh,
 }: KeysSettingsTabProps) {
   const [name, setName] = useState("");
@@ -114,24 +162,43 @@ export function KeysSettingsTab({
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<SystemUpdateStatus | null>(
-    null,
+    initialUpdateStatus,
   );
-  const [updateLoading, setUpdateLoading] = useState(true);
+  const [updateLoading, setUpdateLoading] = useState(!initialUpdateStatus);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [startingUpdate, setStartingUpdate] = useState(false);
   const [reconnectingUpdate, setReconnectingUpdate] = useState(false);
   const [updateLoadError, setUpdateLoadError] = useState<string | null>(null);
   const [showUpdateLogs, setShowUpdateLogs] = useState(false);
+  const baselineBuildRef = useRef<{
+    version: string | null;
+    commit: string | null;
+  } | null>(null);
 
   const githubSectionRef = useRef<HTMLElement | null>(null);
+  const updatesSectionRef = useRef<HTMLElement | null>(null);
   const [githubToken, setGithubToken] = useState("");
   const [githubLabel, setGithubLabel] = useState("");
   const [githubBusy, setGithubBusy] = useState(false);
   const [testingCredId, setTestingCredId] = useState<string | null>(null);
 
+  const applyLocalUpdateStatus = useCallback(
+    (next: SystemUpdateStatus) => {
+      setUpdateStatus(next);
+      onUpdateStatusChange?.(next);
+    },
+    [onUpdateStatusChange],
+  );
+
   useEffect(() => {
     if (focusSection === "github") {
       githubSectionRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+      onConsumeFocusSection?.();
+    } else if (focusSection === "updates") {
+      updatesSectionRef.current?.scrollIntoView({
         behavior: "smooth",
         block: "start",
       });
@@ -142,7 +209,7 @@ export function KeysSettingsTab({
   const loadUpdateStatus = useCallback(async () => {
     try {
       const res = await api.getSystemUpdateStatus();
-      setUpdateStatus(res.status);
+      applyLocalUpdateStatus(res.status);
       setReconnectingUpdate(false);
       setUpdateLoadError(null);
     } catch (err) {
@@ -155,7 +222,7 @@ export function KeysSettingsTab({
     } finally {
       setUpdateLoading(false);
     }
-  }, []);
+  }, [applyLocalUpdateStatus]);
 
   useEffect(() => {
     void loadUpdateStatus();
@@ -166,13 +233,33 @@ export function KeysSettingsTab({
       return;
     }
     let cancelled = false;
+    let sawDrop = false;
+    let inFlight = false;
+    const baseline = baselineBuildRef.current ?? {
+      version: updateStatus.currentVersion,
+      commit: updateStatus.currentCommit,
+    };
+    baselineBuildRef.current = baseline;
+
     const timer = window.setInterval(async () => {
+      if (inFlight || cancelled) return;
+      inFlight = true;
       try {
         const res = await api.getSystemUpdateStatus();
         if (cancelled) return;
         setReconnectingUpdate(false);
-        setUpdateStatus(res.status);
-        if (res.status.state === "succeeded") {
+        applyLocalUpdateStatus(res.status);
+        const versionOrCommitChanged =
+          (res.status.currentVersion &&
+            res.status.currentVersion !== baseline.version) ||
+          (res.status.currentCommit &&
+            res.status.currentCommit !== baseline.commit);
+        if (
+          res.status.state === "succeeded" ||
+          (sawDrop &&
+            res.status.state === "idle" &&
+            Boolean(versionOrCommitChanged))
+        ) {
           setNotice(
             res.status.message ||
               "VPSAgent updated! Reloading the dashboard...",
@@ -185,15 +272,23 @@ export function KeysSettingsTab({
         }
       } catch {
         if (!cancelled) {
+          sawDrop = true;
           setReconnectingUpdate(true);
         }
+      } finally {
+        inFlight = false;
       }
     }, 2500);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [updateStatus?.state]);
+  }, [
+    updateStatus?.state,
+    updateStatus?.currentVersion,
+    updateStatus?.currentCommit,
+    applyLocalUpdateStatus,
+  ]);
 
   const handleCheckUpdates = async () => {
     setCheckingUpdate(true);
@@ -201,14 +296,14 @@ export function KeysSettingsTab({
     setNotice(null);
     try {
       const res = await api.checkSystemUpdate();
-      setUpdateStatus(res.status);
+      applyLocalUpdateStatus(res.status);
       if (res.status.updateAvailable) {
         setNotice(
           res.status.message ||
             "A new version of VPSAgent is ready to install.",
         );
       } else if (res.status.canUpdate) {
-        setNotice("VPSAgent is already up to date.");
+        setNotice(res.status.message || "VPSAgent is already up to date.");
       }
     } catch (err) {
       setError(
@@ -224,9 +319,19 @@ export function KeysSettingsTab({
     setError(null);
     setNotice(null);
     setShowUpdateLogs(true);
+    baselineBuildRef.current = {
+      version: updateStatus?.currentVersion ?? null,
+      commit: updateStatus?.currentCommit ?? null,
+    };
     try {
-      const res = await api.applySystemUpdate();
-      setUpdateStatus(res.status);
+      const source =
+        updateStatus?.updateAvailable &&
+        (updateStatus?.updateSource === "release" ||
+          updateStatus?.updateSource === "git")
+          ? updateStatus.updateSource
+          : "auto";
+      const res = await api.applySystemUpdate(source);
+      applyLocalUpdateStatus(res.status);
       setNotice(
         "Update started. VPSAgent will rebuild and restart automatically in 1–2 minutes.",
       );
@@ -1134,186 +1239,407 @@ export function KeysSettingsTab({
       </section>
 
       {/* VPSAgent Updates */}
-      <section className="surface-panel rounded-xl p-6 space-y-5">
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div className="space-y-1">
-            <div className="flex flex-wrap items-center gap-2.5">
-              <ArrowDownToLine className="h-4 w-4 text-emerald-400" />
-              <h2 className="text-sm font-semibold text-white">
-                VPSAgent updates
-              </h2>
-              {updateStatus?.state === "updating" && (
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300">
-                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
-                  {reconnectingUpdate ? "Restarting..." : "Updating..."}
-                </span>
-              )}
-              {updateStatus?.state !== "updating" &&
-                updateStatus?.updateAvailable && (
-                  <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
-                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-                    {updateStatus.commitsBehind} new{" "}
-                    {updateStatus.commitsBehind === 1 ? "update" : "updates"}
+      <section
+        id="vpsagent-updates"
+        ref={updatesSectionRef}
+        className="surface-panel rounded-xl p-6 space-y-5"
+      >
+        {(() => {
+          const isUpdating = updateStatus?.state === "updating";
+          const isReleaseUpdate = updateStatus?.updateSource === "release";
+          const updateSteps = isReleaseUpdate
+            ? RELEASE_UPDATE_STEPS
+            : GIT_UPDATE_STEPS;
+          const activeStepIdx = getUpdateStepIndex(
+            updateStatus?.phase ?? null,
+            reconnectingUpdate,
+            isReleaseUpdate,
+          );
+          const safeReleaseUrl = isSafeHttpsUrl(updateStatus?.latestReleaseUrl)
+            ? updateStatus.latestReleaseUrl
+            : null;
+          const installedVersionLabel = updateStatus?.currentVersion
+            ? `v${updateStatus.currentVersion.replace(/^v/i, "")}`
+            : updateStatus?.currentReleaseTag || "Unknown";
+          const latestReleaseLabel = updateStatus?.latestVersion
+            ? `v${updateStatus.latestVersion.replace(/^v/i, "")}`
+            : updateStatus?.latestReleaseTag || null;
+          const updateButtonLabel = isUpdating
+            ? "Updating..."
+            : startingUpdate
+              ? "Starting..."
+              : updateStatus?.updateAvailable &&
+                  isReleaseUpdate &&
+                  updateStatus.latestReleaseTag
+                ? `Update to ${updateStatus.latestReleaseTag}`
+                : updateStatus?.updateAvailable
+                  ? "Install update"
+                  : updateStatus?.checkedAt && !updateStatus.updateAvailable
+                    ? "Rebuild VPSAgent"
+                    : "Update VPSAgent";
+          const isSecondaryRebuild = Boolean(
+            updateStatus?.canUpdate &&
+              updateStatus.checkedAt &&
+              !updateStatus.updateAvailable &&
+              !isUpdating,
+          );
+
+          return (
+            <>
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2.5">
+                    <ArrowDownToLine className="h-4 w-4 text-emerald-400" />
+                    <h2 className="text-sm font-semibold text-white">
+                      VPSAgent updates
+                    </h2>
+                    {isUpdating && (
+                      <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300">
+                        <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                        {reconnectingUpdate ? "Restarting..." : "Updating..."}
+                      </span>
+                    )}
+                    {!isUpdating && updateStatus?.updateAvailable && (
+                      <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                        {isReleaseUpdate && updateStatus.latestReleaseTag
+                          ? `${updateStatus.latestReleaseTag} ready`
+                          : `${updateStatus.commitsBehind} new ${
+                              updateStatus.commitsBehind === 1
+                                ? "update"
+                                : "updates"
+                            }`}
+                      </span>
+                    )}
+                    {!isUpdating &&
+                      updateStatus?.state !== "failed" &&
+                      updateStatus?.checkedAt &&
+                      !updateStatus.updateAvailable &&
+                      updateStatus.canUpdate && (
+                        <span className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.1] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-[#D1D5DB]">
+                          Up to date
+                        </span>
+                      )}
+                    {updateStatus?.checksumStatus === "verified" && (
+                      <span className="inline-flex items-center gap-1 rounded-full border border-emerald-500/30 bg-emerald-500/[0.08] px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                        <Check className="h-3 w-3" />
+                        SHA-256 verified
+                      </span>
+                    )}
+                    {updateStatus?.checksumStatus !== "verified" &&
+                      updateStatus?.checksumAvailable && (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-sky-500/30 bg-sky-500/[0.08] px-2.5 py-0.5 text-[11px] font-medium text-sky-300">
+                          SHA-256 check included
+                        </span>
+                      )}
+                    {updateStatus?.updateSource === "git" &&
+                      (updateStatus.releaseStatus === "no_releases" ||
+                        updateStatus.releaseStatus === "unavailable") && (
+                        <span className="inline-flex items-center rounded-full border border-white/[0.1] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-[#9CA3AF]">
+                          Branch fallback
+                        </span>
+                      )}
+                  </div>
+                  <p className="text-xs text-[#9CA3AF]">
+                    Checks GitHub Releases (or your linked branch if no release
+                    is published yet) and safely updates VPSAgent without
+                    touching your apps, secrets, or database.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={
+                      updateLoading ||
+                      checkingUpdate ||
+                      startingUpdate ||
+                      isUpdating
+                    }
+                    onClick={handleCheckUpdates}
+                    className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0C0E12] px-3 py-2 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] disabled:opacity-50 cursor-pointer"
+                  >
+                    <RefreshCw
+                      className={`h-3.5 w-3.5 ${checkingUpdate ? "animate-spin" : ""}`}
+                    />
+                    {checkingUpdate ? "Checking..." : "Check for updates"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={
+                      updateLoading ||
+                      startingUpdate ||
+                      checkingUpdate ||
+                      !updateStatus?.canUpdate ||
+                      isUpdating
+                    }
+                    onClick={handleApplyUpdate}
+                    className={
+                      isSecondaryRebuild
+                        ? "btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.12] bg-[#111317] px-3.5 py-2 text-xs font-medium text-[#F4F5F7] hover:bg-[#181B22] disabled:opacity-50 cursor-pointer"
+                        : "btn-press inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+                    }
+                  >
+                    <ArrowDownToLine className="h-4 w-4" />
+                    {updateButtonLabel}
+                  </button>
+                </div>
+              </div>
+
+              <div className="surface-well rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+                <div className="flex flex-wrap items-center gap-x-5 gap-y-1.5 text-[#9CA3AF]">
+                  <span>
+                    Installed:{" "}
+                    <code className="font-mono text-[#F4F5F7]">
+                      {installedVersionLabel}
+                    </code>
+                    {updateStatus?.currentCommit && (
+                      <code className="ml-1.5 font-mono text-[#6B7280]">
+                        ({updateStatus.currentCommit.slice(0, 7)})
+                      </code>
+                    )}
+                    {updateStatus?.installedFrom === "release" && (
+                      <span className="ml-1.5 text-[11px] text-emerald-400">
+                        release
+                      </span>
+                    )}
+                  </span>
+
+                  <span>
+                    Latest available:{" "}
+                    {latestReleaseLabel ? (
+                      <>
+                        <code
+                          className={`font-mono ${
+                            updateStatus?.updateAvailable && isReleaseUpdate
+                              ? "text-emerald-300 font-semibold"
+                              : "text-[#F4F5F7]"
+                          }`}
+                        >
+                          {latestReleaseLabel}
+                        </code>
+                        {updateStatus?.latestReleasePrerelease && (
+                          <span className="ml-1.5 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-300">
+                            Pre-release
+                          </span>
+                        )}
+                        {safeReleaseUrl && (
+                          <a
+                            href={safeReleaseUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="ml-2 inline-flex items-center gap-1 text-[11px] text-sky-300 hover:text-sky-200"
+                          >
+                            <span>View release</span>
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        )}
+                      </>
+                    ) : updateStatus?.releaseStatus === "no_releases" ? (
+                      <span className="text-[#D1D5DB]">
+                        No GitHub release yet{" "}
+                        {updateStatus.branch
+                          ? `(tracking ${updateStatus.branch})`
+                          : ""}
+                      </span>
+                    ) : updateStatus?.releaseStatus === "unavailable" ? (
+                      <span className="text-amber-300">
+                        Release check unavailable{" "}
+                        {updateStatus.branch
+                          ? `(tracking ${updateStatus.branch})`
+                          : ""}
+                      </span>
+                    ) : updateStatus?.updateSource === "git" &&
+                      updateStatus.updateAvailable &&
+                      updateStatus.latestCommit ? (
+                      <code className="font-mono text-emerald-300">
+                        {updateStatus.commitsBehind} commit
+                        {updateStatus.commitsBehind === 1 ? "" : "s"} ahead (
+                        {updateStatus.latestCommit.slice(0, 7)})
+                      </code>
+                    ) : (
+                      <span className="text-[#6B7280]">
+                        Click &ldquo;Check for updates&rdquo;
+                      </span>
+                    )}
+                  </span>
+
+                  {updateStatus?.branch && (
+                    <span>
+                      Branch:{" "}
+                      <code className="font-mono text-[#F4F5F7]">
+                        {updateStatus.branch}
+                      </code>
+                    </span>
+                  )}
+                </div>
+                {updateStatus?.checkedAt && (
+                  <span className="text-[11px] text-[#6B7280] tabular-nums">
+                    Last checked{" "}
+                    {new Date(updateStatus.checkedAt).toLocaleString()}
                   </span>
                 )}
-              {updateStatus?.state !== "updating" &&
-                updateStatus?.state !== "failed" &&
-                updateStatus?.checkedAt &&
-                !updateStatus.updateAvailable &&
-                updateStatus.canUpdate && (
-                  <span className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.1] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-[#D1D5DB]">
-                    Up to date
-                  </span>
+              </div>
+
+              {!isUpdating &&
+                updateStatus?.updateAvailable &&
+                isReleaseUpdate && (
+                  <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/[0.06] px-4 py-3 text-xs text-emerald-100 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="font-semibold text-emerald-300">
+                          {updateStatus.latestReleaseName ||
+                            updateStatus.latestReleaseTag ||
+                            "New release available"}
+                        </span>
+                        {updateStatus.latestReleasePublishedAt && (
+                          <span className="ml-2 text-[11px] text-emerald-200/75">
+                            Published{" "}
+                            {new Date(
+                              updateStatus.latestReleasePublishedAt,
+                            ).toLocaleDateString()}
+                          </span>
+                        )}
+                      </div>
+                      {safeReleaseUrl && (
+                        <a
+                          href={safeReleaseUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-300 hover:text-emerald-200"
+                        >
+                          <span>Release notes on GitHub</span>
+                          <ExternalLink className="h-3 w-3" />
+                        </a>
+                      )}
+                    </div>
+                    {updateStatus.latestReleaseNotes && (
+                      <p className="whitespace-pre-line text-[11px] text-[#D1D5DB] leading-relaxed max-h-28 overflow-y-auto">
+                        {updateStatus.latestReleaseNotes}
+                      </p>
+                    )}
+                    <p className="text-[11px] text-emerald-200/80">
+                      {updateStatus.checksumAvailable
+                        ? "Includes a SHA-256 checksum that VPSAgent verifies automatically before rebuilding."
+                        : "Downloads directly from GitHub Releases without touching your apps, secrets, or database."}
+                    </p>
+                  </div>
                 )}
-            </div>
-            <p className="text-xs text-[#9CA3AF]">
-              Pull the latest VPSAgent version and rebuild the dashboard
-              automatically without touching your running apps or secrets.
-            </p>
-          </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              disabled={
-                updateLoading ||
-                checkingUpdate ||
-                startingUpdate ||
-                updateStatus?.state === "updating"
-              }
-              onClick={handleCheckUpdates}
-              className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0C0E12] px-3 py-2 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] disabled:opacity-50 cursor-pointer"
-            >
-              <RefreshCw
-                className={`h-3.5 w-3.5 ${checkingUpdate ? "animate-spin" : ""}`}
-              />
-              {checkingUpdate ? "Checking..." : "Check for updates"}
-            </button>
-            <button
-              type="button"
-              disabled={
-                updateLoading ||
-                startingUpdate ||
-                checkingUpdate ||
-                !updateStatus?.canUpdate ||
-                updateStatus.state === "updating"
-              }
-              onClick={handleApplyUpdate}
-              className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
-            >
-              <ArrowDownToLine className="h-4 w-4" />
-              {updateStatus?.state === "updating"
-                ? "Updating..."
-                : startingUpdate
-                  ? "Starting..."
-                  : "Update VPSAgent"}
-            </button>
-          </div>
-        </div>
+              {!isUpdating &&
+                updateStatus?.updateAvailable &&
+                !isReleaseUpdate &&
+                updateStatus.latestCommitSubject && (
+                  <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/[0.06] px-4 py-3 text-xs text-emerald-200">
+                    <span className="font-semibold">Latest change: </span>
+                    {updateStatus.latestCommitSubject}
+                    {updateStatus.latestCommit && (
+                      <code className="ml-2 font-mono text-emerald-300/80">
+                        ({updateStatus.latestCommit.slice(0, 7)})
+                      </code>
+                    )}
+                  </div>
+                )}
 
-        <div className="surface-well rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[#9CA3AF]">
-            <span>
-              Version:{" "}
-              <code className="font-mono text-[#F4F5F7]">
-                {updateStatus?.currentVersion
-                  ? `v${updateStatus.currentVersion}`
-                  : "Unknown"}
-              </code>
-            </span>
-            {updateStatus?.currentCommit && (
-              <span>
-                Build:{" "}
-                <code className="font-mono text-[#F4F5F7]">
-                  {updateStatus.currentCommit.slice(0, 7)}
-                </code>
-              </span>
-            )}
-            {updateStatus?.branch && (
-              <span>
-                Branch:{" "}
-                <code className="font-mono text-[#F4F5F7]">
-                  {updateStatus.branch}
-                </code>
-              </span>
-            )}
-          </div>
-          {updateStatus?.checkedAt && (
-            <span className="text-[11px] text-[#6B7280] tabular-nums">
-              Last checked {new Date(updateStatus.checkedAt).toLocaleString()}
-            </span>
-          )}
-        </div>
-
-        {updateStatus?.latestCommitSubject && updateStatus.updateAvailable && (
-          <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/[0.06] px-4 py-3 text-xs text-emerald-200">
-            <span className="font-semibold">Latest change: </span>
-            {updateStatus.latestCommitSubject}
-            {updateStatus.latestCommit && (
-              <code className="ml-2 font-mono text-emerald-300/80">
-                ({updateStatus.latestCommit.slice(0, 7)})
-              </code>
-            )}
-          </div>
-        )}
-
-        {updateStatus?.state === "updating" && (
-          <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
-            <span className="font-semibold">
-              {reconnectingUpdate
-                ? "Restarting VPSAgent: "
-                : "Update in progress: "}
-            </span>
-            {reconnectingUpdate
-              ? "Reconnecting to your server automatically. This page will refresh as soon as it is back."
-              : updateStatus.message ||
-                "Downloading and rebuilding VPSAgent..."}
-          </div>
-        )}
-
-        {updateStatus?.state === "failed" && updateStatus.error && (
-          <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
-            <span className="font-semibold">Last update failed: </span>
-            {updateStatus.error}
-          </div>
-        )}
-
-        {!updateLoading &&
-          updateStatus &&
-          !updateStatus.canUpdate &&
-          updateStatus.unavailableReason && (
-            <p className="text-xs text-[#9CA3AF]">
-              {updateStatus.unavailableReason}
-            </p>
-          )}
-
-        {!updateLoading && !updateStatus && updateLoadError && (
-          <p className="text-xs text-amber-300">
-            Could not check update availability: {updateLoadError}
-          </p>
-        )}
-
-        {updateStatus && updateStatus.logs.length > 0 && (
-          <div className="space-y-2">
-            <button
-              type="button"
-              onClick={() => setShowUpdateLogs((prev) => !prev)}
-              className="inline-flex items-center gap-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
-            >
-              {showUpdateLogs ? (
-                <ChevronUp className="h-3.5 w-3.5" />
-              ) : (
-                <ChevronDown className="h-3.5 w-3.5" />
+              {!isUpdating && updateStatus?.releaseNote && (
+                <p className="text-xs text-[#9CA3AF]">
+                  {updateStatus.releaseNote}
+                </p>
               )}
-              {showUpdateLogs ? "Hide update log" : "View update log"}
-            </button>
-            {showUpdateLogs && (
-              <pre className="surface-well max-h-56 overflow-auto rounded-lg p-3 text-[11px] font-mono text-[#D1D5DB] leading-relaxed">
-                {updateStatus.logs.join("\n")}
-              </pre>
-            )}
-          </div>
-        )}
+
+              {isUpdating && (
+                <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3.5 text-xs text-amber-200 space-y-3">
+                  <div>
+                    <span className="font-semibold">
+                      {reconnectingUpdate
+                        ? "Restarting VPSAgent: "
+                        : "Update in progress: "}
+                    </span>
+                    {reconnectingUpdate
+                      ? "Reconnecting to your server automatically. This page will reload as soon as it is back."
+                      : updateStatus?.message ||
+                        "Downloading and rebuilding VPSAgent..."}
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    {updateSteps.map((step, idx) => {
+                      const done = idx < activeStepIdx;
+                      const current = idx === activeStepIdx;
+                      return (
+                        <div
+                          key={step.key}
+                          className={`rounded-md border px-2.5 py-1.5 text-[11px] flex items-center gap-1.5 ${
+                            done
+                              ? "border-emerald-500/35 bg-emerald-500/15 text-emerald-200"
+                              : current
+                                ? "border-amber-400/45 bg-amber-400/15 text-amber-100 font-medium"
+                                : "border-white/[0.08] bg-black/20 text-[#9CA3AF]"
+                          }`}
+                        >
+                          {done ? (
+                            <Check className="h-3 w-3 text-emerald-400 shrink-0" />
+                          ) : current ? (
+                            <Loader2 className="h-3 w-3 text-amber-300 animate-spin shrink-0" />
+                          ) : (
+                            <span className="h-1.5 w-1.5 rounded-full bg-white/25 shrink-0" />
+                          )}
+                          <span className="truncate">{step.label}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className="text-[11px] text-amber-100/80">
+                    Your apps, secrets, database, and login stay untouched while
+                    VPSAgent restarts.
+                  </p>
+                </div>
+              )}
+
+              {updateStatus?.state === "failed" && updateStatus.error && (
+                <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-4 py-3 text-xs text-rose-200">
+                  <span className="font-semibold">Last update failed: </span>
+                  {updateStatus.error}
+                </div>
+              )}
+
+              {!updateLoading &&
+                updateStatus &&
+                !updateStatus.canUpdate &&
+                updateStatus.unavailableReason && (
+                  <p className="text-xs text-[#9CA3AF]">
+                    {updateStatus.unavailableReason}
+                  </p>
+                )}
+
+              {!updateLoading && !updateStatus && updateLoadError && (
+                <p className="text-xs text-amber-300">
+                  Could not check update availability: {updateLoadError}
+                </p>
+              )}
+
+              {updateStatus && updateStatus.logs.length > 0 && (
+                <div className="space-y-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowUpdateLogs((prev) => !prev)}
+                    className="inline-flex items-center gap-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
+                  >
+                    {showUpdateLogs ? (
+                      <ChevronUp className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    )}
+                    {showUpdateLogs ? "Hide update log" : "View update log"}
+                  </button>
+                  {showUpdateLogs && (
+                    <pre className="surface-well max-h-56 overflow-auto rounded-lg p-3 text-[11px] font-mono text-[#D1D5DB] leading-relaxed">
+                      {updateStatus.logs.join("\n")}
+                    </pre>
+                  )}
+                </div>
+              )}
+            </>
+          );
+        })()}
       </section>
     </div>
   );
