@@ -1,15 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  Activity,
-  ArrowDownToLine,
-  Box,
-  KeyRound,
-  LogOut,
-  RefreshCw,
-  ShieldCheck,
-  ShieldQuestion,
-} from "lucide-react";
-import {
   api,
   type ApprovalRequest,
   type AuditEvent,
@@ -27,6 +17,8 @@ import { AppsTab } from "./components/AppsTab";
 import { KeysSettingsTab } from "./components/KeysSettingsTab";
 import { OverviewTab } from "./components/OverviewTab";
 import { SetupAndAuth } from "./components/SetupAndAuth";
+import { Boxes, Inbox, LayoutGrid, LogOut, Settings2, type LucideIcon } from "lucide-react";
+import { Logo } from "./brand/Logo";
 
 type TabId = "overview" | "apps" | "approvals" | "keys";
 type AppDrawerSection = "deployments" | "logs" | "domain" | "env" | "security";
@@ -174,28 +166,25 @@ export function App() {
 
   if (!session) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-[#090A0C] px-4">
+      <div className="min-h-screen flex items-center justify-center bg-canvas px-4">
         <div className="surface-panel rounded-xl px-6 py-5 max-w-sm w-full text-center space-y-3">
-          <div className="mx-auto h-9 w-9 rounded-lg bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-center">
-            <ShieldCheck className="h-4.5 w-4.5 text-emerald-400" />
-          </div>
           {connectError ? (
             <>
-              <p className="text-sm font-medium text-[#F4F5F7]">
-                Unable to reach VPSAgent
+              <Logo className="mb-2" />
+              <p className="text-sm font-medium text-fg">
+                Can’t reach this server
               </p>
-              <p className="text-xs text-[#9CA3AF]">{connectError}</p>
+              <p className="text-xs text-muted">{connectError}</p>
               <button
                 type="button"
                 onClick={() => void loadAll()}
-                className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-2 text-xs font-semibold text-[#042F1E] hover:bg-emerald-400 cursor-pointer"
+                className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-primary px-3.5 py-2 text-xs font-semibold text-on-primary hover:bg-primary-hover cursor-pointer"
               >
-                <RefreshCw className="h-3.5 w-3.5" />
                 Try again
               </button>
             </>
           ) : (
-            <p className="text-sm text-[#9CA3AF]">Connecting to VPSAgent...</p>
+            <p className="text-sm text-muted">Connecting…</p>
           )}
         </div>
       </div>
@@ -214,24 +203,19 @@ export function App() {
   const tabs: Array<{
     id: TabId;
     label: string;
-    icon: typeof Activity;
-    badge?: number;
+    icon: LucideIcon;
+    count?: number;
     dot?: boolean;
   }> = [
-    { id: "overview", label: "Overview", icon: Activity },
-    { id: "apps", label: "Apps", icon: Box },
+    { id: "overview", label: "Overview", icon: LayoutGrid },
+    { id: "apps", label: "Apps", icon: Boxes },
     {
       id: "approvals",
-      label: "Approvals & History",
-      icon: ShieldQuestion,
-      badge: pendingCount > 0 ? pendingCount : undefined,
+      label: "Approvals",
+      icon: Inbox,
+      count: pendingCount > 0 ? pendingCount : undefined,
     },
-    {
-      id: "keys",
-      label: "AI Keys & Settings",
-      icon: KeyRound,
-      dot: hasReadyUpdate,
-    },
+    { id: "keys", label: "Settings", icon: Settings2, dot: hasReadyUpdate },
   ];
 
   const openUpdatesSection = () => {
@@ -239,138 +223,121 @@ export function App() {
     setTab("keys");
   };
 
-  return (
-    <div className="min-h-screen bg-[#090A0C] text-[#F4F5F7]">
-      <header className="sticky top-0 z-20 border-b border-white/[0.08] bg-[#090A0C]/90 backdrop-blur-md">
-        <div className="mx-auto max-w-6xl px-4 sm:px-6 h-15 flex items-center justify-between gap-4">
-          {/* Brand Wordmark */}
-          <div className="flex items-center gap-2.5 shrink-0">
-            <div className="h-8 w-8 rounded-lg bg-emerald-500/12 border border-emerald-500/30 flex items-center justify-center">
-              <ShieldCheck className="h-4.5 w-4.5 text-emerald-400" />
-            </div>
-            <span className="text-[15px] font-bold tracking-[-0.02em] text-white">
-              VPSAgent
-            </span>
-          </div>
+  const hostname = overview?.metrics.hostname;
 
-          {/* Desktop Single-Line Navigation */}
-          <nav
-            aria-label="Primary"
-            className="hidden md:flex items-center gap-1"
-          >
+  return (
+    <div className="min-h-screen bg-canvas text-fg md:flex">
+      <aside className="hidden md:flex w-60 shrink-0 flex-col border-r border-line bg-canvas sticky top-0 h-screen">
+        <div className="h-16 px-5 flex items-center">
+          <Logo />
+        </div>
+
+        <nav aria-label="Primary" className="flex-1 px-3 py-2 space-y-0.5">
+          {tabs.map((item) => {
+            const active = tab === item.id;
+            const Icon = item.icon;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setTab(item.id)}
+                aria-current={active ? "page" : undefined}
+                className={`btn-press w-full flex items-center gap-3 rounded-md px-3 py-2 text-sm cursor-pointer ${
+                  active
+                    ? "bg-surface-2 text-fg font-medium"
+                    : "text-muted hover:text-fg hover:bg-surface"
+                }`}
+              >
+                <Icon className="h-4 w-4 shrink-0" strokeWidth={1.75} />
+                <span className="flex-1 text-left">{item.label}</span>
+                {item.count !== undefined && (
+                  <span className="tabular-nums rounded bg-fg px-1.5 text-[11px] leading-[18px] font-semibold text-canvas">
+                    {item.count}
+                  </span>
+                )}
+                {item.dot && (
+                  <span title="An update is available" className="h-1.5 w-1.5 rounded-full bg-fg" />
+                )}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="border-t border-line p-4 space-y-3">
+          {hasReadyUpdate && (
+            <button
+              type="button"
+              onClick={openUpdatesSection}
+              className="btn-press w-full rounded-md border border-line-strong px-3 py-2 text-left text-xs hover:bg-surface cursor-pointer"
+            >
+              <span className="block font-medium text-fg">Update available</span>
+              <span className="block text-muted">
+                {systemUpdate?.latestReleaseTag ?? "New version"} is ready to install
+              </span>
+            </button>
+          )}
+          <div className="flex items-center justify-between gap-3 px-1">
+            <div className="min-w-0">
+              <p className="text-[11px] text-subtle">Server</p>
+              <p className="truncate font-mono text-xs text-fg-2" title={hostname}>
+                {hostname ?? "—"}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleLogout}
+              title="Sign out"
+              aria-label="Sign out"
+              className="btn-press rounded-md p-1.5 text-muted hover:text-fg hover:bg-surface cursor-pointer"
+            >
+              <LogOut className="h-4 w-4" strokeWidth={1.75} />
+            </button>
+          </div>
+        </div>
+      </aside>
+
+      <div className="flex-1 min-w-0">
+        <header className="md:hidden sticky top-0 z-20 border-b border-line bg-canvas">
+          <div className="h-14 px-4 flex items-center justify-between">
+            <Logo />
+            <button
+              type="button"
+              onClick={handleLogout}
+              className="btn-press text-xs text-muted hover:text-fg cursor-pointer"
+            >
+              Sign out
+            </button>
+          </div>
+          <nav aria-label="Mobile" className="px-2 flex border-t border-line">
             {tabs.map((item) => {
-              const Icon = item.icon;
               const active = tab === item.id;
               return (
                 <button
                   key={item.id}
                   type="button"
                   onClick={() => setTab(item.id)}
-                  className={`btn-press relative inline-flex items-center gap-2 rounded-lg px-3.5 py-2 text-[13px] font-medium whitespace-nowrap cursor-pointer ${
-                    active
-                      ? "bg-white/[0.08] text-white"
-                      : "text-[#9CA3AF] hover:text-[#F4F5F7] hover:bg-white/[0.04]"
+                  aria-current={active ? "page" : undefined}
+                  className={`btn-press flex-1 inline-flex items-center justify-center gap-1.5 border-b-2 py-2.5 text-[13px] cursor-pointer ${
+                    active ? "border-fg text-fg font-medium" : "border-transparent text-muted"
                   }`}
                 >
-                  <Icon
-                    className={`h-3.5 w-3.5 ${active ? "text-emerald-400" : "text-[#6B7280]"}`}
-                  />
-                  <span>{item.label}</span>
-                  {item.badge !== undefined && (
-                    <span className="tabular-nums rounded-full bg-amber-400 px-1.5 py-0.5 text-[11px] leading-none font-bold text-[#1A1200]">
-                      {item.badge}
+                  {item.label}
+                  {item.count !== undefined && (
+                    <span className="tabular-nums rounded bg-fg px-1 text-[11px] leading-4 font-semibold text-canvas">
+                      {item.count}
                     </span>
-                  )}
-                  {item.dot && (
-                    <span
-                      title="VPSAgent update available"
-                      className="h-2 w-2 rounded-full bg-emerald-400"
-                    />
                   )}
                 </button>
               );
             })}
           </nav>
+        </header>
 
-          {/* Right Utilities */}
-          <div className="flex items-center gap-3 min-w-0 shrink-0">
-            {hasReadyUpdate && (
-              <button
-                type="button"
-                onClick={openUpdatesSection}
-                className="btn-press inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/12 px-2.5 py-1 text-[11px] font-medium text-emerald-300 hover:bg-emerald-500/20 shrink-0 cursor-pointer"
-              >
-                <ArrowDownToLine className="h-3 w-3" />
-                <span>
-                  {systemUpdate?.latestReleaseTag
-                    ? `${systemUpdate.latestReleaseTag} ready`
-                    : "Update ready"}
-                </span>
-              </button>
-            )}
-            {overview?.metrics.hostname && (
-              <span
-                title={overview.metrics.hostname}
-                className="hidden lg:inline-flex items-center gap-1.5 max-w-[160px] xl:max-w-[220px] min-w-0 text-xs font-mono text-[#9CA3AF]"
-              >
-                <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400" />
-                <span className="truncate">{overview.metrics.hostname}</span>
-              </span>
-            )}
-            <button
-              type="button"
-              onClick={handleLogout}
-              className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-[#111317] px-3 py-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white hover:border-white/[0.16] shrink-0 cursor-pointer"
-            >
-              <LogOut className="h-3.5 w-3.5" />
-              <span>Sign out</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Mobile Tab Strip */}
-        <nav
-          aria-label="Mobile"
-          className="md:hidden border-t border-white/[0.06] px-2 flex gap-1 overflow-x-auto"
-        >
-          {tabs.map((item) => {
-            const Icon = item.icon;
-            const active = tab === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => setTab(item.id)}
-                className={`btn-press inline-flex items-center gap-1.5 border-b-2 px-3 py-2.5 text-[13px] font-medium whitespace-nowrap cursor-pointer ${
-                  active
-                    ? "border-emerald-400 text-white"
-                    : "border-transparent text-[#9CA3AF] hover:text-[#F4F5F7]"
-                }`}
-              >
-                <Icon className="h-3.5 w-3.5" />
-                <span>{item.label}</span>
-                {item.badge !== undefined && (
-                  <span className="tabular-nums rounded-full bg-amber-400 px-1.5 py-0.5 text-[11px] leading-none font-bold text-[#1A1200]">
-                    {item.badge}
-                  </span>
-                )}
-                {item.dot && (
-                  <span
-                    title="VPSAgent update available"
-                    className="h-2 w-2 rounded-full bg-emerald-400"
-                  />
-                )}
-              </button>
-            );
-          })}
-        </nav>
-      </header>
-
-      <main className="mx-auto max-w-6xl px-4 sm:px-6 py-7">
+      <main className="mx-auto max-w-6xl px-4 sm:px-8 py-8 md:py-10">
         {connectError && (
           <div
             role="alert"
-            className="mb-6 rounded-xl border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3"
+            className="mb-6 rounded-xl border border-warn-line bg-warn-soft px-4 py-3 text-xs text-warn flex flex-wrap items-center justify-between gap-3"
           >
             <span>
               <strong className="font-semibold">
@@ -381,9 +348,8 @@ export function App() {
             <button
               type="button"
               onClick={() => void loadAll()}
-              className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-amber-400 px-3 py-1.5 text-xs font-semibold text-[#1A1200] hover:bg-amber-300 cursor-pointer"
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-warn px-3 py-1.5 text-xs font-semibold text-on-warn hover:opacity-90 cursor-pointer"
             >
-              <RefreshCw className="h-3 w-3" />
               Retry
             </button>
           </div>
@@ -394,6 +360,10 @@ export function App() {
             loading={loading}
             onRefresh={() => void loadAll()}
             onNavigateTab={setTab}
+            onOpenApp={(slug) => {
+              setDeepLink({ slug, section: "deployments" });
+              setTab("apps");
+            }}
           />
         )}
         {tab === "apps" && (
@@ -438,6 +408,7 @@ export function App() {
           />
         )}
       </main>
+      </div>
     </div>
   );
 }

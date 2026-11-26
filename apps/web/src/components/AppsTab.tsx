@@ -1,24 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  Database,
-  ExternalLink,
-  GitBranch,
-  Globe,
-  Hammer,
-  KeyRound,
   Loader2,
-  Lock,
-  Play,
-  Plus,
   RefreshCw,
-  Rocket,
-  RotateCw,
-  Search,
-  ShieldCheck,
-  Sparkles,
-  Square,
-  Terminal,
-  Trash2,
 } from "lucide-react";
 import {
   api,
@@ -32,12 +15,14 @@ import {
   type InspectResult,
 } from "../api";
 import { formatSafetyCheckHealth, type HealthBadge } from "../health-display";
+import { AppCard, AppStatus } from "./AppCard";
+import { PageHeader, buttonPrimary, buttonSecondary } from "./PageHeader";
 
 function healthToneClass(tone: HealthBadge["tone"]): string {
-  if (tone === "healthy") return "text-emerald-300";
-  if (tone === "unhealthy") return "text-rose-300";
-  if (tone === "warning") return "text-amber-300";
-  return "text-[#E5E7EB]";
+  if (tone === "healthy") return "text-ok";
+  if (tone === "unhealthy") return "text-bad";
+  if (tone === "warning") return "text-warn";
+  return "text-fg";
 }
 
 function isDeploymentActive(status: DeploymentRecord["status"]): boolean {
@@ -51,21 +36,9 @@ function isDeploymentActive(status: DeploymentRecord["status"]): boolean {
 }
 
 function deploymentToneClass(status: DeploymentRecord["status"]): string {
-  if (status === "succeeded") return "text-emerald-300";
-  if (status === "failed") return "text-rose-300";
-  return "text-amber-300";
-}
-
-function appStatusDot(status: AppRecord["status"]): string {
-  if (status === "running") return "bg-emerald-400";
-  if (status === "error") return "bg-rose-400";
-  return "bg-amber-400";
-}
-
-function appStatusText(status: AppRecord["status"]): string {
-  if (status === "running") return "text-emerald-300";
-  if (status === "error") return "text-rose-300";
-  return "text-amber-300";
+  if (status === "succeeded") return "text-ok";
+  if (status === "failed") return "text-bad";
+  return "text-warn";
 }
 
 const RESERVED_SLUGS = new Set([
@@ -522,7 +495,7 @@ export function AppsTab({
           `Deployment started for ${res.deployment.slug}. Watching build progress live.`,
         );
       } else {
-        setNotice("App launched safely inside its Locked Apartment.");
+        setNotice("App deployed.");
       }
       await onRefresh();
     } catch (err) {
@@ -590,79 +563,71 @@ export function AppsTab({
     }
   };
 
+  const selectedApp = apps.find((a) => a.slug === selectedSlug) ?? null;
+
   return (
-    <div className="space-y-6 panel-enter">
-      {/* Page Header */}
-      <div className="flex flex-wrap items-end justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-[-0.025em] text-white">
-            Apps
-          </h1>
-          <p className="mt-1 text-sm text-[#9CA3AF]">
-            Deploy public or private GitHub repos (auto-detected or Dockerfile)
-            or Docker images inside isolated Locked Apartments.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => {
-            setShowCreate((v) => {
-              if (v) {
-                setGitCredentialId("");
-                setRepoFilter("");
-                manualFieldsRef.current.clear();
-              }
-              return !v;
-            });
-          }}
-          className="btn-press inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 cursor-pointer"
-        >
-          <Plus className="h-4 w-4" />
-          {showCreate ? "Close form" : "Launch new app"}
-        </button>
-      </div>
+    <div className="space-y-6">
+      {!selectedApp && (
+        <PageHeader
+          title="Apps"
+          description="Each app runs in its own isolated container."
+          actions={
+            <button
+              type="button"
+              onClick={() => {
+                setShowCreate((v) => {
+                  if (v) {
+                    setGitCredentialId("");
+                    setRepoFilter("");
+                    manualFieldsRef.current.clear();
+                  }
+                  return !v;
+                });
+              }}
+              className={showCreate ? buttonSecondary : buttonPrimary}
+            >
+              {showCreate ? "Cancel" : "New app"}
+            </button>
+          }
+        />
+      )}
 
       {error && (
-        <div className="rounded-xl border border-rose-500/35 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+        <div className="rounded-xl border border-bad-line bg-bad-soft px-4 py-3 text-sm text-bad">
           {error}
         </div>
       )}
       {notice && (
-        <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200">
+        <div className="rounded-xl border border-line bg-surface-2 px-4 py-3 text-sm text-fg-2">
           {notice}
         </div>
       )}
-
-      {/* Live Background Deployment Tracker */}
       {trackedDeployment && (
-        <div className="surface-panel panel-enter rounded-xl border-l-4 border-l-emerald-400 p-5 space-y-3">
+        <div className="surface-panel rounded-xl p-5 space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2.5 text-xs">
               {isDeploymentActive(trackedDeployment.status) ? (
-                <Loader2 className="h-4 w-4 animate-spin text-amber-300" />
-              ) : (
-                <Rocket className="h-4 w-4 text-emerald-400" />
-              )}
-              <span className="text-sm font-semibold text-white">
+                <Loader2 className="h-4 w-4 animate-spin text-warn" />
+              ) : null}
+              <span className="text-sm font-medium text-fg">
                 Deployment for{" "}
-                <code className="text-emerald-300">
+                <code className="text-fg">
                   {trackedDeployment.slug}
                 </code>
               </span>
               <span
-                className={`font-semibold capitalize ${deploymentToneClass(trackedDeployment.status)}`}
+                className={`font-medium capitalize ${deploymentToneClass(trackedDeployment.status)}`}
               >
                 {trackedDeployment.status}
               </span>
               {trackedDeployment.detectedRuntime && (
-                <span className="font-mono text-[#9CA3AF]">
+                <span className="font-mono text-muted">
                   &middot; {trackedDeployment.detectedRuntime}
                   {trackedDeployment.usedAutoDockerfile ? " (auto)" : ""}
                 </span>
               )}
               {trackedDeployment.commitSha && (
-                <span className="inline-flex items-center gap-1 font-mono text-[#9CA3AF]">
-                  <GitBranch className="h-3 w-3" />
+                <span className="inline-flex items-center gap-1 font-mono text-muted">
                   {trackedDeployment.commitSha.slice(0, 7)}
                 </span>
               )}
@@ -671,42 +636,40 @@ export function AppsTab({
               <button
                 type="button"
                 onClick={() => setTrackedDeployment(null)}
-                className="btn-press text-xs text-[#9CA3AF] hover:text-white cursor-pointer"
+                className="btn-press text-xs text-muted hover:text-fg cursor-pointer"
               >
                 Dismiss
               </button>
             )}
           </div>
           {trackedDeployment.phaseDetail && (
-            <p className="text-xs text-[#D1D5DB]">
+            <p className="text-xs text-fg-2">
               {trackedDeployment.phaseDetail}
             </p>
           )}
           {trackedDeployment.error && (
-            <p className="text-xs text-rose-300">{trackedDeployment.error}</p>
+            <p className="text-xs text-bad">{trackedDeployment.error}</p>
           )}
           {trackedDeployment.buildLogs.length > 0 && (
-            <pre className="surface-well max-h-48 overflow-auto rounded-lg p-3 text-xs font-mono text-[#D1D5DB] whitespace-pre-wrap">
+            <pre className="surface-well max-h-48 overflow-auto rounded-lg p-3 text-xs font-mono text-fg-2 whitespace-pre-wrap">
               {trackedDeployment.buildLogs.join("\n")}
             </pre>
           )}
         </div>
       )}
-
-      {/* Launch New App Form */}
-      {showCreate && (
+      {showCreate && !selectedApp && (
         <form
           onSubmit={handleCreate}
-          className="surface-panel panel-enter rounded-xl p-6 space-y-5"
+          className="surface-panel rounded-xl p-6 space-y-5"
         >
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h2 className="text-sm font-semibold text-white">
-              Launch a new Locked-Apartment app
+            <h2 className="text-sm font-medium text-fg">
+              Deploy a new app
             </h2>
             <div
               role="tablist"
               aria-label="App source type"
-              className="inline-flex rounded-lg border border-white/[0.08] bg-[#0C0E12] p-1 gap-0.5"
+              className="inline-flex rounded-lg border border-line bg-well p-1 gap-0.5"
               onKeyDown={(e) => {
                 if (
                   e.key !== "ArrowLeft" &&
@@ -741,8 +704,8 @@ export function AppsTab({
                 onClick={() => setSourceType("git")}
                 className={`btn-press rounded-md px-3 py-1.5 text-xs font-medium cursor-pointer ${
                   sourceType === "git"
-                    ? "bg-white/[0.1] text-white"
-                    : "text-[#9CA3AF] hover:text-white"
+                    ? "bg-fill text-fg"
+                    : "text-muted hover:text-fg"
                 }`}
               >
                 GitHub repository
@@ -757,8 +720,8 @@ export function AppsTab({
                 onClick={() => setSourceType("image")}
                 className={`btn-press rounded-md px-3 py-1.5 text-xs font-medium cursor-pointer ${
                   sourceType === "image"
-                    ? "bg-white/[0.1] text-white"
-                    : "text-[#9CA3AF] hover:text-white"
+                    ? "bg-fill text-fg"
+                    : "text-muted hover:text-fg"
                 }`}
               >
                 Docker image
@@ -776,8 +739,7 @@ export function AppsTab({
               {gitCredentials.length > 0 ? (
                 <div className="surface-well rounded-lg p-3.5 space-y-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-white">
-                      <Lock className="h-3.5 w-3.5 text-emerald-400" />
+                    <span className="inline-flex items-center gap-1.5 text-xs font-medium text-fg">
                       Your GitHub repositories
                     </span>
                     <div className="flex items-center gap-2">
@@ -792,7 +754,7 @@ export function AppsTab({
                         type="button"
                         disabled={reposLoading}
                         onClick={() => void loadGithubRepos(repoFilter)}
-                        className="btn-press inline-flex items-center gap-1 rounded-md border border-white/[0.1] bg-[#111317] px-2.5 py-1 text-xs text-[#D1D5DB] hover:text-white disabled:opacity-50 cursor-pointer"
+                        className="btn-press inline-flex items-center gap-1 rounded-md border border-line-strong bg-surface px-2.5 py-1 text-xs text-fg-2 hover:text-fg disabled:opacity-50 cursor-pointer"
                       >
                         <RefreshCw
                           className={`h-3 w-3 ${reposLoading ? "animate-spin" : ""}`}
@@ -803,15 +765,15 @@ export function AppsTab({
                   </div>
 
                   {reposError && (
-                    <p className="text-xs text-rose-300">{reposError}</p>
+                    <p className="text-xs text-bad">{reposError}</p>
                   )}
 
                   {reposLoading && githubRepos.length === 0 ? (
-                    <p className="text-xs text-[#9CA3AF]">
+                    <p className="text-xs text-muted">
                       Loading your accessible repositories...
                     </p>
                   ) : githubRepos.length === 0 ? (
-                    <p className="text-xs text-[#9CA3AF]">
+                    <p className="text-xs text-muted">
                       {repoFilter.trim()
                         ? reposHasMore
                           ? "No matches in the 500 most recently updated repositories — paste any GitHub URL below to deploy it directly."
@@ -820,7 +782,7 @@ export function AppsTab({
                     </p>
                   ) : (
                     <>
-                      <div className="max-h-44 overflow-y-auto divide-y divide-white/[0.06] rounded-md border border-white/[0.08] bg-[#090A0C]">
+                      <div className="max-h-44 overflow-y-auto divide-y divide-line rounded-md border border-line bg-canvas">
                         {githubRepos.map((repo) => {
                           const selected =
                             gitRepoUrl.trim().replace(/\/+$/, "") ===
@@ -832,8 +794,8 @@ export function AppsTab({
                               onClick={() => handleSelectGithubRepo(repo)}
                               className={`w-full text-left px-3 py-2 flex items-center justify-between gap-3 text-xs cursor-pointer transition-colors ${
                                 selected
-                                  ? "bg-emerald-500/12 text-white"
-                                  : "hover:bg-white/[0.04] text-[#D1D5DB]"
+                                  ? "bg-ok-soft text-fg"
+                                  : "hover:bg-fill text-fg-2"
                               }`}
                             >
                               <div className="min-w-0">
@@ -842,26 +804,25 @@ export function AppsTab({
                                     {repo.fullName}
                                   </span>
                                   {repo.private ? (
-                                    <span className="inline-flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 shrink-0">
-                                      <Lock className="h-2.5 w-2.5" />
+                                    <span className="inline-flex items-center gap-1 rounded bg-warn-soft px-1.5 py-0.5 text-[10px] font-medium text-warn shrink-0">
                                       Private
                                     </span>
                                   ) : (
-                                    <span className="rounded bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-[#9CA3AF] shrink-0">
+                                    <span className="rounded bg-fill px-1.5 py-0.5 text-[10px] text-muted shrink-0">
                                       Public
                                     </span>
                                   )}
                                 </div>
                                 {repo.description && (
-                                  <p className="text-[11px] text-[#6B7280] truncate mt-0.5">
+                                  <p className="text-[11px] text-subtle truncate mt-0.5">
                                     {repo.description}
                                   </p>
                                 )}
                               </div>
-                              <div className="text-right shrink-0 text-[11px] text-[#6B7280] font-mono">
+                              <div className="text-right shrink-0 text-[11px] text-subtle font-mono">
                                 {repo.defaultBranch ?? "main"}
                                 {gitCredentials.length > 1 && (
-                                  <span className="block text-[10px] text-[#9CA3AF] font-sans">
+                                  <span className="block text-[10px] text-muted font-sans">
                                     {repo.credentialLabel}
                                   </span>
                                 )}
@@ -871,7 +832,7 @@ export function AppsTab({
                         })}
                       </div>
                       {reposHasMore && (
-                        <p className="text-[11px] text-[#9CA3AF]">
+                        <p className="text-[11px] text-muted">
                           {repoFilter.trim()
                             ? `Showing up to ${githubRepos.length} recent matches — refine your search or paste any GitHub URL below if you don't see your repo.`
                             : `Showing the ${githubRepos.length} most recently updated repositories — search above or paste any GitHub URL below.`}
@@ -884,7 +845,7 @@ export function AppsTab({
 
               <div className="flex flex-wrap gap-2.5 items-end">
                 <div className="flex-1 min-w-[260px]">
-                  <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                  <label className="block text-xs font-medium text-muted mb-1.5">
                     HTTPS GitHub repo URL (public or private)
                   </label>
                   <input
@@ -904,27 +865,24 @@ export function AppsTab({
                   type="button"
                   disabled={inspectingGit || !gitRepoUrl.trim()}
                   onClick={handleInspectGit}
-                  className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-sky-500/40 bg-sky-500/12 px-3.5 py-2 text-xs font-semibold text-sky-200 hover:bg-sky-500/20 disabled:opacity-50 cursor-pointer"
+                  className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3.5 py-2 text-xs font-medium text-fg-2 hover:bg-fill disabled:opacity-50 cursor-pointer"
                 >
                   {inspectingGit ? (
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <Search className="h-3.5 w-3.5" />
-                  )}
+                  ) : null}
                   {inspectingGit ? "Inspecting..." : "Inspect & auto-fill"}
                 </button>
               </div>
 
               {gitCredentials.length === 0 && (
-                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-white/[0.08] bg-[#0C0E12] px-3.5 py-2 text-xs text-[#9CA3AF]">
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-line bg-well px-3.5 py-2 text-xs text-muted">
                   <span>Deploying a private GitHub repo?</span>
                   {onOpenGithubSettings && (
                     <button
                       type="button"
                       onClick={onOpenGithubSettings}
-                      className="btn-press inline-flex items-center gap-1 text-emerald-400 hover:text-emerald-300 font-medium cursor-pointer"
+                      className="btn-press inline-flex items-center gap-1 link font-medium cursor-pointer"
                     >
-                      <Lock className="h-3 w-3" />
                       Connect GitHub in Settings
                     </button>
                   )}
@@ -933,7 +891,7 @@ export function AppsTab({
 
               {gitCredentials.length > 1 && (
                 <div>
-                  <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                  <label className="block text-xs font-medium text-muted mb-1.5">
                     GitHub access token
                   </label>
                   <select
@@ -954,22 +912,21 @@ export function AppsTab({
               )}
 
               {gitPreview && (
-                <div className="rounded-lg border border-sky-500/30 bg-sky-500/[0.08] p-3.5 space-y-1.5 text-xs">
-                  <div className="flex flex-wrap items-center gap-2 text-sky-200 font-medium">
-                    <Sparkles className="h-3.5 w-3.5" />
+                <div className="rounded-lg border border-info-line bg-info-soft p-3.5 space-y-1.5 text-xs">
+                  <div className="flex flex-wrap items-center gap-2 text-info font-medium">
                     <span>{gitPreview.buildPlanSummary}</span>
                   </div>
                   {gitPreview.envExampleKeys.length > 0 && (
-                    <p className="text-[#D1D5DB]">
+                    <p className="text-fg-2">
                       Detected settings from <code>.env.example</code>:{" "}
-                      <span className="font-mono text-amber-200">
+                      <span className="font-mono text-warn">
                         {gitPreview.envExampleKeys.map((k) => k.key).join(", ")}
                       </span>{" "}
                       (fill them below or safely later in Hidden Settings).
                     </p>
                   )}
                   {gitPreview.notes.map((n, i) => (
-                    <p key={i} className="text-[#9CA3AF]">
+                    <p key={i} className="text-muted">
                       {n}
                     </p>
                   ))}
@@ -978,7 +935,7 @@ export function AppsTab({
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                  <label className="block text-xs font-medium text-muted mb-1.5">
                     Branch (optional, defaults to repo default)
                   </label>
                   <input
@@ -993,7 +950,7 @@ export function AppsTab({
                   />
                 </div>
                 <div>
-                  <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                  <label className="block text-xs font-medium text-muted mb-1.5">
                     Dockerfile path (leave &ldquo;auto&rdquo; to auto-detect)
                   </label>
                   <input
@@ -1015,7 +972,7 @@ export function AppsTab({
               role="tabpanel"
               aria-labelledby="app-source-tab-image"
             >
-              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              <label className="block text-xs font-medium text-muted mb-1.5">
                 Docker image
               </label>
               <input
@@ -1031,7 +988,7 @@ export function AppsTab({
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              <label className="block text-xs font-medium text-muted mb-1.5">
                 Display name
               </label>
               <input
@@ -1047,7 +1004,7 @@ export function AppsTab({
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              <label className="block text-xs font-medium text-muted mb-1.5">
                 Short ID (lowercase letters &amp; hyphens)
               </label>
               <input
@@ -1066,10 +1023,10 @@ export function AppsTab({
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              <label className="block text-xs font-medium text-muted mb-1.5">
                 App internal port{" "}
                 {sourceType === "git" && (
-                  <span className="text-[#6B7280]">
+                  <span className="text-subtle">
                     (optional, auto-detected)
                   </span>
                 )}
@@ -1089,10 +1046,10 @@ export function AppsTab({
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              <label className="block text-xs font-medium text-muted mb-1.5">
                 Public domain{" "}
                 {appsBaseDomain && !noDomain && (
-                  <span className="text-emerald-400">
+                  <span className="text-ok">
                     (auto: {slug || "your-app"}.{appsBaseDomain})
                   </span>
                 )}
@@ -1113,12 +1070,12 @@ export function AppsTab({
                 className="field-input w-full rounded-lg px-3.5 py-2 text-sm disabled:opacity-45"
               />
               {appsBaseDomain && (
-                <label className="mt-2 inline-flex items-center gap-2 text-xs text-[#9CA3AF] cursor-pointer">
+                <label className="mt-2 inline-flex items-center gap-2 text-xs text-muted cursor-pointer">
                   <input
                     type="checkbox"
                     checked={noDomain}
                     onChange={(e) => setNoDomain(e.target.checked)}
-                    className="rounded border-white/20 bg-[#090A0C] accent-emerald-500"
+                    className="rounded border-line-strong bg-canvas accent-fg"
                   />
                   Keep private (skip automatic subdomain)
                 </label>
@@ -1127,7 +1084,7 @@ export function AppsTab({
           </div>
 
           <div className="flex flex-wrap gap-6 pt-1">
-            <label className="inline-flex items-center gap-2 text-sm text-[#D1D5DB] cursor-pointer">
+            <label className="inline-flex items-center gap-2 text-sm text-fg-2 cursor-pointer">
               <input
                 type="checkbox"
                 checked={withPostgres}
@@ -1135,11 +1092,11 @@ export function AppsTab({
                   manualFieldsRef.current.add("postgres");
                   setWithPostgres(e.target.checked);
                 }}
-                className="rounded border-white/20 bg-[#090A0C] accent-emerald-500"
+                className="rounded border-line-strong bg-canvas accent-fg"
               />
               Attach private Postgres database
             </label>
-            <label className="inline-flex items-center gap-2 text-sm text-[#D1D5DB] cursor-pointer">
+            <label className="inline-flex items-center gap-2 text-sm text-fg-2 cursor-pointer">
               <input
                 type="checkbox"
                 checked={withRedis}
@@ -1147,15 +1104,15 @@ export function AppsTab({
                   manualFieldsRef.current.add("redis");
                   setWithRedis(e.target.checked);
                 }}
-                className="rounded border-white/20 bg-[#090A0C] accent-emerald-500"
+                className="rounded border-line-strong bg-canvas accent-fg"
               />
               Attach private Redis cache
             </label>
           </div>
 
           <div>
-            <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
-              Hidden settings / secrets (optional, one KEY=VALUE per line)
+            <label className="block text-xs font-medium text-muted mb-1.5">
+              Environment variables (optional, one KEY=VALUE per line)
             </label>
             <textarea
               rows={3}
@@ -1175,14 +1132,14 @@ export function AppsTab({
                 setRepoFilter("");
                 manualFieldsRef.current.clear();
               }}
-              className="btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-4 py-2 text-[13px] font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
+              className="btn-press rounded-lg border border-line-strong bg-surface px-4 py-2 text-[13px] font-medium text-muted hover:text-fg cursor-pointer"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={creating}
-              className="btn-press rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+              className="btn-press rounded-lg bg-primary px-4 py-2 text-[13px] font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 cursor-pointer"
             >
               {creating ? "Starting..." : "Launch app"}
             </button>
@@ -1190,205 +1147,156 @@ export function AppsTab({
         </form>
       )}
 
-      {/* Apps List */}
       {apps.length === 0 ? (
-        <div className="surface-panel rounded-xl p-10 text-center space-y-3">
-          <p className="text-sm font-medium text-[#F4F5F7]">
-            No apps running yet
-          </p>
-          <p className="text-xs text-[#9CA3AF] max-w-md mx-auto">
-            Launch a public or private GitHub repo or Docker image directly, or
-            create a visitor pass in AI Keys &amp; Settings so your AI agent can
-            deploy for you.
+        <div className="surface-panel rounded-lg px-6 py-10 space-y-3">
+          <p className="text-sm font-medium">No apps yet.</p>
+          <p className="text-xs text-muted max-w-md">
+            Deploy a GitHub repo or Docker image yourself, or create an access
+            key in Settings so your AI agent can deploy for you.
           </p>
           <button
             type="button"
             onClick={() => setShowCreate(true)}
-            className="btn-press inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-[#042F1E] hover:bg-emerald-400 cursor-pointer"
+            className="btn-press rounded-md bg-primary px-3.5 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover cursor-pointer"
           >
-            <Plus className="h-3.5 w-3.5" />
-            Launch your first app
+            Deploy your first app
           </button>
         </div>
+      ) : !selectedApp ? (
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-4">
+          {apps.map((app) => (
+            <AppCard
+              key={app.slug}
+              app={app}
+              onOpen={() => void openDrawerBySlug(app.slug, "deployments", app.domain)}
+            />
+          ))}
+        </div>
       ) : (
-        <div className="space-y-4">
-          {apps.map((app) => {
+        <div>
+          {[selectedApp].map((app) => {
             const isBusy = busySlug === app.slug;
-            const isOpen = selectedSlug === app.slug;
+            const isOpen = true;
             return (
-              <article
-                key={app.slug}
-                className="surface-panel rounded-xl overflow-hidden"
-              >
-                {/* App Primary Row */}
-                <div className="p-5 flex flex-wrap items-start justify-between gap-4">
-                  <div className="space-y-1.5 min-w-0">
+              <div key={app.slug} className="space-y-6">
+                <button
+                  type="button"
+                  onClick={() => setSelectedSlug(null)}
+                  className="btn-press text-xs text-muted hover:text-fg cursor-pointer"
+                >
+                  ← All apps
+                </button>
+
+                <div className="flex flex-wrap items-end justify-between gap-4">
+                  <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-3">
-                      <h2 className="text-base font-semibold tracking-[-0.015em] text-white">
-                        {app.name}
-                      </h2>
-                      <span
-                        className={`inline-flex items-center gap-1.5 text-xs font-medium capitalize ${appStatusText(app.status)}`}
-                      >
-                        <span
-                          className={`h-1.5 w-1.5 rounded-full ${appStatusDot(app.status)}`}
-                        />
-                        {app.status}
-                      </span>
-                      {app.domain && (
+                      <h1 className="text-2xl font-semibold tracking-[-0.02em]">{app.name}</h1>
+                      <AppStatus status={app.status} />
+                    </div>
+                    <p className="mt-1.5 text-sm text-muted">
+                      {app.domain ? (
                         <a
                           href={`https://${app.domain}`}
                           target="_blank"
                           rel="noreferrer"
-                          className="inline-flex items-center gap-1 text-xs text-emerald-400 hover:text-emerald-300"
+                          className="hover:text-fg hover:underline underline-offset-2"
                         >
-                          <span>{app.domain}</span>
-                          <ExternalLink className="h-3 w-3" />
+                          {app.domain}
                         </a>
+                      ) : (
+                        "No public address"
                       )}
-                    </div>
-
-                    {/* Clean Typographic Metadata Line (no pill soup) */}
-                    <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-[#9CA3AF] tabular-nums">
-                      <span className="font-mono text-[#D1D5DB]">
-                        {app.slug}
-                      </span>
-                      <span className="text-[#4B5563]">&middot;</span>
-                      <span>Port {app.internalPort}</span>
-                      <span className="text-[#4B5563]">&middot;</span>
-                      <span>
-                        {app.cpuLimit} CPU / {app.memoryLimitMb} MB
-                      </span>
-                      {app.detectedRuntime && (
-                        <>
-                          <span className="text-[#4B5563]">&middot;</span>
-                          <span className="font-mono">
-                            {app.detectedRuntime}
-                          </span>
-                        </>
-                      )}
-                      {app.lastCommitSha && (
-                        <>
-                          <span className="text-[#4B5563]">&middot;</span>
-                          <span className="inline-flex items-center gap-1 font-mono text-[#9CA3AF]">
-                            <GitBranch className="h-3 w-3 text-[#6B7280]" />
-                            {app.lastCommitSha.slice(0, 7)}
-                          </span>
-                        </>
-                      )}
-                      {app.gitCredentialId && (
-                        <>
-                          <span className="text-[#4B5563]">&middot;</span>
-                          <span className="inline-flex items-center gap-1 text-amber-300">
-                            <Lock className="h-3 w-3" />
-                            Private repo
-                          </span>
-                        </>
-                      )}
-                      {app.companions.length > 0 && (
-                        <>
-                          <span className="text-[#4B5563]">&middot;</span>
-                          <span className="inline-flex items-center gap-1 text-sky-300">
-                            <Database className="h-3 w-3" />
-                            {app.companions.map((c) => c.type).join(" + ")}
-                          </span>
-                        </>
-                      )}
-                    </div>
+                    </p>
                   </div>
-
-                  {/* Grouped Lifecycle Control Bar */}
-                  <div className="inline-flex max-w-full flex-wrap items-center rounded-lg border border-white/[0.08] bg-[#0C0E12] divide-x divide-white/[0.08] overflow-hidden">
+                  <div className="flex flex-wrap items-center gap-2">
                     {app.status === "running" ? (
-                      <button
-                        type="button"
-                        disabled={isBusy}
-                        onClick={() => handleAction(app.slug, "stop")}
-                        className="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#D1D5DB] hover:bg-white/[0.06] hover:text-white disabled:opacity-45 cursor-pointer"
-                      >
-                        <Square className="h-3 w-3" />
+                      <button type="button" disabled={isBusy} onClick={() => handleAction(app.slug, "stop")} className={buttonSecondary}>
                         Stop
                       </button>
                     ) : (
-                      <button
-                        type="button"
-                        disabled={isBusy}
-                        onClick={() => handleAction(app.slug, "start")}
-                        className="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-300 hover:bg-emerald-500/15 disabled:opacity-45 cursor-pointer"
-                      >
-                        <Play className="h-3 w-3" />
+                      <button type="button" disabled={isBusy} onClick={() => handleAction(app.slug, "start")} className={buttonSecondary}>
                         Start
                       </button>
                     )}
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      onClick={() => handleAction(app.slug, "restart")}
-                      className="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#D1D5DB] hover:bg-white/[0.06] hover:text-white disabled:opacity-45 cursor-pointer"
-                    >
-                      <RotateCw className="h-3 w-3" />
+                    <button type="button" disabled={isBusy} onClick={() => handleAction(app.slug, "restart")} className={buttonSecondary}>
                       Restart
                     </button>
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      onClick={() => handleAction(app.slug, "rebuild")}
-                      className="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#D1D5DB] hover:bg-white/[0.06] hover:text-white disabled:opacity-45 cursor-pointer"
-                    >
-                      <Hammer className="h-3 w-3" />
+                    <button type="button" disabled={isBusy} onClick={() => handleAction(app.slug, "rebuild")} className={buttonPrimary}>
                       Rebuild
                     </button>
                     <button
                       type="button"
                       disabled={isBusy}
                       onClick={() => handleDelete(app.slug)}
-                      className="btn-press inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-rose-300 hover:bg-rose-500/15 disabled:opacity-45 cursor-pointer"
+                      className="btn-press rounded-md px-3 py-2 text-[13px] text-muted hover:text-fg hover:bg-bad-soft disabled:opacity-50 cursor-pointer"
                     >
-                      <Trash2 className="h-3 w-3" />
                       Delete
                     </button>
                   </div>
                 </div>
 
-                {/* Inspector Tab Strip */}
-                <div className="border-t border-white/[0.06] bg-[#0C0E12]/70 px-4 py-1.5 flex flex-wrap gap-1">
+                <dl className="grid grid-cols-2 lg:grid-cols-4 gap-px overflow-hidden rounded-lg border border-line bg-line">
                   {(
                     [
-                      ["deployments", "Deployments", Rocket],
-                      ["logs", "Logs", Terminal],
-                      ["domain", "Domain", Globe],
-                      ["env", "Hidden settings (.env)", KeyRound],
-                      ["security", "Safety check", ShieldCheck],
+                      ["Short ID", <span className="font-mono">{app.slug}</span>],
+                      [
+                        "Source",
+                        app.sourceType === "git"
+                          ? `${app.gitRepoUrl?.replace(/^https?:\/\/(www\.)?github\.com\//, "") ?? "GitHub"}${app.gitBranch ? ` · ${app.gitBranch}` : ""}`
+                          : app.image ?? "Docker image",
+                      ],
+                      [
+                        "Runtime",
+                        [app.detectedRuntime, `port ${app.internalPort}`].filter(Boolean).join(" · "),
+                      ],
+                      [
+                        "Limits",
+                        `${app.cpuLimit} CPU · ${app.memoryLimitMb} MB${
+                          app.companions.length > 0
+                            ? ` · + ${app.companions.map((c) => c.type).join(", ")}`
+                            : ""
+                        }`,
+                      ],
+                    ] as Array<[string, React.ReactNode]>
+                  ).map(([label, value]) => (
+                    <div key={label} className="bg-surface px-4 py-3 min-w-0">
+                      <dt className="text-xs text-muted">{label}</dt>
+                      <dd className="mt-1 truncate text-sm">{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+
+                <nav aria-label={`${app.name} sections`} className="flex flex-wrap gap-x-6 border-b border-line">
+                  {(
+                    [
+                      ["deployments", "Deploys"],
+                      ["logs", "Logs"],
+                      ["domain", "Address"],
+                      ["env", "Variables"],
+                      ["security", "Health"],
                     ] as const
-                  ).map(([key, label, Icon]) => {
-                    const active = isOpen && section === key;
+                  ).map(([key, label]) => {
+                    const active = section === key;
                     return (
                       <button
                         key={key}
                         type="button"
-                        onClick={() =>
-                          active
-                            ? setSelectedSlug(null)
-                            : void openDrawerBySlug(app.slug, key, app.domain)
-                        }
-                        className={`btn-press inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium cursor-pointer ${
-                          active
-                            ? "bg-white/[0.09] text-white"
-                            : "text-[#9CA3AF] hover:text-[#F4F5F7] hover:bg-white/[0.04]"
+                        aria-current={active ? "page" : undefined}
+                        onClick={() => {
+                          if (!active) void openDrawerBySlug(app.slug, key, app.domain);
+                        }}
+                        className={`btn-press -mb-px border-b-2 pb-2.5 text-sm cursor-pointer ${
+                          active ? "border-fg text-fg font-medium" : "border-transparent text-muted hover:text-fg"
                         }`}
                       >
-                        <Icon
-                          className={`h-3.5 w-3.5 ${active ? "text-emerald-400" : "text-[#6B7280]"}`}
-                        />
                         {label}
                       </button>
                     );
                   })}
-                </div>
+                </nav>
 
-                {/* Expanded Inspector Drawer */}
                 {isOpen && (
-                  <div className="panel-enter border-t border-white/[0.08] bg-[#0C0E12] p-5">
+                  <div>
                     {drawerLoading ? (
                       <div className="space-y-2.5" aria-busy="true">
                         <div className="h-4 w-48 rounded skeleton-bar" />
@@ -1397,7 +1305,7 @@ export function AppsTab({
                     ) : section === "deployments" ? (
                       <div className="space-y-3">
                         <div className="flex items-center justify-between">
-                          <span className="text-xs text-[#9CA3AF]">
+                          <span className="text-xs text-muted">
                             Recent builds &amp; deployments (secrets are
                             automatically scrubbed)
                           </span>
@@ -1410,57 +1318,57 @@ export function AppsTab({
                                 app.domain,
                               )
                             }
-                            className="btn-press text-xs font-medium text-emerald-400 hover:text-emerald-300 cursor-pointer"
+                            className="btn-press text-xs font-medium link cursor-pointer"
                           >
                             Refresh
                           </button>
                         </div>
                         {deployments.length === 0 ? (
-                          <p className="text-xs text-[#6B7280]">
+                          <p className="text-xs text-subtle">
                             No tracked deployments yet.
                           </p>
                         ) : (
-                          <div className="divide-y divide-white/[0.06] border-t border-white/[0.06]">
+                          <div className="divide-y divide-line border-t border-line">
                             {deployments.map((dep) => (
                               <div key={dep.id} className="py-3.5 space-y-2">
                                 <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                                   <div className="flex flex-wrap items-center gap-2">
                                     <span
-                                      className={`font-semibold capitalize ${deploymentToneClass(dep.status)}`}
+                                      className={`font-medium capitalize ${deploymentToneClass(dep.status)}`}
                                     >
                                       {dep.status}
                                     </span>
-                                    <span className="font-mono text-[#D1D5DB]">
+                                    <span className="font-mono text-fg-2">
                                       {dep.action}
                                     </span>
                                     {dep.detectedRuntime && (
-                                      <span className="text-[#9CA3AF]">
+                                      <span className="text-muted">
                                         {dep.detectedRuntime}
                                         {dep.usedAutoDockerfile ? " (auto)" : ""}
                                       </span>
                                     )}
                                     {dep.commitSha && (
-                                      <span className="font-mono text-[#6B7280]">
+                                      <span className="font-mono text-subtle">
                                         @{dep.commitSha.slice(0, 7)}
                                       </span>
                                     )}
                                   </div>
-                                  <span className="text-[#6B7280] tabular-nums">
+                                  <span className="text-subtle tabular-nums">
                                     {new Date(dep.createdAt).toLocaleString()}
                                   </span>
                                 </div>
                                 {dep.phaseDetail && (
-                                  <p className="text-xs text-[#9CA3AF]">
+                                  <p className="text-xs text-muted">
                                     {dep.phaseDetail}
                                   </p>
                                 )}
                                 {dep.error && (
-                                  <p className="text-xs text-rose-300">
+                                  <p className="text-xs text-bad">
                                     {dep.error}
                                   </p>
                                 )}
                                 {dep.buildLogs.length > 0 && (
-                                  <pre className="max-h-40 overflow-auto rounded-lg border border-white/[0.08] bg-[#090A0C] p-3 text-[11px] font-mono text-[#D1D5DB] whitespace-pre-wrap">
+                                  <pre className="max-h-40 overflow-auto rounded-lg border border-line bg-canvas p-3 text-[11px] font-mono text-fg-2 whitespace-pre-wrap">
                                     {dep.buildLogs.join("\n")}
                                   </pre>
                                 )}
@@ -1472,7 +1380,7 @@ export function AppsTab({
                     ) : section === "logs" ? (
                       <div className="space-y-2.5">
                         <div className="flex items-center justify-between">
-                          <span className="text-xs text-[#9CA3AF]">
+                          <span className="text-xs text-muted">
                             Recent container logs (passwords &amp; tokens
                             automatically scrubbed)
                           </span>
@@ -1481,19 +1389,19 @@ export function AppsTab({
                             onClick={() =>
                               void openDrawerBySlug(app.slug, "logs", app.domain)
                             }
-                            className="btn-press text-xs font-medium text-emerald-400 hover:text-emerald-300 cursor-pointer"
+                            className="btn-press text-xs font-medium link cursor-pointer"
                           >
                             Refresh logs
                           </button>
                         </div>
-                        <pre className="max-h-64 overflow-auto rounded-lg border border-white/[0.08] bg-[#090A0C] p-3.5 text-xs font-mono text-[#D1D5DB] whitespace-pre-wrap leading-relaxed">
+                        <pre className="max-h-64 overflow-auto rounded-lg border border-line bg-canvas p-3.5 text-xs font-mono text-fg-2 whitespace-pre-wrap leading-relaxed">
                           {logs.length > 0 ? logs.join("\n") : "No logs yet."}
                         </pre>
                       </div>
                     ) : section === "domain" ? (
                       <div className="flex flex-wrap items-end gap-3">
                         <div className="flex-1 min-w-[220px]">
-                          <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                          <label className="block text-xs font-medium text-muted mb-1.5">
                             Public web address (automatic HTTPS)
                           </label>
                           <input
@@ -1507,7 +1415,7 @@ export function AppsTab({
                         <button
                           type="button"
                           onClick={() => handleSaveDomain(false)}
-                          className="btn-press rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-[#042F1E] hover:bg-emerald-400 cursor-pointer"
+                          className="btn-press rounded-lg bg-primary px-4 py-2 text-xs font-medium text-on-primary hover:bg-primary-hover cursor-pointer"
                         >
                           Connect domain
                         </button>
@@ -1515,7 +1423,7 @@ export function AppsTab({
                           <button
                             type="button"
                             onClick={() => handleSaveDomain(true)}
-                            className="btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-3.5 py-2 text-xs font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
+                            className="btn-press rounded-lg border border-line-strong bg-surface px-3.5 py-2 text-xs font-medium text-muted hover:text-fg cursor-pointer"
                           >
                             Disconnect
                           </button>
@@ -1524,8 +1432,8 @@ export function AppsTab({
                     ) : section === "env" ? (
                       <div className="space-y-4">
                         {missingEnvKeys.length > 0 && (
-                          <div className="rounded-lg border border-amber-500/35 bg-amber-500/[0.08] p-3.5 space-y-2">
-                            <p className="text-xs font-medium text-amber-200">
+                          <div className="rounded-lg border border-warn-line bg-warn-soft p-3.5 space-y-2">
+                            <p className="text-xs font-medium text-warn">
                               Suggested settings from this repo&rsquo;s{" "}
                               <code>.env.example</code> (click one to fill it
                               safely here):
@@ -1536,7 +1444,7 @@ export function AppsTab({
                                   key={key}
                                   type="button"
                                   onClick={() => setNewEnvKey(key)}
-                                  className="btn-press rounded-md border border-amber-500/40 bg-[#090A0C] px-2.5 py-1 text-xs font-mono text-amber-200 hover:bg-amber-500/20 cursor-pointer"
+                                  className="btn-press rounded-md border border-warn-line bg-canvas px-2.5 py-1 text-xs font-mono text-warn hover:bg-warn-soft cursor-pointer"
                                 >
                                   + {key}
                                 </button>
@@ -1566,14 +1474,14 @@ export function AppsTab({
                           />
                           <button
                             type="submit"
-                            className="btn-press rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-[#042F1E] hover:bg-emerald-400 cursor-pointer"
+                            className="btn-press rounded-lg bg-primary px-4 py-2 text-xs font-medium text-on-primary hover:bg-primary-hover cursor-pointer"
                           >
                             Save setting
                           </button>
                         </form>
-                        <div className="divide-y divide-white/[0.06] rounded-lg border border-white/[0.08] bg-[#090A0C]">
+                        <div className="divide-y divide-line rounded-lg border border-line bg-canvas">
                           {envVars.length === 0 ? (
-                            <p className="p-3.5 text-xs text-[#6B7280]">
+                            <p className="p-3.5 text-xs text-subtle">
                               No saved settings yet.
                             </p>
                           ) : (
@@ -1583,17 +1491,17 @@ export function AppsTab({
                                 className="flex items-center justify-between px-3.5 py-2.5 text-xs"
                               >
                                 <div className="min-w-0 [overflow-wrap:anywhere]">
-                                  <span className="font-mono text-[#F4F5F7]">
+                                  <span className="font-mono text-fg">
                                     {entry.key}
                                   </span>
-                                  <span className="ml-3 font-mono text-[#6B7280]">
+                                  <span className="ml-3 font-mono text-subtle">
                                     {entry.maskedValue}
                                   </span>
                                 </div>
                                 <button
                                   type="button"
                                   onClick={() => handleDeleteEnv(entry.key)}
-                                  className="btn-press text-rose-400 hover:text-rose-300 cursor-pointer shrink-0 ml-3"
+                                  className="btn-press text-bad hover:text-bad cursor-pointer shrink-0 ml-3"
                                 >
                                   Remove
                                 </button>
@@ -1608,33 +1516,33 @@ export function AppsTab({
                           <div className="space-y-3">
                             <div className="flex flex-wrap items-center gap-4">
                               <span
-                                className={`inline-flex items-center gap-1.5 font-semibold ${
+                                className={`inline-flex items-center gap-1.5 font-medium ${
                                   inspectData.lockedApartmentCompliant
-                                    ? "text-emerald-300"
-                                    : "text-rose-300"
+                                    ? "text-ok"
+                                    : "text-bad"
                                 }`}
                               >
                                 <span
                                   className={`h-2 w-2 rounded-full ${
                                     inspectData.lockedApartmentCompliant
-                                      ? "bg-emerald-400"
-                                      : "bg-rose-400"
+                                      ? "bg-ok"
+                                      : "bg-bad"
                                   }`}
                                 />
                                 {inspectData.lockedApartmentCompliant
-                                  ? "Locked Apartment verified"
+                                  ? "Isolation verified"
                                   : "Safety warning: check config"}
                               </span>
-                              <span className="text-[#9CA3AF] tabular-nums">
+                              <span className="text-muted tabular-nums">
                                 Containers: {inspectData.containers.length}{" "}
                                 &middot; Overall status:{" "}
                                 <span
                                   className={
                                     inspectData.status === "running"
-                                      ? "text-emerald-300 font-semibold"
+                                      ? "text-ok font-medium"
                                       : inspectData.status === "error"
-                                        ? "text-rose-300 font-semibold"
-                                        : "text-[#F4F5F7] font-semibold"
+                                        ? "text-bad font-medium"
+                                        : "text-fg font-medium"
                                   }
                                 >
                                   {inspectData.status}
@@ -1646,8 +1554,8 @@ export function AppsTab({
                                 formatSafetyCheckHealth(inspectData);
                               return (
                                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1">
-                                  <div className="rounded-lg border border-white/[0.06] bg-[#090A0C] px-3.5 py-2.5">
-                                    <p className="text-[11px] text-[#6B7280]">
+                                  <div className="rounded-lg border border-line bg-canvas px-3.5 py-2.5">
+                                    <p className="text-[11px] text-subtle">
                                       Docker liveness
                                     </p>
                                     <p
@@ -1656,8 +1564,8 @@ export function AppsTab({
                                       {health.dockerLiveness.label}
                                     </p>
                                   </div>
-                                  <div className="rounded-lg border border-white/[0.06] bg-[#090A0C] px-3.5 py-2.5">
-                                    <p className="text-[11px] text-[#6B7280]">
+                                  <div className="rounded-lg border border-line bg-canvas px-3.5 py-2.5">
+                                    <p className="text-[11px] text-subtle">
                                       Monitored HTTP health
                                     </p>
                                     <p
@@ -1666,8 +1574,8 @@ export function AppsTab({
                                       {health.monitoredHttp.label}
                                     </p>
                                   </div>
-                                  <div className="rounded-lg border border-white/[0.06] bg-[#090A0C] px-3.5 py-2.5">
-                                    <p className="text-[11px] text-[#6B7280]">
+                                  <div className="rounded-lg border border-line bg-canvas px-3.5 py-2.5">
+                                    <p className="text-[11px] text-subtle">
                                       Live HTTP probe
                                     </p>
                                     <p
@@ -1681,7 +1589,7 @@ export function AppsTab({
                             })()}
                           </div>
                         ) : (
-                          <p className="text-[#9CA3AF]">
+                          <p className="text-muted">
                             No container inspection data available.
                           </p>
                         )}
@@ -1689,7 +1597,7 @@ export function AppsTab({
                     )}
                   </div>
                 )}
-              </article>
+              </div>
             );
           })}
         </div>

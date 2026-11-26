@@ -4,15 +4,13 @@ import {
   CheckCircle2,
   Copy,
   ExternalLink,
-  Globe,
   Loader2,
   Lock,
-  Network,
   RefreshCw,
-  ShieldCheck,
 } from "lucide-react";
 import { api, type SessionInfo, type TailscaleStatus } from "../api";
 import { describeTailscaleConflict } from "../tailscale-conflict";
+import { Logo } from "../brand/Logo";
 
 interface SetupAndAuthProps {
   session: SessionInfo;
@@ -102,23 +100,16 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
     };
 
     return (
-      <div className="min-h-screen flex items-center justify-center p-6 bg-[#090A0C]">
-        <div className="surface-panel panel-enter w-full max-w-md rounded-2xl p-8">
-          <div className="flex items-center gap-3 mb-7">
-            <div className="h-10 w-10 rounded-xl bg-emerald-500/12 border border-emerald-500/30 flex items-center justify-center">
-              <ShieldCheck className="h-5 w-5 text-emerald-400" />
-            </div>
-            <div>
-              <h1 className="text-lg font-semibold tracking-[-0.02em] text-white">
-                VPSAgent
-              </h1>
-              <p className="text-xs text-[#9CA3AF]">Sign in to your server</p>
-            </div>
+      <div className="min-h-screen flex items-center justify-center p-6 bg-canvas">
+        <div className="surface-panel w-full max-w-md rounded-lg p-8">
+          <div className="mb-8 space-y-5">
+            <Logo markSize={48} textClassName="text-[32px]" className="gap-3.5" />
+            <h1 className="text-sm text-muted">Sign in to your server</h1>
           </div>
 
           <form onSubmit={handleLogin} className="space-y-4">
             <div>
-              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              <label className="block text-xs font-medium text-muted mb-1.5">
                 Owner password
               </label>
               <input
@@ -133,7 +124,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
             </div>
 
             {error && (
-              <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200">
+              <div className="rounded-lg border border-line-strong px-3.5 py-2.5 text-xs text-muted hover:text-bad">
                 {error}
               </div>
             )}
@@ -141,7 +132,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
             <button
               type="submit"
               disabled={busy}
-              className="btn-press w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+              className="btn-press w-full rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 cursor-pointer"
             >
               {busy ? "Signing in..." : "Sign in"}
             </button>
@@ -235,29 +226,21 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center p-6 bg-[#090A0C]">
-      <div className="surface-panel panel-enter w-full max-w-lg rounded-2xl p-8">
-        <div className="flex items-center gap-3 mb-6">
-          <div className="h-10 w-10 rounded-xl bg-emerald-500/12 border border-emerald-500/30 flex items-center justify-center">
-            <ShieldCheck className="h-5 w-5 text-emerald-400" />
-          </div>
+    <div className="min-h-screen flex items-center justify-center p-6 bg-canvas">
+      <div className="surface-panel w-full max-w-lg rounded-lg p-8">
+        <div className="mb-7 space-y-5">
+          <Logo markSize={48} textClassName="text-[32px]" className="gap-3.5" />
           <div>
-            <h1 className="text-lg font-semibold tracking-[-0.02em] text-white">
-              Welcome to VPSAgent
-            </h1>
-            <p className="text-xs text-[#9CA3AF]">
-              Quick 2-step setup to lock down your server
-            </p>
+            <h1 className="text-base font-medium text-fg">Set up your server</h1>
+            <p className="text-xs text-muted">Two quick steps to secure it.</p>
           </div>
         </div>
-
-        {/* Stepper */}
         <div className="grid grid-cols-2 gap-2.5 mb-6">
           <div
             className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium ${
               step === 1
-                ? "border-emerald-500/45 bg-emerald-500/10 text-emerald-300"
-                : "border-white/[0.08] bg-[#0C0E12] text-emerald-400"
+                ? "border-line-strong bg-fill text-fg"
+                : "border-line bg-well text-muted"
             }`}
           >
             {step > 1 ? (
@@ -270,11 +253,10 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
           <div
             className={`flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium ${
               step === 2
-                ? "border-emerald-500/45 bg-emerald-500/10 text-emerald-300"
-                : "border-white/[0.08] bg-[#0C0E12] text-[#6B7280]"
+                ? "border-line-strong bg-fill text-fg"
+                : "border-line bg-well text-subtle"
             }`}
           >
-            <Globe className="h-3.5 w-3.5 shrink-0" />
             <span>2. Private HTTPS access</span>
           </div>
         </div>
@@ -282,7 +264,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
         {step === 1 ? (
           <form onSubmit={handleClaim} className="space-y-4">
             <div>
-              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              <label className="block text-xs font-medium text-muted mb-1.5">
                 Private setup code
               </label>
               <input
@@ -296,7 +278,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              <label className="block text-xs font-medium text-muted mb-1.5">
                 Choose your dashboard password
               </label>
               <input
@@ -310,7 +292,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
             </div>
 
             <div>
-              <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+              <label className="block text-xs font-medium text-muted mb-1.5">
                 Confirm password
               </label>
               <input
@@ -324,7 +306,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
             </div>
 
             {error && (
-              <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200">
+              <div className="rounded-lg border border-line-strong px-3.5 py-2.5 text-xs text-muted hover:text-bad">
                 {error}
               </div>
             )}
@@ -332,18 +314,17 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
             <button
               type="submit"
               disabled={busy}
-              className="btn-press w-full rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+              className="btn-press w-full rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 cursor-pointer"
             >
               {busy ? "Claiming server..." : "Save password & continue"}
             </button>
           </form>
         ) : (
           <div className="space-y-4">
-            {/* Access Method Switcher */}
             <div
               role="tablist"
               aria-label="HTTPS access method"
-              className="grid grid-cols-2 rounded-lg border border-white/[0.08] bg-[#0C0E12] p-1 gap-1"
+              className="grid grid-cols-2 rounded-lg border border-line bg-well p-1 gap-1"
             >
               <button
                 type="button"
@@ -355,11 +336,10 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                 }}
                 className={`btn-press inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs font-medium cursor-pointer ${
                   accessMode === "domain"
-                    ? "bg-white/[0.1] text-white"
-                    : "text-[#9CA3AF] hover:text-white"
+                    ? "bg-fill text-fg"
+                    : "text-muted hover:text-fg"
                 }`}
               >
-                <Globe className="h-3.5 w-3.5 text-sky-400" />
                 <span>Custom domain</span>
               </button>
               <button
@@ -372,27 +352,26 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                 }}
                 className={`btn-press inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-2 text-xs font-medium cursor-pointer ${
                   accessMode === "tailscale"
-                    ? "bg-white/[0.1] text-white"
-                    : "text-[#9CA3AF] hover:text-white"
+                    ? "bg-fill text-fg"
+                    : "text-muted hover:text-fg"
                 }`}
               >
-                <Network className="h-3.5 w-3.5 text-emerald-400" />
                 <span>Tailscale (no domain)</span>
               </button>
             </div>
 
             {accessMode === "domain" ? (
               <>
-                <p className="text-sm text-[#9CA3AF] leading-relaxed">
-                  Connect a domain name so your dashboard and AI doorway get
-                  automatic <code className="text-emerald-400">https://</code>{" "}
+                <p className="text-sm text-muted leading-relaxed">
+                  Connect a domain name so your dashboard and AI connection get
+                  automatic <code className="text-fg">https://</code>{" "}
                   security.
                   {session.publicIp && (
                     <>
                       {" "}
                       Point your domain&apos;s DNS{" "}
-                      <strong className="text-[#F4F5F7]">A record</strong> to{" "}
-                      <code className="rounded bg-white/[0.06] px-1.5 py-0.5 text-emerald-300">
+                      <strong className="text-fg">A record</strong> to{" "}
+                      <code className="rounded bg-fill px-1.5 py-0.5 text-fg">
                         {session.publicIp}
                       </code>
                       .
@@ -401,7 +380,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                 </p>
 
                 <div>
-                  <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                  <label className="block text-xs font-medium text-muted mb-1.5">
                     Dashboard domain name
                   </label>
                   <input
@@ -414,7 +393,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-[#9CA3AF] mb-1.5">
+                  <label className="block text-xs font-medium text-muted mb-1.5">
                     Email for security certificate notices (optional)
                   </label>
                   <input
@@ -427,7 +406,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                 </div>
 
                 {error && (
-                  <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200">
+                  <div className="rounded-lg border border-line-strong px-3.5 py-2.5 text-xs text-muted hover:text-bad">
                     {error}
                   </div>
                 )}
@@ -437,7 +416,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                     type="button"
                     disabled={busy}
                     onClick={() => handleDomainSave(false)}
-                    className="btn-press flex-1 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+                    className="btn-press flex-1 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 cursor-pointer"
                   >
                     {busy ? "Saving..." : "Connect domain & finish"}
                   </button>
@@ -445,7 +424,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                     type="button"
                     disabled={busy}
                     onClick={() => handleDomainSave(true)}
-                    className="btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-4 py-2.5 text-sm font-medium text-[#9CA3AF] hover:text-white hover:bg-[#161920] cursor-pointer"
+                    className="btn-press rounded-lg border border-line-strong bg-surface px-4 py-2.5 text-sm font-medium text-muted hover:text-fg hover:bg-surface-2 cursor-pointer"
                   >
                     Skip for now
                   </button>
@@ -453,33 +432,33 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
               </>
             ) : (
               <div className="space-y-4">
-                <p className="text-sm text-[#9CA3AF] leading-relaxed">
+                <p className="text-sm text-muted leading-relaxed">
                   Use Tailscale for private{" "}
-                  <code className="text-emerald-400">https://</code> access to
-                  your dashboard and AI doorway without buying a domain or
+                  <code className="text-fg">https://</code> access to
+                  your dashboard and AI connection without buying a domain or
                   configuring DNS.
                 </p>
 
                 {tsLoading && !tsStatus ? (
-                  <div className="surface-well rounded-lg px-4 py-3 text-xs text-[#9CA3AF] flex items-center gap-2">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-emerald-400" />
+                  <div className="surface-well rounded-lg px-4 py-3 text-xs text-muted flex items-center gap-2">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-muted" />
                     Checking Tailscale on this server...
                   </div>
                 ) : !tsBridgeSupported ? (
-                  <div className="surface-well rounded-lg px-4 py-3 text-xs text-[#9CA3AF]">
+                  <div className="surface-well rounded-lg px-4 py-3 text-xs text-muted">
                     {tsStatus?.detail ||
                       "Re-run the installer with --tailscale or skip for now to enable Tailscale in Settings."}
                   </div>
                 ) : tsStatus?.serveEnabled && tsStatus.serveUrl ? (
-                  <div className="rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-4 py-3 text-xs text-emerald-200 space-y-1.5">
-                    <p className="font-semibold text-emerald-300">
+                  <div className="rounded-lg border border-line bg-surface-2 px-4 py-3 text-xs text-fg-2 space-y-1.5">
+                    <p className="font-medium text-ok">
                       Tailscale private HTTPS is active
                     </p>
-                    <p className="font-mono break-all text-white">
+                    <p className="font-mono break-all text-fg">
                       {tsStatus.serveUrl}
                     </p>
                     {tsStatus.tailscaleIp && (
-                      <p className="text-emerald-200/80 font-mono">
+                      <p className="text-fg font-mono">
                         Tailscale IP: {tsStatus.tailscaleIp}
                       </p>
                     )}
@@ -487,14 +466,14 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                 ) : tsStatus?.connected ? (
                   <div className="surface-well rounded-lg p-4 space-y-2.5 text-xs">
                     <div className="flex items-center justify-between gap-2">
-                      <span className="font-semibold text-emerald-300">
+                      <span className="font-medium text-ok">
                         Tailscale connected
                       </span>
                       <button
                         type="button"
                         disabled={tsLoading}
                         onClick={() => void refreshTailscaleStatus()}
-                        className="inline-flex items-center gap-1 text-[#9CA3AF] hover:text-white cursor-pointer"
+                        className="inline-flex items-center gap-1 text-muted hover:text-fg cursor-pointer"
                       >
                         <RefreshCw
                           className={`h-3 w-3 ${tsLoading ? "animate-spin" : ""}`}
@@ -503,29 +482,29 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                       </button>
                     </div>
                     {tsStatus.tailscaleIp && (
-                      <p className="text-[#9CA3AF]">
+                      <p className="text-muted">
                         Tailscale IP:{" "}
-                        <code className="font-mono text-[#F4F5F7]">
+                        <code className="font-mono text-fg">
                           {tsStatus.tailscaleIp}
                         </code>
                       </p>
                     )}
                     {tsStatus.dnsName && (
-                      <p className="text-[#9CA3AF]">
+                      <p className="text-muted">
                         MagicDNS address:{" "}
-                        <code className="font-mono text-emerald-300">
+                        <code className="font-mono text-fg">
                           {tsStatus.dnsName}
                         </code>
                       </p>
                     )}
                     {!tsStatus.httpsCertsAvailable && (
-                      <div className="rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-amber-200">
+                      <div className="rounded-md border border-warn-line bg-warn-soft px-3 py-2 text-warn">
                         Enable MagicDNS and HTTPS Certificates in{" "}
                         <a
                           href="https://login.tailscale.com/admin/dns"
                           target="_blank"
                           rel="noreferrer"
-                          className="underline font-medium text-amber-100"
+                          className="underline font-medium text-warn"
                         >
                           Tailscale DNS settings
                         </a>{" "}
@@ -533,27 +512,27 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                       </div>
                     )}
                     {tsConflict && (
-                      <div className="rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2.5 text-amber-200 space-y-2">
+                      <div className="rounded-md border border-warn-line bg-warn-soft px-3 py-2.5 text-warn space-y-2">
                         <p>{tsConflict.headline}</p>
                         <ul className="space-y-1.5">
                           {tsConflict.effects.map((effect) => (
                             <li
                               key={`${effect.kind}:${effect.routes}`}
-                              className="rounded border border-amber-500/20 bg-black/20 px-2.5 py-1.5 space-y-0.5"
+                              className="rounded border border-warn-line bg-well px-2.5 py-1.5 space-y-0.5"
                             >
-                              <div className="font-semibold text-amber-100">
+                              <div className="font-medium text-warn">
                                 {effect.label}
                               </div>
-                              <div className="font-mono text-[11px] text-amber-50 break-all">
+                              <div className="font-mono text-[11px] text-warn break-all">
                                 {effect.routes}
                               </div>
-                              <div className="text-[11px] text-amber-200/90">
+                              <div className="text-[11px] text-warn">
                                 {effect.explanation}
                               </div>
                             </li>
                           ))}
                         </ul>
-                        <p className="text-[11px] text-amber-100/90">
+                        <p className="text-[11px] text-warn">
                           Setup leaves your existing port 443 routes untouched.
                           Move those services and click Refresh, or continue to
                           the dashboard and confirm the exact changes in AI Keys
@@ -564,7 +543,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                   </div>
                 ) : tsStatus?.installed ? (
                   <div className="surface-well rounded-lg p-4 space-y-3 text-xs">
-                    <p className="text-[#D1D5DB]">
+                    <p className="text-fg-2">
                       Tailscale is installed on this server. Sign in to connect
                       it to your tailnet, then turn on private HTTPS.
                     </p>
@@ -573,7 +552,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                         href={tsLoginUrl}
                         target="_blank"
                         rel="noreferrer"
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 px-3 py-2 font-medium text-emerald-200 hover:bg-emerald-500/25"
+                        className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-line-strong px-3 py-2 font-medium text-fg hover:bg-fill"
                       >
                         <span>Open Tailscale sign-in</span>
                         <ExternalLink className="h-3.5 w-3.5" />
@@ -584,7 +563,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                         type="button"
                         disabled={busy}
                         onClick={() => void handleTailscaleConnect()}
-                        className="btn-press rounded-lg bg-[#F4F5F7] px-3 py-1.5 text-xs font-semibold text-[#090A0C] hover:bg-white disabled:opacity-50 cursor-pointer"
+                        className="btn-press rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 cursor-pointer"
                       >
                         {busy ? "Starting..." : "Sign in to Tailscale"}
                       </button>
@@ -592,7 +571,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                         type="button"
                         disabled={tsLoading}
                         onClick={() => void refreshTailscaleStatus()}
-                        className="btn-press inline-flex items-center gap-1 rounded-lg border border-white/[0.1] bg-[#111317] px-3 py-1.5 text-xs font-medium text-[#D1D5DB] hover:text-white cursor-pointer"
+                        className="btn-press inline-flex items-center gap-1 rounded-lg border border-line-strong bg-surface px-3 py-1.5 text-xs font-medium text-fg-2 hover:text-fg cursor-pointer"
                       >
                         <RefreshCw
                           className={`h-3 w-3 ${tsLoading ? "animate-spin" : ""}`}
@@ -603,22 +582,22 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                   </div>
                 ) : (
                   <div className="surface-well rounded-lg p-4 space-y-3 text-xs">
-                    <p className="text-[#D1D5DB]">
+                    <p className="text-fg-2">
                       Tailscale isn&apos;t installed on this server yet. Run
                       this command on your server, or skip for now and enable it
-                      anytime in AI Keys &amp; Settings:
+                      anytime in Settings:
                     </p>
                     <div className="flex items-center gap-2">
-                      <code className="flex-1 overflow-x-auto rounded-md bg-[#090A0C] border border-white/[0.08] px-3 py-2 font-mono text-[11px] text-emerald-300">
+                      <code className="flex-1 overflow-x-auto rounded-md bg-canvas border border-line px-3 py-2 font-mono text-[11px] text-fg-2">
                         {TAILSCALE_INSTALL_CMD}
                       </code>
                       <button
                         type="button"
                         onClick={() => void copyInstallCmd()}
-                        className="btn-press inline-flex items-center gap-1 rounded-md border border-white/[0.1] bg-[#111317] px-2.5 py-2 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] cursor-pointer shrink-0"
+                        className="btn-press inline-flex items-center gap-1 rounded-md border border-line-strong bg-surface px-2.5 py-2 text-xs font-medium text-fg hover:bg-surface-2 cursor-pointer shrink-0"
                       >
                         {tsCopied ? (
-                          <Check className="h-3.5 w-3.5 text-emerald-400" />
+                          <Check className="h-3.5 w-3.5 text-ok" />
                         ) : (
                           <Copy className="h-3.5 w-3.5" />
                         )}
@@ -629,7 +608,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                       type="button"
                       disabled={tsLoading}
                       onClick={() => void refreshTailscaleStatus()}
-                      className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#111317] px-3 py-1.5 text-xs font-medium text-[#D1D5DB] hover:text-white cursor-pointer"
+                      className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-line-strong bg-surface px-3 py-1.5 text-xs font-medium text-fg-2 hover:text-fg cursor-pointer"
                     >
                       <RefreshCw
                         className={`h-3 w-3 ${tsLoading ? "animate-spin" : ""}`}
@@ -640,7 +619,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                 )}
 
                 {error && (
-                  <div className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-3.5 py-2.5 text-xs text-rose-200">
+                  <div className="rounded-lg border border-line-strong px-3.5 py-2.5 text-xs text-muted hover:text-bad">
                     {error}
                   </div>
                 )}
@@ -651,7 +630,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                       type="button"
                       disabled={busy}
                       onClick={() => void onAuthenticated()}
-                      className="btn-press flex-1 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+                      className="btn-press flex-1 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 cursor-pointer"
                     >
                       Continue to dashboard
                     </button>
@@ -660,7 +639,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                       type="button"
                       disabled={busy}
                       onClick={() => handleDomainSave(true)}
-                      className="btn-press flex-1 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+                      className="btn-press flex-1 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 cursor-pointer"
                     >
                       Continue to dashboard
                     </button>
@@ -670,7 +649,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                         type="button"
                         disabled={busy}
                         onClick={() => void handleEnableTailscaleAndFinish()}
-                        className="btn-press flex-1 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+                        className="btn-press flex-1 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-on-primary hover:bg-primary-hover disabled:opacity-50 cursor-pointer"
                       >
                         {busy ? "Enabling..." : "Enable private HTTPS & finish"}
                       </button>
@@ -678,7 +657,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                         type="button"
                         disabled={busy}
                         onClick={() => handleDomainSave(true)}
-                        className="btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-4 py-2.5 text-sm font-medium text-[#9CA3AF] hover:text-white hover:bg-[#161920] cursor-pointer"
+                        className="btn-press rounded-lg border border-line-strong bg-surface px-4 py-2.5 text-sm font-medium text-muted hover:text-fg hover:bg-surface-2 cursor-pointer"
                       >
                         Skip for now
                       </button>
@@ -688,7 +667,7 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                       type="button"
                       disabled={busy}
                       onClick={() => handleDomainSave(true)}
-                      className="btn-press flex-1 rounded-lg border border-white/[0.1] bg-[#111317] px-4 py-2.5 text-sm font-medium text-[#9CA3AF] hover:text-white hover:bg-[#161920] cursor-pointer"
+                      className="btn-press flex-1 rounded-lg border border-line-strong bg-surface px-4 py-2.5 text-sm font-medium text-muted hover:text-fg hover:bg-surface-2 cursor-pointer"
                     >
                       Skip for now
                     </button>
