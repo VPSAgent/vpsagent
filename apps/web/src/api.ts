@@ -20,6 +20,13 @@ export type TailscaleBackendState =
   | "running"
   | "unknown";
 
+export interface TailscaleServeConflictDetails {
+  funnelActive: boolean;
+  preservedFunnelSiblings: string[];
+  replacedRootRoute: string | null;
+  removedMcpRoute: string | null;
+}
+
 export interface TailscaleStatus {
   installed: boolean;
   serviceActive: boolean;
@@ -38,6 +45,7 @@ export interface TailscaleStatus {
   serveUrl: string | null;
   mcpUrl: string | null;
   serveConflict: string | null;
+  serveConflictDetails: TailscaleServeConflictDetails | null;
   cliVersion: string | null;
   detail: string | null;
 }

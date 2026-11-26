@@ -433,6 +433,16 @@ export const TailscaleBackendStateSchema = z.enum([
 ]);
 export type TailscaleBackendState = z.infer<typeof TailscaleBackendStateSchema>;
 
+export const RuntimeTailscaleServeConflictDetailsSchema = z.object({
+  funnelActive: z.boolean().default(false),
+  preservedFunnelSiblings: z.array(z.string()).default([]),
+  replacedRootRoute: z.string().nullable().default(null),
+  removedMcpRoute: z.string().nullable().default(null),
+});
+export type RuntimeTailscaleServeConflictDetails = z.infer<
+  typeof RuntimeTailscaleServeConflictDetailsSchema
+>;
+
 export const RuntimeTailscaleStatusSchema = z.object({
   installed: z.boolean(),
   serviceActive: z.boolean(),
@@ -451,6 +461,7 @@ export const RuntimeTailscaleStatusSchema = z.object({
   serveUrl: z.string().nullable().default(null),
   mcpUrl: z.string().nullable().default(null),
   serveConflict: z.string().nullable().default(null),
+  serveConflictDetails: RuntimeTailscaleServeConflictDetailsSchema.nullable().default(null),
   cliVersion: z.string().nullable().default(null),
   detail: z.string().nullable().default(null),
 });
@@ -1380,6 +1391,24 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
   ): RuntimeTailscaleStatus {
     return {
       ...parsed,
+      serveConflict: parsed.serveConflict
+        ? redactSecrets(parsed.serveConflict)
+        : null,
+      serveConflictDetails: parsed.serveConflictDetails
+        ? {
+            funnelActive: parsed.serveConflictDetails.funnelActive,
+            preservedFunnelSiblings:
+              parsed.serveConflictDetails.preservedFunnelSiblings.map((item) =>
+                redactSecrets(item),
+              ),
+            replacedRootRoute: parsed.serveConflictDetails.replacedRootRoute
+              ? redactSecrets(parsed.serveConflictDetails.replacedRootRoute)
+              : null,
+            removedMcpRoute: parsed.serveConflictDetails.removedMcpRoute
+              ? redactSecrets(parsed.serveConflictDetails.removedMcpRoute)
+              : null,
+          }
+        : null,
       detail: parsed.detail ? redactSecrets(parsed.detail) : null,
     };
   }

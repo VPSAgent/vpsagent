@@ -747,6 +747,88 @@ print_ready_banner
             self.assertNotIn(secret_part, proc.stdout)
             self.assertNotIn(secret_part, proc.stderr)
 
+    def test_tailscale_install_funnel_with_sibling_and_conflicting_mcp(
+        self,
+    ) -> None:
+        bin_dir = Path(self.tmp) / "bin-funnel-sibling-mcp"
+        bin_dir.mkdir()
+        ts_calls = Path(self.tmp) / "funnel-sibling-mcp-calls.log"
+        vpsagent_root = Path(self.tmp) / "var-lib-vpsagent-funnel-sibling-mcp"
+        vpsagent_root.mkdir(parents=True)
+
+        (bin_dir / "tailscale").write_text(
+            f"""#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+with open({str(ts_calls)!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+if args == ["status", "--json"]:
+    print(json.dumps({{
+        "BackendState": "Running",
+        "Self": {{"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]}},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }}))
+    sys.exit(0)
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({{
+        "Web": {{
+            "vps-node.tail99.ts.net:443": {{
+                "Handlers": {{
+                    "/status": {{"Proxy": "http://127.0.0.1:8080/status"}},
+                    "/mcp": {{"Proxy": "http://bob:pw999@127.0.0.1:9000/mcp?key=hideme"}},
+                }}
+            }}
+        }},
+        "AllowFunnel": {{"vps-node.tail99.ts.net:443": True}},
+    }}))
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_dir / "tailscale", 0o755)
+        proc = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+set -euo pipefail
+export PATH="{bin_dir}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+CLAIM_TOKEN="claim_ts_funnel_sib_mcp"
+PUBLIC_IP="203.0.113.10"
+configure_tailscale
+print_ready_banner
+""",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        calls_text = ts_calls.read_text(encoding="utf-8")
+        self.assertNotIn("serve --bg --https=443", calls_text)
+        self.assertIn(
+            "public Funnel sibling routes (/status -> http://127.0.0.1:8080/status)",
+            proc.stdout,
+        )
+        self.assertIn(
+            "removed /mcp route (/mcp -> http://[REDACTED]@127.0.0.1:9000/mcp)",
+            proc.stdout,
+        )
+        self.assertIn("even inside your tailnet", proc.stdout)
+        self.assertNotIn(
+            "https://vps-node.tail99.ts.net/#claim=claim_ts_funnel_sib_mcp",
+            proc.stdout,
+        )
+        self.assertIn("http://localhost:3002/#claim=claim_ts_funnel_sib_mcp", proc.stdout)
+        for secret_part in ("bob", "pw999", "hideme"):
+            self.assertNotIn(secret_part, proc.stdout)
+            self.assertNotIn(secret_part, proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

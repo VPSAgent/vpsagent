@@ -582,14 +582,21 @@ if raw_serve.strip():
                 if summary not in funnel_siblings:
                     funnel_siblings.append(summary)
 
+        root_display = (
+            f"/ ({other_proxy})"
+            if other_proxy.startswith("existing handler on ")
+            else (f"/ -> {other_proxy}" if other_proxy else "")
+        )
         if funnel_active and funnel_siblings:
-            affected = []
-            if other_proxy:
-                affected.append(f"/ -> {other_proxy}")
+            parts = [f"public Funnel sibling routes ({', '.join(funnel_siblings)})"]
+            if root_display:
+                parts.append(f"replaced root route ({root_display})")
             if mcp_conflict:
-                affected.append(mcp_conflict)
-            affected.extend(funnel_siblings)
-            serve_conflict = f"public Funnel sibling routes ({', '.join(affected)})"
+                parts.append(f"removed /mcp route ({mcp_conflict})")
+            serve_conflict = "; ".join(parts)
+            serve_url = ""
+        elif other_proxy and mcp_conflict:
+            serve_conflict = f"{root_display}; {mcp_conflict}"
             serve_url = ""
         elif mcp_conflict:
             serve_conflict = mcp_conflict
@@ -651,10 +658,18 @@ configure_tailscale() {
   if [[ "${TAILSCALE_BACKEND_STATE}" == "Running" && -n "${TAILSCALE_DNS_NAME}" ]]; then
     if [[ -n "${TAILSCALE_SERVE_CONFLICT}" ]]; then
       if [[ "${TAILSCALE_SERVE_CONFLICT}" == "public Funnel sibling routes"* ]]; then
-        log "Warning: Port 443 is currently open to the public internet via Tailscale Funnel with ${TAILSCALE_SERVE_CONFLICT}. Turning on private Tailscale HTTPS would disable public Funnel for the entire port 443 listener and cut off public access to those services. Leaving your existing Funnel setup untouched; move those services to another port or confirm the switch in AI Keys & Settings -> Tailscale private access."
+        if [[ "${TAILSCALE_SERVE_CONFLICT}" == *"; replaced root route "* || "${TAILSCALE_SERVE_CONFLICT}" == *"; removed /mcp route "* ]]; then
+          log "Warning: Port 443 is currently open to the public internet via Tailscale Funnel (${TAILSCALE_SERVE_CONFLICT}). Turning on private Tailscale HTTPS would disable public Funnel across port 443 (making sibling routes tailnet-only) and replace/remove the conflicting / or /mcp route(s) even inside your tailnet. Leaving your existing routes untouched; move those services or confirm the exact changes in AI Keys & Settings -> Tailscale private access."
+        else
+          log "Warning: Port 443 is currently open to the public internet via Tailscale Funnel with ${TAILSCALE_SERVE_CONFLICT}. Turning on private Tailscale HTTPS would disable public Funnel for the entire port 443 listener and cut off public access to those services. Leaving your existing Funnel setup untouched; move those services to another port or confirm the switch in AI Keys & Settings -> Tailscale private access."
+        fi
         return
       fi
-      log "Warning: Tailscale Serve port 443 is already forwarding to ${TAILSCALE_SERVE_CONFLICT}. Keeping your existing route; open AI Keys & Settings -> Tailscale private access if you want to replace it."
+      if [[ "${TAILSCALE_FUNNEL_ACTIVE}" == "true" ]]; then
+        log "Warning: Port 443 is currently open to the public internet via Tailscale Funnel with conflicting route(s) (${TAILSCALE_SERVE_CONFLICT}) that would be replaced/removed even inside your tailnet. Keeping your existing routes untouched; confirm the switch in AI Keys & Settings -> Tailscale private access."
+        return
+      fi
+      log "Warning: Tailscale Serve port 443 is already forwarding to ${TAILSCALE_SERVE_CONFLICT}. Keeping your existing route; open AI Keys & Settings -> Tailscale private access if you want to replace or remove it."
       return
     fi
     if [[ -n "${TAILSCALE_SERVE_URL}" && "${TAILSCALE_FUNNEL_ACTIVE}" != "true" ]]; then

@@ -4217,6 +4217,18 @@ sys.exit(0)
             "/status -> http://[REDACTED]@127.0.0.1:8080/health",
             sib_status["serveConflict"] or "",
         )
+        self.assertEqual(
+            sib_status["serveConflictDetails"],
+            {
+                "funnelActive": True,
+                "preservedFunnelSiblings": [
+                    "/status -> http://[REDACTED]@127.0.0.1:8080/health"
+                ],
+                "replacedRootRoute": None,
+                "removedMcpRoute": None,
+            },
+        )
+        self.assertIn("tailnet only", sib_status["detail"] or "")
         for leaked in ("bot", "secret99", "leakme"):
             self.assertNotIn(leaked, str(sib_status))
 
@@ -4236,6 +4248,155 @@ sys.exit(0)
         self.assertTrue(sib_forced["ok"])
         self.assertTrue(sib_forced["status"]["serveEnabled"])
         self.assertIsNone(sib_forced["status"]["serveConflict"])
+        self.assertIsNone(sib_forced["status"]["serveConflictDetails"])
+
+        # Public Funnel + preserved sibling /status + conflicting /mcp must separate
+        # preserved sibling from removed /mcp route, keep secrets redacted, and preserve /status on force=True
+        ts_funnel_mcp, sys_funnel_mcp, calls_funnel_mcp, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_cmd_rc=0,
+            serve_cmd_stderr="Disabled Funnel on port 443; serving privately to your tailnet.\n",
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:3001"},
+                                "/status": {"Proxy": "http://127.0.0.1:8080/health"},
+                                "/mcp": {
+                                    "Proxy": "http://mcpbot:mcpsecret@127.0.0.1:9000/mcp?tok=mcpquery"
+                                },
+                            }
+                        }
+                    },
+                    "AllowFunnel": {"my-vps.tail42.ts.net:443": True},
+                }
+            ),
+        )
+        svc_funnel_mcp = self._service(
+            tailscale_bin=ts_funnel_mcp, systemctl_bin=sys_funnel_mcp
+        )
+        fm_status = svc_funnel_mcp.tailscale_status()
+        self.assertFalse(fm_status["serveEnabled"])
+        self.assertIn(
+            "public Funnel sibling routes (/status -> http://127.0.0.1:8080/health)",
+            fm_status["serveConflict"] or "",
+        )
+        self.assertIn(
+            "removed /mcp route (/mcp -> http://[REDACTED]@127.0.0.1:9000/mcp)",
+            fm_status["serveConflict"] or "",
+        )
+        self.assertEqual(
+            fm_status["serveConflictDetails"],
+            {
+                "funnelActive": True,
+                "preservedFunnelSiblings": [
+                    "/status -> http://127.0.0.1:8080/health"
+                ],
+                "replacedRootRoute": None,
+                "removedMcpRoute": "/mcp -> http://[REDACTED]@127.0.0.1:9000/mcp",
+            },
+        )
+        self.assertIn("tailnet only", fm_status["detail"] or "")
+        self.assertIn("will be removed", fm_status["detail"] or "")
+        self.assertIn("even inside your tailnet", fm_status["detail"] or "")
+        for leaked in ("mcpbot", "mcpsecret", "mcpquery"):
+            self.assertNotIn(leaked, str(fm_status))
+
+        with self.assertRaises(rb.BridgeRequestError) as cm_fm_409:
+            svc_funnel_mcp.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_fm_409.exception.status_code, 409)
+        self.assertIn("tailnet only", str(cm_fm_409.exception))
+        self.assertIn("will be removed", str(cm_fm_409.exception))
+        self.assertIn("even inside your tailnet", str(cm_fm_409.exception))
+        for leaked in ("mcpbot", "mcpsecret", "mcpquery"):
+            self.assertNotIn(leaked, str(cm_fm_409.exception))
+        fm_calls_before = [
+            json.loads(line)
+            for line in Path(calls_funnel_mcp).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertFalse(any(c[:2] == ["serve", "--bg"] for c in fm_calls_before))
+        self.assertNotIn(
+            ["serve", "--https=443", "--set-path=/mcp", "off"], fm_calls_before
+        )
+
+        fm_forced = svc_funnel_mcp.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertTrue(fm_forced["ok"])
+        self.assertTrue(fm_forced["status"]["serveEnabled"])
+        self.assertIsNone(fm_forced["status"]["serveConflict"])
+        self.assertIsNone(fm_forced["status"]["serveConflictDetails"])
+        fm_state = json.loads(
+            (Path(calls_funnel_mcp).parent / "ts-serve-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fm_handlers = fm_state["Web"]["my-vps.tail42.ts.net:443"]["Handlers"]
+        self.assertEqual(fm_handlers["/"], {"Proxy": "http://127.0.0.1:3001"})
+        self.assertEqual(
+            fm_handlers["/status"], {"Proxy": "http://127.0.0.1:8080/health"}
+        )
+        self.assertNotIn("/mcp", fm_handlers)
+        self.assertFalse(fm_state["AllowFunnel"]["my-vps.tail42.ts.net:443"])
+
+        # Public Funnel + preserved sibling + conflicting / + conflicting /mcp
+        ts_funnel_all, sys_funnel_all, calls_funnel_all, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_cmd_rc=0,
+            serve_cmd_stderr="Disabled Funnel on port 443; serving privately to your tailnet.\n",
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:9000"},
+                                "/status": {"Proxy": "http://127.0.0.1:8080/health"},
+                                "/mcp": {"Proxy": "http://127.0.0.1:9001/mcp"},
+                            }
+                        }
+                    },
+                    "AllowFunnel": {"my-vps.tail42.ts.net:443": True},
+                }
+            ),
+        )
+        svc_funnel_all = self._service(
+            tailscale_bin=ts_funnel_all, systemctl_bin=sys_funnel_all
+        )
+        fa_status = svc_funnel_all.tailscale_status()
+        self.assertEqual(
+            fa_status["serveConflictDetails"],
+            {
+                "funnelActive": True,
+                "preservedFunnelSiblings": [
+                    "/status -> http://127.0.0.1:8080/health"
+                ],
+                "replacedRootRoute": "/ -> http://127.0.0.1:9000",
+                "removedMcpRoute": "/mcp -> http://127.0.0.1:9001/mcp",
+            },
+        )
+        self.assertIn("will be replaced by VPSAgent", fa_status["detail"] or "")
+        self.assertIn("will be removed", fa_status["detail"] or "")
+        with self.assertRaises(rb.BridgeRequestError) as cm_fa_409:
+            svc_funnel_all.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_fa_409.exception.status_code, 409)
+        self.assertIn("will be replaced by VPSAgent", str(cm_fa_409.exception))
+        self.assertIn("will be removed", str(cm_fa_409.exception))
+
+        fa_forced = svc_funnel_all.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertTrue(fa_forced["ok"])
+        self.assertTrue(fa_forced["status"]["serveEnabled"])
+        fa_state = json.loads(
+            (Path(calls_funnel_all).parent / "ts-serve-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fa_handlers = fa_state["Web"]["my-vps.tail42.ts.net:443"]["Handlers"]
+        self.assertEqual(fa_handlers["/"], {"Proxy": "http://127.0.0.1:3001"})
+        self.assertEqual(
+            fa_handlers["/status"], {"Proxy": "http://127.0.0.1:8080/health"}
+        )
+        self.assertNotIn("/mcp", fa_handlers)
 
         # If Funnel stays active after serve command, fail closed with 422
         ts_stuck, sys_stuck, _, _ = self._make_fake_tailscale(

@@ -36,6 +36,7 @@ function createTailscaleMockBridge(options?: {
     serveUrl: null,
     mcpUrl: null,
     serveConflict: null,
+    serveConflictDetails: null,
     cliVersion: "1.78.1",
     detail: null,
   };
@@ -644,6 +645,7 @@ describe("Tailscale API, MCP Gateway, CSRF & Fallback", () => {
         serveUrl: "https://my-vps.tail1234.ts.net",
         mcpUrl: "https://my-vps.tail1234.ts.net/mcp",
         serveConflict: null,
+        serveConflictDetails: null,
         cliVersion: "1.78.1",
         detail: null,
       },

@@ -12,6 +12,7 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { api, type SessionInfo, type TailscaleStatus } from "../api";
+import { describeTailscaleConflict } from "../tailscale-conflict";
 
 interface SetupAndAuthProps {
   session: SessionInfo;
@@ -206,11 +207,11 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
     }
   };
 
-  const handleEnableTailscaleAndFinish = async (force = false) => {
+  const handleEnableTailscaleAndFinish = async () => {
     setError(null);
     setBusy(true);
     try {
-      const res = await api.setTailscaleServe(true, force);
+      const res = await api.setTailscaleServe(true, false);
       setTsStatus(res.status);
       await onAuthenticated();
     } catch (err) {
@@ -219,10 +220,13 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
           ? err.message
           : "Could not enable Tailscale private HTTPS.",
       );
+      void refreshTailscaleStatus();
     } finally {
       setBusy(false);
     }
   };
+
+  const tsConflict = tsStatus ? describeTailscaleConflict(tsStatus) : null;
 
   const copyInstallCmd = async () => {
     await navigator.clipboard.writeText(TAILSCALE_INSTALL_CMD);
@@ -528,29 +532,33 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                         before turning on private HTTPS.
                       </div>
                     )}
-                    {tsStatus.serveConflict && (
-                      <div className="rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-amber-200">
-                        {tsStatus.serveConflict.startsWith(
-                          "public Funnel sibling routes",
-                        ) ? (
-                          <>
-                            Port 443 shares public Tailscale Funnel with{" "}
-                            <code className="font-mono">
-                              {tsStatus.serveConflict}
-                            </code>
-                            . Switching makes the entire port private; move
-                            those services to another port first or confirm in AI
-                            Keys &amp; Settings.
-                          </>
-                        ) : (
-                          <>
-                            Port 443 is currently forwarding to{" "}
-                            <code className="font-mono">
-                              {tsStatus.serveConflict}
-                            </code>
-                            .
-                          </>
-                        )}
+                    {tsConflict && (
+                      <div className="rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2.5 text-amber-200 space-y-2">
+                        <p>{tsConflict.headline}</p>
+                        <ul className="space-y-1.5">
+                          {tsConflict.effects.map((effect) => (
+                            <li
+                              key={`${effect.kind}:${effect.routes}`}
+                              className="rounded border border-amber-500/20 bg-black/20 px-2.5 py-1.5 space-y-0.5"
+                            >
+                              <div className="font-semibold text-amber-100">
+                                {effect.label}
+                              </div>
+                              <div className="font-mono text-[11px] text-amber-50 break-all">
+                                {effect.routes}
+                              </div>
+                              <div className="text-[11px] text-amber-200/90">
+                                {effect.explanation}
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                        <p className="text-[11px] text-amber-100/90">
+                          Setup leaves your existing port 443 routes untouched.
+                          Move those services and click Refresh, or continue to
+                          the dashboard and confirm the exact changes in AI Keys
+                          &amp; Settings &rarr; Tailscale private access.
+                        </p>
                       </div>
                     )}
                   </div>
@@ -647,36 +655,44 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                     >
                       Continue to dashboard
                     </button>
-                  ) : tsStatus?.connected && tsStatus.dnsName ? (
+                  ) : tsStatus?.connected && tsStatus.serveConflict ? (
                     <button
                       type="button"
                       disabled={busy}
-                      onClick={() =>
-                        void handleEnableTailscaleAndFinish(
-                          Boolean(tsStatus.serveConflict),
-                        )
-                      }
+                      onClick={() => handleDomainSave(true)}
                       className="btn-press flex-1 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
                     >
-                      {busy
-                        ? "Enabling..."
-                        : tsStatus.serveConflict
-                          ? "Replace port 443 & finish"
-                          : "Enable private HTTPS & finish"}
+                      Continue to dashboard
                     </button>
-                  ) : null}
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => handleDomainSave(true)}
-                    className={`btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-4 py-2.5 text-sm font-medium text-[#9CA3AF] hover:text-white hover:bg-[#161920] cursor-pointer ${
-                      !(tsStatus?.serveEnabled || (tsStatus?.connected && tsStatus.dnsName))
-                        ? "flex-1"
-                        : ""
-                    }`}
-                  >
-                    Skip for now
-                  </button>
+                  ) : tsStatus?.connected && tsStatus.dnsName ? (
+                    <>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void handleEnableTailscaleAndFinish()}
+                        className="btn-press flex-1 rounded-lg bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+                      >
+                        {busy ? "Enabling..." : "Enable private HTTPS & finish"}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => handleDomainSave(true)}
+                        className="btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-4 py-2.5 text-sm font-medium text-[#9CA3AF] hover:text-white hover:bg-[#161920] cursor-pointer"
+                      >
+                        Skip for now
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => handleDomainSave(true)}
+                      className="btn-press flex-1 rounded-lg border border-white/[0.1] bg-[#111317] px-4 py-2.5 text-sm font-medium text-[#9CA3AF] hover:text-white hover:bg-[#161920] cursor-pointer"
+                    >
+                      Skip for now
+                    </button>
+                  )}
                 </div>
               </div>
             )}

@@ -1286,6 +1286,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     serveUrl: null,
     mcpUrl: null,
     serveConflict: null,
+    serveConflictDetails: null,
     cliVersion: null,
     detail: unavailableTailscaleDetail,
   };

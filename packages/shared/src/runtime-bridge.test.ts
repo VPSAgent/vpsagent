@@ -14,6 +14,7 @@ import {
   HttpRuntimeBridgeClient,
   RuntimeBridgeError,
   RuntimeCoreUpdateStatusSchema,
+  RuntimeTailscaleStatusSchema,
   createRuntimeBridgeFromEnv,
   syncAppStatuses,
 } from "./runtime-bridge.js";
@@ -857,6 +858,19 @@ sys.exit(0)
       expect(disabled.ok).toBe(true);
       expect(disabled.status.serveEnabled).toBe(false);
       expect(disabled.status.mcpUrl).toBeNull();
+      expect(disabled.status.serveConflictDetails).toBeNull();
+
+      const legacyStatus = RuntimeTailscaleStatusSchema.parse({
+        installed: true,
+        serviceActive: true,
+        connected: true,
+        backendState: "running",
+        tailscaleIp: "100.64.0.42",
+        hostname: "my-vps",
+        dnsName: "my-vps.tail1234.ts.net",
+        tailnetName: "tail1234.ts.net",
+      });
+      expect(legacyStatus.serveConflictDetails).toBeNull();
     } finally {
       await daemon.close();
       await new Promise<void>((resolve) => targetServer.close(() => resolve()));
@@ -948,6 +962,63 @@ sys.exit(0)
       const applied = await client.applyCoreUpdate({ source: "release" });
       expect(applied.started).toBe(true);
       expect(seenApplyBody).toBe(JSON.stringify({ source: "release" }));
+    } finally {
+      await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+    }
+  });
+
+  it("parses and redacts Tailscale serveConflictDetails", async () => {
+    const mockServer = http.createServer((req, res) => {
+      if (req.url === "/v1/host/tailscale/status") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            installed: true,
+            serviceActive: true,
+            connected: true,
+            backendState: "running",
+            tailscaleIp: "100.64.0.42",
+            hostname: "my-vps",
+            dnsName: "my-vps.tail1234.ts.net",
+            tailnetName: "tail1234.ts.net",
+            serveConflict:
+              "public Funnel sibling routes (/status -> http://user:vpsmcp_secret123456@127.0.0.1:8080); removed /mcp route (/mcp -> http://tok:sk-secret1234567890abcd@127.0.0.1:9000)",
+            serveConflictDetails: {
+              funnelActive: true,
+              preservedFunnelSiblings: [
+                "/status -> http://user:vpsmcp_secret123456@127.0.0.1:8080",
+              ],
+              replacedRootRoute: null,
+              removedMcpRoute:
+                "/mcp -> http://tok:sk-secret1234567890abcd@127.0.0.1:9000",
+            },
+          }),
+        );
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) =>
+      mockServer.listen(0, "127.0.0.1", () => resolve()),
+    );
+    const port = (mockServer.address() as AddressInfo).port;
+    try {
+      const client = new HttpRuntimeBridgeClient({
+        baseUrl: `http://127.0.0.1:${port}`,
+      });
+      const ts = await client.getTailscaleStatus();
+      expect(ts.serveConflictDetails).not.toBeNull();
+      expect(ts.serveConflictDetails?.funnelActive).toBe(true);
+      expect(ts.serveConflictDetails?.preservedFunnelSiblings[0]).not.toContain(
+        "vpsmcp_secret123456",
+      );
+      expect(ts.serveConflictDetails?.removedMcpRoute).not.toContain(
+        "sk-secret1234567890abcd",
+      );
+      expect(ts.serveConflict).not.toContain("vpsmcp_secret123456");
+      expect(ts.serveConflict).not.toContain("sk-secret1234567890abcd");
     } finally {
       await new Promise<void>((resolve) => mockServer.close(() => resolve()));
     }

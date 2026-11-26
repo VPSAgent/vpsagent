@@ -30,6 +30,7 @@ import {
   type SystemUpdateStatus,
   type TailscaleStatus,
 } from "../api";
+import { describeTailscaleConflict } from "../tailscale-conflict";
 
 const TAILSCALE_INSTALL_CMD =
   "curl -fsSL https://tailscale.com/install.sh | sudo sh && sudo tailscale up";
@@ -328,10 +329,15 @@ export function KeysSettingsTab({
           ? err.message
           : "Could not update Tailscale private HTTPS.",
       );
+      void loadTailscaleStatus();
     } finally {
       setTailscaleBusy(false);
     }
   };
+
+  const tailscaleConflict = tailscaleStatus
+    ? describeTailscaleConflict(tailscaleStatus)
+    : null;
 
   useEffect(() => {
     if (updateStatus?.state !== "updating") {
@@ -1479,25 +1485,16 @@ export function KeysSettingsTab({
                 >
                   {tailscaleBusy ? "Updating..." : "Disable private HTTPS"}
                 </button>
-              ) : (
+              ) : !tailscaleStatus.serveConflict ? (
                 <button
                   type="button"
                   disabled={tailscaleBusy || !tailscaleStatus.dnsName}
-                  onClick={() =>
-                    void handleToggleTailscaleServe(
-                      true,
-                      Boolean(tailscaleStatus.serveConflict),
-                    )
-                  }
+                  onClick={() => void handleToggleTailscaleServe(true, false)}
                   className="btn-press rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
                 >
-                  {tailscaleBusy
-                    ? "Enabling..."
-                    : tailscaleStatus.serveConflict
-                      ? "Replace port 443 route"
-                      : "Enable private HTTPS"}
+                  {tailscaleBusy ? "Enabling..." : "Enable private HTTPS"}
                 </button>
-              ))}
+              ) : null)}
             {tailscaleBridgeSupported &&
               tailscaleStatus?.installed &&
               !tailscaleStatus.connected && (
@@ -1762,45 +1759,39 @@ export function KeysSettingsTab({
               </div>
             )}
 
-            {tailscaleStatus.serveConflict && (
-              <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
-                <span>
-                  {tailscaleStatus.serveConflict.startsWith(
-                    "public Funnel sibling routes",
-                  ) ? (
-                    <>
-                      Port 443 is currently open to the public internet via{" "}
-                      <strong className="font-semibold">Tailscale Funnel</strong>{" "}
-                      with{" "}
-                      <code className="font-mono text-amber-100">
-                        {tailscaleStatus.serveConflict}
-                      </code>
-                      . Turning on private HTTPS disables public Funnel across the
-                      entire port 443 listener, which stops public internet access
-                      to those routes until you move them to another port.
-                    </>
-                  ) : (
-                    <>
-                      Tailscale Serve port 443 is currently forwarding to{" "}
-                      <code className="font-mono text-amber-100">
-                        {tailscaleStatus.serveConflict}
-                      </code>
-                      . Replace it to route private HTTPS to VPSAgent instead.
-                    </>
-                  )}
-                </span>
-                <button
-                  type="button"
-                  disabled={tailscaleBusy}
-                  onClick={() => void handleToggleTailscaleServe(true, true)}
-                  className="btn-press rounded-lg bg-amber-400 px-3 py-1.5 text-xs font-semibold text-[#1A1200] hover:bg-amber-300 disabled:opacity-50 cursor-pointer"
-                >
-                  {tailscaleStatus.serveConflict.startsWith(
-                    "public Funnel sibling routes",
-                  )
-                    ? "Make port 443 private anyway"
-                    : "Replace port 443 route with VPSAgent"}
-                </button>
+            {tailscaleConflict && tailscaleStatus && (
+              <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 space-y-3">
+                <p>{tailscaleConflict.headline}</p>
+                <ul className="space-y-2">
+                  {tailscaleConflict.effects.map((effect) => (
+                    <li
+                      key={`${effect.kind}:${effect.routes}`}
+                      className="rounded-md border border-amber-500/25 bg-black/20 px-3 py-2 space-y-0.5"
+                    >
+                      <div className="font-semibold text-amber-100">
+                        {effect.label}
+                      </div>
+                      <div className="font-mono text-[11px] text-amber-50 break-all">
+                        {effect.routes}
+                      </div>
+                      <div className="text-[11px] text-amber-200/90">
+                        {effect.explanation}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    disabled={tailscaleBusy || !tailscaleStatus.dnsName}
+                    onClick={() => void handleToggleTailscaleServe(true, true)}
+                    className="btn-press rounded-lg bg-amber-400 px-3 py-1.5 text-xs font-semibold text-[#1A1200] hover:bg-amber-300 disabled:opacity-50 cursor-pointer"
+                  >
+                    {tailscaleBusy
+                      ? "Updating..."
+                      : tailscaleConflict.confirmButtonLabel}
+                  </button>
+                </div>
               </div>
             )}
           </div>

@@ -5570,6 +5570,7 @@ class RuntimeService:
             "serve_enabled": False,
             "serve_target": None,
             "serve_conflict": None,
+            "serve_conflict_details": None,
             "root_matched": False,
             "mcp_conflict": None,
             "mcp_explicit_match": False,
@@ -5677,21 +5678,49 @@ class RuntimeService:
                 if summary not in funnel_siblings:
                     funnel_siblings.append(summary)
 
+        root_display = (
+            f"/ ({other_proxy})"
+            if other_proxy is not None and other_proxy.startswith("existing handler on ")
+            else (f"/ -> {other_proxy}" if other_proxy is not None else None)
+        )
+        serve_conflict_details: dict[str, Any] | None = None
         if funnel_active and funnel_siblings:
-            affected: list[str] = []
-            if other_proxy is not None:
-                affected.append(f"/ -> {other_proxy}")
+            parts = [f"public Funnel sibling routes ({', '.join(funnel_siblings)})"]
+            if root_display is not None:
+                parts.append(f"replaced root route ({root_display})")
             if mcp_conflict is not None:
-                affected.append(mcp_conflict)
-            affected.extend(funnel_siblings)
-            funnel_conflict = f"public Funnel sibling routes ({', '.join(affected)})"
+                parts.append(f"removed /mcp route ({mcp_conflict})")
+            funnel_conflict = "; ".join(parts)
             serve_enabled = False
             serve_target: str | None = funnel_conflict
             serve_conflict: str | None = funnel_conflict
+            serve_conflict_details = {
+                "funnelActive": True,
+                "preservedFunnelSiblings": list(funnel_siblings),
+                "replacedRootRoute": root_display,
+                "removedMcpRoute": mcp_conflict,
+            }
+        elif other_proxy is not None and mcp_conflict is not None:
+            both_conflict = f"{root_display}; {mcp_conflict}"
+            serve_enabled = False
+            serve_target = both_conflict
+            serve_conflict = both_conflict
+            serve_conflict_details = {
+                "funnelActive": funnel_active,
+                "preservedFunnelSiblings": [],
+                "replacedRootRoute": root_display,
+                "removedMcpRoute": mcp_conflict,
+            }
         elif mcp_conflict is not None:
             serve_enabled = False
             serve_target = mcp_conflict
             serve_conflict = mcp_conflict
+            serve_conflict_details = {
+                "funnelActive": funnel_active,
+                "preservedFunnelSiblings": [],
+                "replacedRootRoute": None,
+                "removedMcpRoute": mcp_conflict,
+            }
         elif root_matched:
             if funnel_active:
                 serve_enabled = False
@@ -5705,6 +5734,12 @@ class RuntimeService:
             serve_enabled = False
             serve_target = other_proxy
             serve_conflict = other_proxy
+            serve_conflict_details = {
+                "funnelActive": funnel_active,
+                "preservedFunnelSiblings": [],
+                "replacedRootRoute": root_display,
+                "removedMcpRoute": None,
+            }
         elif any_handler_key is not None:
             serve_enabled = False
             serve_target = f"tailscale-serve:{any_handler_key}"
@@ -5718,12 +5753,75 @@ class RuntimeService:
             "serve_enabled": serve_enabled,
             "serve_target": serve_target,
             "serve_conflict": serve_conflict,
+            "serve_conflict_details": serve_conflict_details,
             "root_matched": root_matched,
             "mcp_conflict": mcp_conflict,
             "mcp_explicit_match": mcp_explicit_match,
             "funnel_active": funnel_active,
             "funnel_siblings": funnel_siblings,
         }
+
+    def _format_tailscale_conflict_summary(
+        self,
+        serve_conflict: str,
+        conflict_details: dict[str, Any] | None,
+        *,
+        for_error: bool = False,
+    ) -> str:
+        if isinstance(conflict_details, dict):
+            funnel_active = bool(conflict_details.get("funnelActive"))
+            preserved = [
+                str(item)
+                for item in (conflict_details.get("preservedFunnelSiblings") or [])
+                if isinstance(item, str) and item.strip()
+            ]
+            replaced_root = conflict_details.get("replacedRootRoute")
+            removed_mcp = conflict_details.get("removedMcpRoute")
+            parts: list[str] = []
+            if funnel_active and preserved:
+                parts.append(
+                    "Port 443 is currently open to the public internet via Tailscale Funnel. "
+                    "Switching port 443 to private Tailscale HTTPS turns off public Funnel for the "
+                    "entire port 443 listener, keeping sibling routes ("
+                    + ", ".join(preserved)
+                    + ") available privately inside your tailnet only (stopping public internet access)."
+                )
+            elif funnel_active:
+                parts.append(
+                    "Port 443 is currently open to the public internet via Tailscale Funnel. "
+                    "Switching port 443 to private Tailscale HTTPS turns off public Funnel for the "
+                    "entire port 443 listener."
+                )
+            if isinstance(replaced_root, str) and replaced_root:
+                parts.append(
+                    f"The existing root route ({replaced_root}) will be replaced by VPSAgent, "
+                    "so that service will lose / access even inside your tailnet."
+                )
+            if isinstance(removed_mcp, str) and removed_mcp:
+                parts.append(
+                    f"The conflicting /mcp route ({removed_mcp}) will be removed so VPSAgent's /mcp works, "
+                    "so that service will lose /mcp access even inside your tailnet."
+                )
+            if parts:
+                if for_error:
+                    if funnel_active and preserved and not replaced_root and not removed_mcp:
+                        parts.append("Confirm to make port 443 private anyway.")
+                    elif funnel_active and (replaced_root or removed_mcp):
+                        parts.append(
+                            "Confirm to make port 443 private and apply these route changes."
+                        )
+                    else:
+                        parts.append(
+                            "Confirm to apply these port 443 route changes for VPSAgent."
+                        )
+                return " ".join(parts)
+
+        if for_error:
+            return (
+                f"Tailscale Serve port 443 is currently forwarding to {serve_conflict}. "
+                "Confirm replacement to switch port 443 to VPSAgent."
+            )
+        return f"Tailscale Serve port 443 is currently forwarding to {serve_conflict}."
 
     def _inspect_tailscale_serve(
         self, dns_name: str | None
@@ -5755,6 +5853,7 @@ class RuntimeService:
                 "serveUrl": None,
                 "mcpUrl": None,
                 "serveConflict": None,
+                "serveConflictDetails": None,
                 "cliVersion": None,
                 "detail": None,
             }
@@ -5820,6 +5919,7 @@ class RuntimeService:
                 "serveUrl": None,
                 "mcpUrl": None,
                 "serveConflict": None,
+                "serveConflictDetails": None,
                 "cliVersion": None,
                 "detail": combined_err
                 or "Tailscale background service (tailscaled) is not running yet.",
@@ -5919,9 +6019,11 @@ class RuntimeService:
             serve_enabled = bool(serve_details["serve_enabled"])
             serve_target = serve_details["serve_target"]
             serve_conflict = serve_details["serve_conflict"]
+            serve_conflict_details = serve_details["serve_conflict_details"]
             funnel_active = bool(serve_details["funnel_active"] and serve_details["root_matched"])
         else:
             serve_enabled, serve_target, serve_conflict = False, None, None
+            serve_conflict_details = None
             funnel_active = False
 
         serve_url = f"https://{dns_name}" if (serve_enabled and dns_name) else None
@@ -5941,14 +6043,11 @@ class RuntimeService:
                 "Enable MagicDNS and HTTPS Certificates in Tailscale DNS settings."
             )
         elif serve_conflict:
-            if str(serve_conflict).startswith("public Funnel sibling routes"):
-                detail = (
-                    f"Port 443 is currently open to the public internet via Tailscale Funnel with {serve_conflict}. "
-                    "Switching port 443 to private Tailscale HTTPS turns off public Funnel for the entire port 443 "
-                    "listener, making those routes tailnet-only unless you move them to another port."
-                )
-            else:
-                detail = f"Tailscale Serve port 443 is currently forwarding to {serve_conflict}."
+            detail = self._format_tailscale_conflict_summary(
+                str(serve_conflict),
+                serve_conflict_details,
+                for_error=False,
+            )
         elif connected and funnel_active:
             detail = (
                 "Public Tailscale Funnel is currently active on port 443. Enable private "
@@ -5973,6 +6072,7 @@ class RuntimeService:
             "serveUrl": serve_url,
             "mcpUrl": mcp_url,
             "serveConflict": serve_conflict,
+            "serveConflictDetails": serve_conflict_details,
             "cliVersion": cli_version,
             "detail": detail,
         }
@@ -6001,16 +6101,13 @@ class RuntimeService:
                         "MagicDNS hostname is not available yet. Enable MagicDNS and HTTPS Certificates at https://login.tailscale.com/admin/dns and refresh.",
                     )
                 if status["serveConflict"] and not force:
-                    if str(status["serveConflict"]).startswith(
-                        "public Funnel sibling routes"
-                    ):
-                        raise BridgeRequestError(
-                            409,
-                            f'Port 443 is currently open to the public internet via Tailscale Funnel with {status["serveConflict"]}. Enabling private Tailscale HTTPS turns off public Funnel for the entire port 443 listener, which will stop public internet access to those routes. Confirm to make port 443 private anyway.',
-                        )
                     raise BridgeRequestError(
                         409,
-                        f'Tailscale Serve port 443 is currently forwarding to {status["serveConflict"]}. Confirm replacement to switch port 443 to VPSAgent.',
+                        self._format_tailscale_conflict_summary(
+                            str(status["serveConflict"]),
+                            status.get("serveConflictDetails"),
+                            for_error=True,
+                        ),
                     )
                 if not self._tailscale_target_checker(
                     self._tailscale_target_host, self._tailscale_target_port
