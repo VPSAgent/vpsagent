@@ -40,11 +40,12 @@ const JSON_SECRET_PATTERN =
   /"([A-Za-z0-9_]*(?:key|token|secret|password|passwd|pass|passphrase|credential|auth)[A-Za-z0-9_]*)"\s*:\s*"([^"]*)"/gi;
 const AUTH_HEADER_PATTERN = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{6,}/gi;
 const KNOWN_TOKEN_PREFIX_PATTERN =
-  /\b(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|vpsmcp_[A-Za-z0-9_-]{16,}|\d{6,12}:AA[A-Za-z0-9_-]{25,})\b/g;
+  /\b(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|vpsmcp_[A-Za-z0-9_-]{16,}|tskey-[a-z]+-[A-Za-z0-9_-]{8,}|\d{6,12}:AA[A-Za-z0-9_-]{25,})\b/g;
 const PEM_KEY_PATTERN =
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
 const URL_CREDENTIALS_PATTERN = /\b(https?:\/\/)([^:@\s/]+):([^@\s/]+)@/gi;
 const GIT_TOKEN_PATTERN = /^[A-Za-z0-9_.-]{8,512}$/;
+const TAILSCALE_AUTHKEY_PATTERN = /^tskey-auth-[A-Za-z0-9_-]{8,256}$/;
 const GITHUB_OWNER_REPO_SEGMENT = /^[A-Za-z0-9._-]+$/;
 
 const BLOCKED_METADATA_HOSTS = new Set([
@@ -664,6 +665,19 @@ export function validateGitAccessToken(rawToken: string): string {
   if (!GIT_TOKEN_PATTERN.test(trimmed)) {
     throw new Error(
       "Invalid GitHub access token format: expected 8-512 characters using letters, numbers, '_', '-', or '.'.",
+    );
+  }
+  return trimmed;
+}
+
+/**
+ * Validates a Tailscale auth key (`tskey-auth-...`) without echoing the raw key on error.
+ */
+export function validateTailscaleAuthKey(rawKey: string): string {
+  const trimmed = rawKey.trim();
+  if (!TAILSCALE_AUTHKEY_PATTERN.test(trimmed)) {
+    throw new Error(
+      "Invalid Tailscale auth key format: expected a tskey-auth-... key with letters, numbers, '_', or '-'.",
     );
   }
   return trimmed;

@@ -14,6 +14,7 @@ import {
   HttpRuntimeBridgeClient,
   RuntimeBridgeError,
   RuntimeCoreUpdateStatusSchema,
+  RuntimeTailscaleStatusSchema,
   createRuntimeBridgeFromEnv,
   syncAppStatuses,
 } from "./runtime-bridge.js";
@@ -680,6 +681,203 @@ describe("RuntimeBridge Unix-socket client + bootstrap/runtime-bridge.py", () =>
     }
   });
 
+  it("discovers Tailscale status, connects, and toggles Tailscale Serve over Unix socket", async () => {
+    const pythonBin = findPythonBinary();
+    expect(pythonBin).not.toBeNull();
+    if (!pythonBin) return;
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpsagent-ts-bridge-"));
+    const appsRoot = path.join(tempDir, "apps");
+    const caddyAppsDir = path.join(tempDir, "caddy-apps");
+    const socketPath = path.join(tempDir, "run", "runtime.sock");
+    const stateFile = path.join(tempDir, "docker-state.json");
+    const callsLog = path.join(tempDir, "docker-calls.log");
+    const envLog = path.join(tempDir, "docker-env.log");
+    const tsStateFile = path.join(tempDir, "tailscale-state.json");
+    fs.mkdirSync(appsRoot, { recursive: true });
+    fs.mkdirSync(caddyAppsDir, { recursive: true });
+
+    const targetServer = http.createServer((_req, res) => {
+      res.statusCode = 200;
+      res.end("ok");
+    });
+    await new Promise<void>((resolve) =>
+      targetServer.listen(0, "127.0.0.1", () => resolve()),
+    );
+    const targetPort = (targetServer.address() as AddressInfo).port;
+
+    const tsShimPy = path.join(tempDir, "fake_tailscale.py");
+    fs.writeFileSync(
+      tsShimPy,
+      `import json, os, sys
+state_file = ${JSON.stringify(tsStateFile)}
+args = sys.argv[1:]
+
+def load():
+    if os.path.exists(state_file):
+        with open(state_file, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    return {"connected": False, "serve": False, "authFileSeen": None}
+
+def save(st):
+    with open(state_file, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+
+st = load()
+
+if args == ["status", "--json"]:
+    if not st["connected"]:
+        print(json.dumps({
+            "Version": "1.78.1",
+            "BackendState": "NeedsLogin",
+            "AuthURL": "https://login.tailscale.com/a/unit1234",
+            "Self": {"HostName": "my-vps", "DNSName": "", "TailscaleIPs": []},
+            "CertDomains": [],
+        }))
+        sys.exit(0)
+    print(json.dumps({
+        "Version": "1.78.1",
+        "BackendState": "Running",
+        "Self": {
+            "HostName": "my-vps",
+            "DNSName": "my-vps.tail1234.ts.net.",
+            "TailscaleIPs": ["100.64.0.42", "fd7a:115c:a1e0::42"],
+        },
+        "CurrentTailnet": {
+            "Name": "tail1234.ts.net",
+            "MagicDNSSuffix": "tail1234.ts.net",
+            "MagicDNSEnabled": True,
+        },
+        "CertDomains": ["my-vps.tail1234.ts.net"],
+    }))
+    sys.exit(0)
+
+if args == ["serve", "status", "--json"]:
+    if st.get("serve"):
+        print(json.dumps({
+            "Web": {
+                "my-vps.tail1234.ts.net:443": {
+                    "Handlers": {"/": {"Proxy": "http://127.0.0.1:${targetPort}"}}
+                }
+            }
+        }))
+    else:
+        print("{}")
+    sys.exit(0)
+
+if args[:1] == ["up"]:
+    for arg in args[1:]:
+        if arg.startswith("--auth-key=file:"):
+            path = arg.split(":", 1)[1]
+            with open(path, "r", encoding="utf-8") as fh:
+                st["authFileSeen"] = fh.read()
+            st["connected"] = True
+            save(st)
+            sys.exit(0)
+    print("https://login.tailscale.com/a/unit1234")
+    sys.exit(0)
+
+if args[:3] == ["serve", "--bg", "--https=443"]:
+    st["serve"] = True
+    save(st)
+    sys.exit(0)
+
+if args == ["serve", "--https=443", "--set-path=/", "off"]:
+    st["serve"] = False
+    save(st)
+    sys.exit(0)
+
+sys.exit(0)
+`,
+      "utf8",
+    );
+    const tsBin = path.join(tempDir, "fake-tailscale");
+    fs.writeFileSync(
+      tsBin,
+      `#!/usr/bin/env sh\nexec "${pythonBin}" "${tsShimPy}" "$@"\n`,
+      "utf8",
+    );
+    fs.chmodSync(tsBin, 0o755);
+
+    const dockerBin = createFakeDockerShim(
+      tempDir,
+      pythonBin,
+      stateFile,
+      callsLog,
+      envLog,
+    );
+    const gitBin = createFakeGitShim(tempDir, pythonBin);
+    const runtimeToken = "vpsagent-runtime-ts-token-1234";
+
+    const daemon = await startPythonRuntimeBridge({
+      pythonBin,
+      appsRoot,
+      caddyAppsDir,
+      dockerBin,
+      gitBin,
+      runtimeToken,
+      socketPath,
+      extraEnv: {
+        VPSAGENT_TAILSCALE_BIN: tsBin,
+        VPSAGENT_TAILSCALE_TARGET_URL: `http://127.0.0.1:${targetPort}`,
+      },
+    });
+
+    try {
+      const client = createRuntimeBridgeFromEnv({
+        VPSAGENT_RUNTIME_SOCKET: daemon.socketPath,
+        VPSAGENT_RUNTIME_TOKEN: runtimeToken,
+      })!;
+
+      const initial = await client.getTailscaleStatus();
+      expect(initial.installed).toBe(true);
+      expect(initial.connected).toBe(false);
+      expect(initial.backendState).toBe("needs_login");
+      expect(initial.loginUrl).toBe("https://login.tailscale.com/a/unit1234");
+
+      const loginStarted = await client.connectTailscale({ mode: "login" });
+      expect(loginStarted.ok).toBe(true);
+      expect(loginStarted.loginUrl).toBe("https://login.tailscale.com/a/unit1234");
+
+      const connected = await client.connectTailscale({
+        mode: "authkey",
+        authKey: "tskey-auth-kBridgeTest12345678",
+      });
+      expect(connected.ok).toBe(true);
+      expect(connected.status.connected).toBe(true);
+      expect(connected.status.tailscaleIp).toBe("100.64.0.42");
+      expect(connected.status.dnsName).toBe("my-vps.tail1234.ts.net");
+
+      const served = await client.setTailscaleServe({ enabled: true });
+      expect(served.ok).toBe(true);
+      expect(served.status.serveEnabled).toBe(true);
+      expect(served.status.serveUrl).toBe("https://my-vps.tail1234.ts.net");
+      expect(served.status.mcpUrl).toBe("https://my-vps.tail1234.ts.net/mcp");
+
+      const disabled = await client.setTailscaleServe({ enabled: false });
+      expect(disabled.ok).toBe(true);
+      expect(disabled.status.serveEnabled).toBe(false);
+      expect(disabled.status.mcpUrl).toBeNull();
+      expect(disabled.status.serveConflictDetails).toBeNull();
+
+      const legacyStatus = RuntimeTailscaleStatusSchema.parse({
+        installed: true,
+        serviceActive: true,
+        connected: true,
+        backendState: "running",
+        tailscaleIp: "100.64.0.42",
+        hostname: "my-vps",
+        dnsName: "my-vps.tail1234.ts.net",
+        tailnetName: "tail1234.ts.net",
+      });
+      expect(legacyStatus.serveConflictDetails).toBeNull();
+    } finally {
+      await daemon.close();
+      await new Promise<void>((resolve) => targetServer.close(() => resolve()));
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
   it("parses legacy and release update status payloads and redacts secrets", async () => {
     const minimalParsed = RuntimeCoreUpdateStatusSchema.parse({
       state: "idle",
@@ -764,6 +962,63 @@ describe("RuntimeBridge Unix-socket client + bootstrap/runtime-bridge.py", () =>
       const applied = await client.applyCoreUpdate({ source: "release" });
       expect(applied.started).toBe(true);
       expect(seenApplyBody).toBe(JSON.stringify({ source: "release" }));
+    } finally {
+      await new Promise<void>((resolve) => mockServer.close(() => resolve()));
+    }
+  });
+
+  it("parses and redacts Tailscale serveConflictDetails", async () => {
+    const mockServer = http.createServer((req, res) => {
+      if (req.url === "/v1/host/tailscale/status") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            installed: true,
+            serviceActive: true,
+            connected: true,
+            backendState: "running",
+            tailscaleIp: "100.64.0.42",
+            hostname: "my-vps",
+            dnsName: "my-vps.tail1234.ts.net",
+            tailnetName: "tail1234.ts.net",
+            serveConflict:
+              "public Funnel sibling routes (/status -> http://user:vpsmcp_secret123456@127.0.0.1:8080); removed /mcp route (/mcp -> http://tok:sk-secret1234567890abcd@127.0.0.1:9000)",
+            serveConflictDetails: {
+              funnelActive: true,
+              preservedFunnelSiblings: [
+                "/status -> http://user:vpsmcp_secret123456@127.0.0.1:8080",
+              ],
+              replacedRootRoute: null,
+              removedMcpRoute:
+                "/mcp -> http://tok:sk-secret1234567890abcd@127.0.0.1:9000",
+            },
+          }),
+        );
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise<void>((resolve) =>
+      mockServer.listen(0, "127.0.0.1", () => resolve()),
+    );
+    const port = (mockServer.address() as AddressInfo).port;
+    try {
+      const client = new HttpRuntimeBridgeClient({
+        baseUrl: `http://127.0.0.1:${port}`,
+      });
+      const ts = await client.getTailscaleStatus();
+      expect(ts.serveConflictDetails).not.toBeNull();
+      expect(ts.serveConflictDetails?.funnelActive).toBe(true);
+      expect(ts.serveConflictDetails?.preservedFunnelSiblings[0]).not.toContain(
+        "vpsmcp_secret123456",
+      );
+      expect(ts.serveConflictDetails?.removedMcpRoute).not.toContain(
+        "sk-secret1234567890abcd",
+      );
+      expect(ts.serveConflict).not.toContain("vpsmcp_secret123456");
+      expect(ts.serveConflict).not.toContain("sk-secret1234567890abcd");
     } finally {
       await new Promise<void>((resolve) => mockServer.close(() => resolve()));
     }

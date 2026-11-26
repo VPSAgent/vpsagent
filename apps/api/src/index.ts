@@ -56,6 +56,29 @@ function startServerFromEnv(): void {
     });
   }
 
+  // Sync initial Tailscale Serve state on startup so /mcp accepts Tailscale HTTPS immediately
+  if (bridge.getTailscaleStatus) {
+    void bridge
+      .getTailscaleStatus()
+      .then((ts) => {
+        const nextDomain = ts.dnsName || null;
+        const nextEnabled = Boolean(ts.serveEnabled && ts.dnsName);
+        const cur = store.getSetupState();
+        if (
+          cur.tailscaleDomain !== nextDomain ||
+          cur.tailscaleServeEnabled !== nextEnabled
+        ) {
+          store.updateSetupState({
+            tailscaleDomain: nextDomain,
+            tailscaleServeEnabled: nextEnabled,
+          });
+        }
+      })
+      .catch(() => {
+        // Non-fatal: Tailscale may not be installed or bridge may still be starting
+      });
+  }
+
   // 1. Primary Caddy-fronted server (strictly requires HTTPS via X-Forwarded-Proto)
   const { app, generatedClaimToken } = createVpsAgentApp({
     store,

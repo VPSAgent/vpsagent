@@ -209,6 +209,626 @@ start_core_stack
         self.assertIn(f"VPSAGENT_REPO_DIR={home_checkout}\n", docker_call)
         self.assertIn("up -d --build", docker_call)
 
+    def test_tailscale_install_configures_serve_banner_and_never_leaks_authkey(
+        self,
+    ) -> None:
+        bin_dir = Path(self.tmp) / "bin"
+        bin_dir.mkdir()
+        ts_state = Path(self.tmp) / "ts-state.json"
+        ts_calls = Path(self.tmp) / "ts-calls.log"
+        vpsagent_root = Path(self.tmp) / "var-lib-vpsagent"
+        vpsagent_root.mkdir(parents=True)
+        env_file = vpsagent_root / ".env"
+        env_file.write_text("VPSAGENT_CLAIM_TOKEN=claim_ts_banner_123\n", encoding="utf-8")
+        os.chmod(env_file, 0o600)
+
+        (bin_dir / "tailscale").write_text(
+            f"""#!/usr/bin/env python3
+import json, os, sys
+state_path = {str(ts_state)!r}
+calls_path = {str(ts_calls)!r}
+args = sys.argv[1:]
+with open(calls_path, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+
+st = {{"connected": False, "serve": False}}
+if os.path.exists(state_path):
+    with open(state_path, "r", encoding="utf-8") as fh:
+        st = json.load(fh)
+
+if args[:1] == ["up"]:
+    for arg in args[1:]:
+        if arg.startswith("--auth-key=file:"):
+            key_path = arg.split(":", 1)[1]
+            with open(key_path, "r", encoding="utf-8") as kf:
+                assert kf.read().startswith("tskey-auth-")
+    st["connected"] = True
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+    sys.exit(0)
+
+if args == ["serve", "--bg", "--https=443", "http://127.0.0.1:3001"]:
+    st["serve"] = True
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+    sys.exit(0)
+
+if args == ["status", "--json"]:
+    if not st["connected"]:
+        print(json.dumps({{"BackendState": "Stopped", "Self": {{"TailscaleIPs": []}}}}))
+    else:
+        print(json.dumps({{
+            "BackendState": "Running",
+            "Self": {{"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]}},
+            "CertDomains": ["vps-node.tail99.ts.net"],
+        }}))
+    sys.exit(0)
+
+if args == ["serve", "status", "--json"]:
+    if st["serve"]:
+        print(json.dumps({{
+            "Web": {{
+                "vps-node.tail99.ts.net:443": {{
+                    "Handlers": {{"/": {{"Proxy": "http://127.0.0.1:3001"}}}}
+                }}
+            }}
+        }}))
+    else:
+        print("{{}}")
+    sys.exit(0)
+
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_dir / "tailscale", 0o755)
+
+        secret_auth_key = "tskey-auth-kInstallSecret99998888"
+        script = f"""
+set -euo pipefail
+export PATH="{bin_dir}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+export VPSAGENT_TAILSCALE_AUTHKEY="{secret_auth_key}"
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+CLAIM_TOKEN="claim_ts_banner_123"
+configure_tailscale
+print_ready_banner
+"""
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"configure_tailscale failed:\nstdout={proc.stdout}\nstderr={proc.stderr}",
+        )
+        self.assertIn(
+            "https://vps-node.tail99.ts.net/#claim=claim_ts_banner_123",
+            proc.stdout,
+        )
+        self.assertNotIn(secret_auth_key, proc.stdout)
+        self.assertNotIn(secret_auth_key, proc.stderr)
+        self.assertNotIn(secret_auth_key, env_file.read_text(encoding="utf-8"))
+        calls_text = ts_calls.read_text(encoding="utf-8")
+        self.assertIn("serve --bg --https=443 http://127.0.0.1:3001", calls_text)
+        self.assertNotIn(secret_auth_key, calls_text)
+
+    def test_tailscale_install_preserves_existing_conflicting_serve_route(
+        self,
+    ) -> None:
+        bin_dir = Path(self.tmp) / "bin-conflict"
+        bin_dir.mkdir()
+        ts_calls = Path(self.tmp) / "ts-conflict-calls.log"
+        vpsagent_root = Path(self.tmp) / "var-lib-vpsagent-conflict"
+        vpsagent_root.mkdir(parents=True)
+
+        (bin_dir / "tailscale").write_text(
+            f"""#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+with open({str(ts_calls)!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+
+if args == ["status", "--json"]:
+    print(json.dumps({{
+        "BackendState": "Running",
+        "Self": {{"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]}},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }}))
+    sys.exit(0)
+
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({{
+        "Web": {{
+            "vps-node.tail99.ts.net:443": {{
+                "Handlers": {{"/": {{"Proxy": "http://127.0.0.1:9000"}}}}
+            }}
+        }}
+    }}))
+    sys.exit(0)
+
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_dir / "tailscale", 0o755)
+
+        script = f"""
+set -euo pipefail
+export PATH="{bin_dir}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+configure_tailscale
+"""
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("http://127.0.0.1:9000", proc.stdout)
+        calls_text = ts_calls.read_text(encoding="utf-8")
+        self.assertNotIn("serve --bg --https=443", calls_text)
+
+    def test_tailscale_install_accepts_explicit_mcp_path_and_rejects_bare_mcp_mount(
+        self,
+    ) -> None:
+        # Explicit /mcp -> http://127.0.0.1:3001/mcp is accepted (Tailscale strips mount prefix)
+        bin_ok = Path(self.tmp) / "bin-mcp-ok"
+        bin_ok.mkdir()
+        (bin_ok / "tailscale").write_text(
+            """#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+if args == ["status", "--json"]:
+    print(json.dumps({
+        "BackendState": "Running",
+        "Self": {"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }))
+    sys.exit(0)
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({
+        "Web": {
+            "vps-node.tail99.ts.net:443": {
+                "Handlers": {
+                    "/": {"Proxy": "http://127.0.0.1:3001"},
+                    "/mcp": {"Proxy": "http://127.0.0.1:3001/mcp"},
+                }
+            }
+        }
+    }))
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_ok / "tailscale", 0o755)
+        proc_ok = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+set -euo pipefail
+export PATH="{bin_ok}:$PATH"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+detect_tailscale_info
+printf 'SERVE=%s\\nCONFLICT=%s\\n' "$TAILSCALE_SERVE_URL" "$TAILSCALE_SERVE_CONFLICT"
+""",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_ok.returncode, 0, msg=proc_ok.stderr)
+        self.assertIn("SERVE=https://vps-node.tail99.ts.net\n", proc_ok.stdout)
+        self.assertIn("CONFLICT=\n", proc_ok.stdout)
+
+        # Bare /mcp -> http://127.0.0.1:3001 (without /mcp suffix) is flagged as a conflict
+        bin_bare = Path(self.tmp) / "bin-mcp-bare"
+        bin_bare.mkdir()
+        (bin_bare / "tailscale").write_text(
+            """#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+if args == ["status", "--json"]:
+    print(json.dumps({
+        "BackendState": "Running",
+        "Self": {"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }))
+    sys.exit(0)
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({
+        "Web": {
+            "vps-node.tail99.ts.net:443": {
+                "Handlers": {
+                    "/": {"Proxy": "http://127.0.0.1:3001"},
+                    "/mcp": {"Proxy": "http://127.0.0.1:3001"},
+                }
+            }
+        }
+    }))
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_bare / "tailscale", 0o755)
+        proc_bare = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+set -euo pipefail
+export PATH="{bin_bare}:$PATH"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+detect_tailscale_info
+printf 'SERVE=%s\\nCONFLICT=%s\\n' "$TAILSCALE_SERVE_URL" "$TAILSCALE_SERVE_CONFLICT"
+""",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_bare.returncode, 0, msg=proc_bare.stderr)
+        self.assertIn("SERVE=\n", proc_bare.stdout)
+        self.assertIn("CONFLICT=/mcp -> http://127.0.0.1:3001\n", proc_bare.stdout)
+
+    def test_tailscale_install_disables_public_funnel_and_never_prints_funnel_claim_link(
+        self,
+    ) -> None:
+        # Case A: AllowFunnel=True is cleared by `tailscale serve --bg --https=443 http://127.0.0.1:3001`
+        bin_clear = Path(self.tmp) / "bin-funnel-clear"
+        bin_clear.mkdir()
+        ts_state = Path(self.tmp) / "funnel-clear-state.json"
+        ts_state.write_text('{"funnel": true}', encoding="utf-8")
+        ts_calls = Path(self.tmp) / "funnel-clear-calls.log"
+        vpsagent_root = Path(self.tmp) / "var-lib-vpsagent-funnel-clear"
+        vpsagent_root.mkdir(parents=True)
+
+        (bin_clear / "tailscale").write_text(
+            f"""#!/usr/bin/env python3
+import json, sys
+state_path = {str(ts_state)!r}
+calls_path = {str(ts_calls)!r}
+args = sys.argv[1:]
+with open(calls_path, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+st = json.loads(open(state_path, "r", encoding="utf-8").read())
+if args == ["status", "--json"]:
+    print(json.dumps({{
+        "BackendState": "Running",
+        "Self": {{"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]}},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }}))
+    sys.exit(0)
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({{
+        "Web": {{
+            "vps-node.tail99.ts.net:443": {{
+                "Handlers": {{"/": {{"Proxy": "http://127.0.0.1:3001"}}}}
+            }}
+        }},
+        "AllowFunnel": {{"vps-node.tail99.ts.net:443": bool(st.get("funnel"))}},
+    }}))
+    sys.exit(0)
+if args == ["serve", "--bg", "--https=443", "http://127.0.0.1:3001"]:
+    st["funnel"] = False
+    open(state_path, "w", encoding="utf-8").write(json.dumps(st))
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_clear / "tailscale", 0o755)
+        proc_clear = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+set -euo pipefail
+export PATH="{bin_clear}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+CLAIM_TOKEN="claim_ts_funnel_clear"
+configure_tailscale
+print_ready_banner
+""",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_clear.returncode, 0, msg=proc_clear.stderr)
+        self.assertIn("serve --bg --https=443 http://127.0.0.1:3001", ts_calls.read_text(encoding="utf-8"))
+        self.assertIn(
+            "https://vps-node.tail99.ts.net/#claim=claim_ts_funnel_clear",
+            proc_clear.stdout,
+        )
+
+        # Case B: If AllowFunnel stays True, never report private Serve or print claim link over public Funnel
+        bin_stuck = Path(self.tmp) / "bin-funnel-stuck"
+        bin_stuck.mkdir()
+        (bin_stuck / "tailscale").write_text(
+            """#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+if args == ["status", "--json"]:
+    print(json.dumps({
+        "BackendState": "Running",
+        "Self": {"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }))
+    sys.exit(0)
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({
+        "Web": {
+            "vps-node.tail99.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:3001"}}
+            }
+        },
+        "AllowFunnel": {"vps-node.tail99.ts.net:443": True},
+    }))
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_stuck / "tailscale", 0o755)
+        proc_stuck = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+set -euo pipefail
+export PATH="{bin_stuck}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+CLAIM_TOKEN="claim_ts_funnel_stuck"
+PUBLIC_IP="203.0.113.10"
+configure_tailscale
+print_ready_banner
+""",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc_stuck.returncode, 0, msg=proc_stuck.stderr)
+        self.assertIn("Public Tailscale Funnel is still active", proc_stuck.stdout)
+        self.assertNotIn(
+            "https://vps-node.tail99.ts.net/#claim=claim_ts_funnel_stuck",
+            proc_stuck.stdout,
+        )
+        self.assertIn("http://localhost:3002/#claim=claim_ts_funnel_stuck", proc_stuck.stdout)
+
+    def test_tailscale_install_redacts_proxy_credentials_in_conflict_warning(
+        self,
+    ) -> None:
+        bin_cred = Path(self.tmp) / "bin-cred-conflict"
+        bin_cred.mkdir()
+        (bin_cred / "tailscale").write_text(
+            """#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+if args == ["status", "--json"]:
+    print(json.dumps({
+        "BackendState": "Running",
+        "Self": {"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }))
+    sys.exit(0)
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({
+        "Web": {
+            "vps-node.tail99.ts.net:443": {
+                "Handlers": {
+                    "/": {"Proxy": "http://alice:topsecret123@127.0.0.1:9000/ui?key=leakme#frag"}
+                }
+            }
+        }
+    }))
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_cred / "tailscale", 0o755)
+        proc = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+set -euo pipefail
+export PATH="{bin_cred}:$PATH"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+configure_tailscale
+""",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertIn("http://[REDACTED]@127.0.0.1:9000/ui", proc.stdout)
+        for secret_part in ("alice", "topsecret123", "leakme", "frag"):
+            self.assertNotIn(secret_part, proc.stdout)
+            self.assertNotIn(secret_part, proc.stderr)
+
+    def test_tailscale_install_preserves_public_funnel_with_sibling_routes(
+        self,
+    ) -> None:
+        bin_sib = Path(self.tmp) / "bin-funnel-siblings"
+        bin_sib.mkdir()
+        ts_calls = Path(self.tmp) / "funnel-siblings-calls.log"
+        vpsagent_root = Path(self.tmp) / "var-lib-vpsagent-funnel-siblings"
+        vpsagent_root.mkdir(parents=True)
+
+        (bin_sib / "tailscale").write_text(
+            f"""#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+with open({str(ts_calls)!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+if args == ["status", "--json"]:
+    print(json.dumps({{
+        "BackendState": "Running",
+        "Self": {{"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]}},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }}))
+    sys.exit(0)
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({{
+        "Web": {{
+            "vps-node.tail99.ts.net:443": {{
+                "Handlers": {{
+                    "/": {{"Proxy": "http://127.0.0.1:3001"}},
+                    "/status": {{"Proxy": "http://alice:pw123@127.0.0.1:8080/status?tok=hideme"}},
+                }}
+            }}
+        }},
+        "AllowFunnel": {{"vps-node.tail99.ts.net:443": True}},
+    }}))
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_sib / "tailscale", 0o755)
+        proc = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+set -euo pipefail
+export PATH="{bin_sib}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+CLAIM_TOKEN="claim_ts_funnel_sib"
+PUBLIC_IP="203.0.113.10"
+configure_tailscale
+print_ready_banner
+""",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        calls_text = ts_calls.read_text(encoding="utf-8")
+        self.assertNotIn("serve --bg --https=443", calls_text)
+        self.assertIn("public Funnel sibling routes", proc.stdout)
+        self.assertIn("/status -> http://[REDACTED]@127.0.0.1:8080/status", proc.stdout)
+        self.assertNotIn(
+            "https://vps-node.tail99.ts.net/#claim=claim_ts_funnel_sib",
+            proc.stdout,
+        )
+        self.assertIn("http://localhost:3002/#claim=claim_ts_funnel_sib", proc.stdout)
+        for secret_part in ("alice", "pw123", "hideme"):
+            self.assertNotIn(secret_part, proc.stdout)
+            self.assertNotIn(secret_part, proc.stderr)
+
+    def test_tailscale_install_funnel_with_sibling_and_conflicting_mcp(
+        self,
+    ) -> None:
+        bin_dir = Path(self.tmp) / "bin-funnel-sibling-mcp"
+        bin_dir.mkdir()
+        ts_calls = Path(self.tmp) / "funnel-sibling-mcp-calls.log"
+        vpsagent_root = Path(self.tmp) / "var-lib-vpsagent-funnel-sibling-mcp"
+        vpsagent_root.mkdir(parents=True)
+
+        (bin_dir / "tailscale").write_text(
+            f"""#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+with open({str(ts_calls)!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+if args == ["status", "--json"]:
+    print(json.dumps({{
+        "BackendState": "Running",
+        "Self": {{"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]}},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }}))
+    sys.exit(0)
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({{
+        "Web": {{
+            "vps-node.tail99.ts.net:443": {{
+                "Handlers": {{
+                    "/status": {{"Proxy": "http://127.0.0.1:8080/status"}},
+                    "/mcp": {{"Proxy": "http://bob:pw999@127.0.0.1:9000/mcp?key=hideme"}},
+                }}
+            }}
+        }},
+        "AllowFunnel": {{"vps-node.tail99.ts.net:443": True}},
+    }}))
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_dir / "tailscale", 0o755)
+        proc = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+set -euo pipefail
+export PATH="{bin_dir}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+CLAIM_TOKEN="claim_ts_funnel_sib_mcp"
+PUBLIC_IP="203.0.113.10"
+configure_tailscale
+print_ready_banner
+""",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        calls_text = ts_calls.read_text(encoding="utf-8")
+        self.assertNotIn("serve --bg --https=443", calls_text)
+        self.assertIn(
+            "public Funnel sibling routes (/status -> http://127.0.0.1:8080/status)",
+            proc.stdout,
+        )
+        self.assertIn(
+            "removed /mcp route (/mcp -> http://[REDACTED]@127.0.0.1:9000/mcp)",
+            proc.stdout,
+        )
+        self.assertIn("even inside your tailnet", proc.stdout)
+        self.assertNotIn(
+            "https://vps-node.tail99.ts.net/#claim=claim_ts_funnel_sib_mcp",
+            proc.stdout,
+        )
+        self.assertIn("http://localhost:3002/#claim=claim_ts_funnel_sib_mcp", proc.stdout)
+        for secret_part in ("bob", "pw999", "hideme"):
+            self.assertNotIn(secret_part, proc.stdout)
+            self.assertNotIn(secret_part, proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

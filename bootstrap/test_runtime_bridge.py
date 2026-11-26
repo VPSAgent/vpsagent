@@ -3517,5 +3517,974 @@ sys.exit(0)
             srv.server_close()
 
 
+class TestRuntimeBridgeTailscale(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.mkdtemp(prefix="vpsagent-ts-py-test-")
+        self.apps_root = os.path.join(self.tmp_dir, "apps")
+        self.caddy_dir = os.path.join(self.tmp_dir, "caddy-apps")
+        os.makedirs(self.apps_root, exist_ok=True)
+        os.makedirs(self.caddy_dir, exist_ok=True)
+        self.git_sh, self.docker_sh = _write_fake_git_and_docker(self.tmp_dir)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _make_fake_tailscale(
+        self,
+        *,
+        status_rc: int = 0,
+        status_stdout: str = "",
+        status_stderr: str = "",
+        serve_stdout: str = "{}",
+        up_rc: int = 0,
+        up_stdout: str = "",
+        up_stderr: str = "",
+        serve_cmd_rc: int = 0,
+        serve_cmd_stderr: str = "",
+        systemctl_active: bool = False,
+        serve_stateful: bool = False,
+        serve_apply_state: bool = True,
+        keep_funnel_on_serve: bool = False,
+    ) -> tuple[str, str, str, str]:
+        sub_dir = tempfile.mkdtemp(dir=self.tmp_dir)
+        calls_file = os.path.join(sub_dir, "ts-calls.jsonl")
+        seen_key_file = os.path.join(sub_dir, "ts-seen-key.txt")
+        serve_state_file = os.path.join(sub_dir, "ts-serve-state.json")
+        Path(serve_state_file).write_text(serve_stdout, encoding="utf-8")
+        ts_py = os.path.join(sub_dir, "fake_tailscale.py")
+        Path(ts_py).write_text(
+            f"""import json, os, sys
+args = sys.argv[1:]
+with open({calls_file!r}, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(args) + "\\n")
+
+if args == ["status", "--json"]:
+    sys.stdout.write({status_stdout!r})
+    sys.stderr.write({status_stderr!r})
+    sys.exit({status_rc!r})
+
+if args == ["serve", "status", "--json"]:
+    if {serve_stateful!r} and os.path.exists({serve_state_file!r}):
+        sys.stdout.write(open({serve_state_file!r}, "r", encoding="utf-8").read())
+    else:
+        sys.stdout.write({serve_stdout!r})
+    sys.exit(0)
+
+if args[:1] == ["up"]:
+    for arg in args[1:]:
+        if arg.startswith("--auth-key=file:"):
+            path = arg.split(":", 1)[1]
+            with open(path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+            with open({seen_key_file!r}, "w", encoding="utf-8") as out:
+                out.write(content)
+    sys.stdout.write({up_stdout!r})
+    sys.stderr.write({up_stderr!r})
+    sys.exit({up_rc!r})
+
+if args[:1] == ["serve"]:
+    if {serve_stateful!r} and {serve_apply_state!r} and {serve_cmd_rc!r} == 0:
+        data = json.loads(open({serve_state_file!r}, "r", encoding="utf-8").read() or "{{}}")
+        web = data.setdefault("Web", {{}})
+        host_key = "my-vps.tail42.ts.net:443"
+        entry = web.setdefault(host_key, {{}})
+        handlers = entry.setdefault("Handlers", {{}})
+        if args == ["serve", "--https=443", "--set-path=/", "off"]:
+            handlers.pop("/", None)
+        elif args == ["serve", "--https=443", "--set-path=/mcp", "off"]:
+            handlers.pop("/mcp", None)
+        elif len(args) >= 4 and args[1] == "--bg" and args[2] == "--https=443":
+            handlers["/"] = {{"Proxy": args[3]}}
+            if not {keep_funnel_on_serve!r} and isinstance(data.get("AllowFunnel"), dict):
+                data["AllowFunnel"][host_key] = False
+        open({serve_state_file!r}, "w", encoding="utf-8").write(json.dumps(data))
+    sys.stderr.write({serve_cmd_stderr!r})
+    sys.exit({serve_cmd_rc!r})
+
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        ts_sh = os.path.join(sub_dir, "fake-tailscale")
+        Path(ts_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{ts_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(ts_sh, 0o755)
+
+        sys_py = os.path.join(sub_dir, "fake_systemctl.py")
+        Path(sys_py).write_text(
+            f"""import sys
+args = sys.argv[1:]
+if args[:2] == ["is-active", "tailscaled"]:
+    if {systemctl_active!r}:
+        print("active")
+        sys.exit(0)
+    print("inactive")
+    sys.exit(3)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        sys_sh = os.path.join(sub_dir, "fake-systemctl")
+        Path(sys_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{sys_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(sys_sh, 0o755)
+        return ts_sh, sys_sh, calls_file, seen_key_file
+
+    def _service(
+        self,
+        *,
+        tailscale_bin: str,
+        systemctl_bin: str = "systemctl",
+        target_reachable: bool = True,
+    ) -> rb.RuntimeService:
+        return rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=self.docker_sh,
+            git_bin=self.git_sh,
+            systemctl_bin=systemctl_bin,
+            tailscale_bin=tailscale_bin,
+            tailscale_target_url="http://127.0.0.1:3001",
+            tailscale_target_checker=lambda _h, _p: target_reachable,
+            runtime_token="secret-token-for-unit-test-1234",
+        )
+
+    def test_tailscale_key_redaction(self) -> None:
+        raw = "auth=tskey-auth-kSecret1234567890 api=tskey-api-kApiSecret987654"
+        redacted = rb.redact_secrets(raw)
+        self.assertNotIn("tskey-auth-kSecret1234567890", redacted)
+        self.assertNotIn("tskey-api-kApiSecret987654", redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+    def test_tailscale_status_variants(self) -> None:
+        # 1. Not installed
+        svc_missing = self._service(
+            tailscale_bin=os.path.join(self.tmp_dir, "does-not-exist-tailscale")
+        )
+        missing_status = svc_missing.tailscale_status()
+        self.assertFalse(missing_status["installed"])
+        self.assertFalse(missing_status["connected"])
+        self.assertEqual(missing_status["backendState"], "not_installed")
+
+        # 2. Daemon stopped (non-JSON error)
+        ts_stopped, sys_stopped, _, _ = self._make_fake_tailscale(
+            status_rc=1,
+            status_stderr="failed to connect to local tailscaled; it doesn't appear to be running",
+        )
+        stopped_status = self._service(
+            tailscale_bin=ts_stopped, systemctl_bin=sys_stopped
+        ).tailscale_status()
+        self.assertTrue(stopped_status["installed"])
+        self.assertFalse(stopped_status["serviceActive"])
+        self.assertFalse(stopped_status["connected"])
+        self.assertEqual(stopped_status["backendState"], "stopped")
+
+        # 3. NeedsLogin with loginUrl (must NOT redact loginUrl!) and non-zero rc
+        ts_login, sys_login, _, _ = self._make_fake_tailscale(
+            status_rc=1,
+            status_stdout=json.dumps(
+                {
+                    "Version": "1.78.0",
+                    "BackendState": "NeedsLogin",
+                    "AuthURL": "https://login.tailscale.com/a/abc987def",
+                    "Self": {"HostName": "box", "DNSName": "", "TailscaleIPs": []},
+                    "CertDomains": [],
+                }
+            ),
+        )
+        login_status = self._service(
+            tailscale_bin=ts_login, systemctl_bin=sys_login
+        ).tailscale_status()
+        self.assertTrue(login_status["installed"])
+        self.assertTrue(login_status["serviceActive"])
+        self.assertFalse(login_status["connected"])
+        self.assertEqual(login_status["backendState"], "needs_login")
+        self.assertEqual(
+            login_status["loginUrl"], "https://login.tailscale.com/a/abc987def"
+        )
+
+        # 4. Connected without Serve
+        running_json = json.dumps(
+            {
+                "Version": "1.78.0",
+                "BackendState": "Running",
+                "Self": {
+                    "HostName": "my-vps",
+                    "DNSName": "my-vps.tail42.ts.net.",
+                    "TailscaleIPs": ["100.64.10.5", "fd7a:115c:a1e0::5"],
+                },
+                "CurrentTailnet": {
+                    "Name": "tail42.ts.net",
+                    "MagicDNSSuffix": "tail42.ts.net",
+                    "MagicDNSEnabled": True,
+                },
+                "CertDomains": ["my-vps.tail42.ts.net"],
+            }
+        )
+        ts_conn, sys_conn, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json, serve_stdout="{}"
+        )
+        conn_status = self._service(
+            tailscale_bin=ts_conn, systemctl_bin=sys_conn
+        ).tailscale_status()
+        self.assertTrue(conn_status["connected"])
+        self.assertEqual(conn_status["tailscaleIp"], "100.64.10.5")
+        self.assertEqual(conn_status["dnsName"], "my-vps.tail42.ts.net")
+        self.assertTrue(conn_status["magicDnsEnabled"])
+        self.assertTrue(conn_status["httpsCertsAvailable"])
+        self.assertFalse(conn_status["serveEnabled"])
+        self.assertIsNone(conn_status["serveConflict"])
+
+        # 5. Connected with Serve matching http://127.0.0.1:3001
+        ts_serve, sys_serve, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:3001"}}
+                        }
+                    }
+                }
+            ),
+        )
+        serve_status = self._service(
+            tailscale_bin=ts_serve, systemctl_bin=sys_serve
+        ).tailscale_status()
+        self.assertTrue(serve_status["serveEnabled"])
+        self.assertEqual(serve_status["serveUrl"], "https://my-vps.tail42.ts.net")
+        self.assertEqual(serve_status["mcpUrl"], "https://my-vps.tail42.ts.net/mcp")
+        self.assertIsNone(serve_status["serveConflict"])
+
+        # 6. Connected with port 443 conflict
+        ts_conflict, sys_conflict, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}
+                        }
+                    }
+                }
+            ),
+        )
+        conflict_status = self._service(
+            tailscale_bin=ts_conflict, systemctl_bin=sys_conflict
+        ).tailscale_status()
+        self.assertFalse(conflict_status["serveEnabled"])
+        self.assertEqual(conflict_status["serveConflict"], "http://127.0.0.1:9000")
+
+    def test_set_tailscale_serve_enable_disable_conflict_and_errors(self) -> None:
+        running_json = json.dumps(
+            {
+                "BackendState": "Running",
+                "Self": {
+                    "HostName": "my-vps",
+                    "DNSName": "my-vps.tail42.ts.net.",
+                    "TailscaleIPs": ["100.64.10.5"],
+                },
+                "CurrentTailnet": {"Name": "tail42.ts.net", "MagicDNSEnabled": True},
+                "CertDomains": ["my-vps.tail42.ts.net"],
+            }
+        )
+
+        # Enable succeeds and passes --bg --https=443 http://127.0.0.1:3001
+        ts_ok, sys_ok, calls_file, _ = self._make_fake_tailscale(
+            status_stdout=running_json, serve_stdout="{}", serve_stateful=True
+        )
+        svc_ok = self._service(tailscale_bin=ts_ok, systemctl_bin=sys_ok)
+        res_on = svc_ok.set_tailscale_serve({"enabled": True})
+        self.assertTrue(res_on["ok"])
+        res_off = svc_ok.set_tailscale_serve({"enabled": False})
+        self.assertTrue(res_off["ok"])
+        calls = [
+            json.loads(line)
+            for line in Path(calls_file).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(
+            ["serve", "--bg", "--https=443", "http://127.0.0.1:3001"], calls
+        )
+        self.assertIn(["serve", "--https=443", "--set-path=/", "off"], calls)
+
+        # /mcp path conflict is detected even when / points to VPSAgent, and force=True clears /mcp
+        ts_mcp_conflict, sys_mcp_conflict, calls_mcp_conflict, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:3001"},
+                                "/mcp": {"Proxy": "http://127.0.0.1:9000"},
+                            }
+                        }
+                    }
+                }
+            ),
+        )
+        svc_mcp_conflict = self._service(
+            tailscale_bin=ts_mcp_conflict, systemctl_bin=sys_mcp_conflict
+        )
+        mcp_conflict_status = svc_mcp_conflict.tailscale_status()
+        self.assertFalse(mcp_conflict_status["serveEnabled"])
+        self.assertEqual(
+            mcp_conflict_status["serveConflict"], "/mcp -> http://127.0.0.1:9000"
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_mcp_conflict:
+            svc_mcp_conflict.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_mcp_conflict.exception.status_code, 409)
+        svc_mcp_conflict.set_tailscale_serve({"enabled": True, "force": True})
+        mcp_calls = [
+            json.loads(line)
+            for line in Path(calls_mcp_conflict).read_text(encoding="utf-8").splitlines()
+        ]
+        serve_idx = mcp_calls.index(
+            ["serve", "--bg", "--https=443", "http://127.0.0.1:3001"]
+        )
+        rm_mcp_idx = mcp_calls.index(
+            ["serve", "--https=443", "--set-path=/mcp", "off"]
+        )
+        self.assertLess(serve_idx, rm_mcp_idx)
+
+        # Conflict returns 409 unless force=True
+        ts_conflict, sys_conflict, calls_conflict, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}
+                        }
+                    }
+                }
+            ),
+        )
+        svc_conflict = self._service(
+            tailscale_bin=ts_conflict, systemctl_bin=sys_conflict
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_conflict:
+            svc_conflict.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_conflict.exception.status_code, 409)
+        forced = svc_conflict.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertTrue(forced["ok"])
+        conflict_calls = [
+            json.loads(line)
+            for line in Path(calls_conflict).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(
+            ["serve", "--bg", "--https=443", "http://127.0.0.1:3001"], conflict_calls
+        )
+
+        # Unreachable loopback target returns 422
+        svc_unreach = self._service(
+            tailscale_bin=ts_ok, systemctl_bin=sys_ok, target_reachable=False
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_unreach:
+            svc_unreach.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_unreach.exception.status_code, 422)
+
+        # Tailscale admin enablement link surfaced cleanly on error
+        ts_admin_err, sys_admin_err, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout="{}",
+            serve_cmd_rc=1,
+            serve_cmd_stderr="Serve is not enabled on your tailnet. To enable, visit: https://login.tailscale.com/f/serve?node=n123",
+        )
+        svc_admin_err = self._service(
+            tailscale_bin=ts_admin_err, systemctl_bin=sys_admin_err
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_admin:
+            svc_admin_err.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_admin.exception.status_code, 422)
+        self.assertIn(
+            "https://login.tailscale.com/f/serve?node=n123",
+            str(cm_admin.exception),
+        )
+
+        # Even when tailscale serve exits 0 after printing instructions, must fail closed (422)
+        ts_zero_exit, sys_zero_exit, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout="{}",
+            serve_cmd_rc=0,
+            serve_cmd_stderr="To enable Serve, visit: https://login.tailscale.com/f/serve?node=zero",
+        )
+        svc_zero_exit = self._service(
+            tailscale_bin=ts_zero_exit, systemctl_bin=sys_zero_exit
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_zero:
+            svc_zero_exit.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_zero.exception.status_code, 422)
+        self.assertIn(
+            "https://login.tailscale.com/f/serve?node=zero",
+            str(cm_zero.exception),
+        )
+
+    def test_connect_tailscale_login_and_authkey_security(self) -> None:
+        needs_login_json = json.dumps(
+            {
+                "BackendState": "Stopped",
+                "Self": {"HostName": "my-vps", "DNSName": "", "TailscaleIPs": []},
+            }
+        )
+        ts_login, sys_login, _, _ = self._make_fake_tailscale(
+            status_stdout=needs_login_json,
+            up_rc=0,
+            up_stderr="To authenticate, visit:\n\thttps://login.tailscale.com/a/interactive777\n",
+        )
+        svc_login = self._service(tailscale_bin=ts_login, systemctl_bin=sys_login)
+        login_res = svc_login.connect_tailscale({"mode": "login"})
+        self.assertTrue(login_res["ok"])
+        self.assertEqual(
+            login_res["loginUrl"], "https://login.tailscale.com/a/interactive777"
+        )
+
+        # authkey uses --auth-key=file:<tmp>, deletes temp file, and scrubs key from errors
+        secret_key = "tskey-auth-kSuperSecretUnitKey-9999"
+        ts_key_err, sys_key_err, calls_file, seen_key_file = self._make_fake_tailscale(
+            status_stdout=needs_login_json,
+            up_rc=1,
+            up_stderr=f"invalid key {secret_key}",
+        )
+        svc_key_err = self._service(
+            tailscale_bin=ts_key_err, systemctl_bin=sys_key_err
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_err:
+            svc_key_err.connect_tailscale({"mode": "authkey", "authKey": secret_key})
+        self.assertEqual(cm_err.exception.status_code, 422)
+        self.assertNotIn(secret_key, str(cm_err.exception))
+
+        calls = [
+            json.loads(line)
+            for line in Path(calls_file).read_text(encoding="utf-8").splitlines()
+        ]
+        up_call = next(c for c in calls if c[:1] == ["up"])
+        auth_arg = next(a for a in up_call if a.startswith("--auth-key=file:"))
+        self.assertNotIn(secret_key, " ".join(up_call))
+        temp_key_path = auth_arg.split(":", 1)[1]
+        self.assertFalse(os.path.exists(temp_key_path))
+        self.assertEqual(
+            Path(seen_key_file).read_text(encoding="utf-8"),
+            secret_key,
+        )
+
+        # Invalid authKey returns 400
+        with self.assertRaises(rb.BridgeRequestError) as cm_bad:
+            svc_key_err.connect_tailscale(
+                {"mode": "authkey", "authKey": "bad-invalid-key"}
+            )
+        self.assertEqual(cm_bad.exception.status_code, 400)
+
+    def test_tailscale_serve_explicit_mcp_mount_and_bare_mcp_rejection(self) -> None:
+        running_json = json.dumps(
+            {
+                "BackendState": "Running",
+                "Self": {
+                    "HostName": "my-vps",
+                    "DNSName": "my-vps.tail42.ts.net.",
+                    "TailscaleIPs": ["100.64.10.5"],
+                },
+                "CurrentTailnet": {"Name": "tail42.ts.net", "MagicDNSEnabled": True},
+                "CertDomains": ["my-vps.tail42.ts.net"],
+            }
+        )
+
+        # Explicit /mcp -> http://127.0.0.1:3001/mcp is accepted as working alongside sibling /wiki,
+        # and disabling Serve removes both / and /mcp while keeping /wiki.
+        ts_explicit, sys_explicit, calls_explicit, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:3001"},
+                                "/mcp": {"Proxy": "http://127.0.0.1:3001/mcp"},
+                                "/wiki": {"Proxy": "http://127.0.0.1:8080"},
+                            }
+                        }
+                    }
+                }
+            ),
+        )
+        svc_explicit = self._service(
+            tailscale_bin=ts_explicit, systemctl_bin=sys_explicit
+        )
+        explicit_status = svc_explicit.tailscale_status()
+        self.assertTrue(explicit_status["serveEnabled"])
+        self.assertIsNone(explicit_status["serveConflict"])
+
+        off_res = svc_explicit.set_tailscale_serve({"enabled": False})
+        self.assertTrue(off_res["ok"])
+        self.assertFalse(off_res["status"]["serveEnabled"])
+        explicit_calls = [
+            json.loads(line)
+            for line in Path(calls_explicit).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(["serve", "--https=443", "--set-path=/", "off"], explicit_calls)
+        self.assertIn(["serve", "--https=443", "--set-path=/mcp", "off"], explicit_calls)
+
+        # Bare /mcp -> http://127.0.0.1:3001 (missing /mcp suffix) is flagged as a conflict
+        # because Tailscale strips /mcp before proxying upstream.
+        ts_bare, sys_bare, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:3001"},
+                                "/mcp": {"Proxy": "http://127.0.0.1:3001"},
+                            }
+                        }
+                    }
+                }
+            ),
+        )
+        bare_status = self._service(
+            tailscale_bin=ts_bare, systemctl_bin=sys_bare
+        ).tailscale_status()
+        self.assertFalse(bare_status["serveEnabled"])
+        self.assertEqual(bare_status["serveConflict"], "/mcp -> http://127.0.0.1:3001")
+
+    def test_tailscale_serve_failed_replacement_preserves_existing_mcp_route(
+        self,
+    ) -> None:
+        running_json = json.dumps(
+            {
+                "BackendState": "Running",
+                "Self": {
+                    "HostName": "my-vps",
+                    "DNSName": "my-vps.tail42.ts.net.",
+                    "TailscaleIPs": ["100.64.10.5"],
+                },
+                "CurrentTailnet": {"Name": "tail42.ts.net", "MagicDNSEnabled": True},
+                "CertDomains": ["my-vps.tail42.ts.net"],
+            }
+        )
+        initial_serve = json.dumps(
+            {
+                "Web": {
+                    "my-vps.tail42.ts.net:443": {
+                        "Handlers": {
+                            "/mcp": {"Proxy": "http://127.0.0.1:9000"},
+                        }
+                    }
+                }
+            }
+        )
+
+        # Zero-exit with HTTPS approval link must fail closed AND never delete existing /mcp route
+        ts_https_req, sys_https_req, calls_https_req, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_apply_state=False,
+            serve_stdout=initial_serve,
+            serve_cmd_rc=0,
+            serve_cmd_stderr="To enable HTTPS, visit: https://login.tailscale.com/f/serve?node=httpsreq",
+        )
+        svc_https_req = self._service(
+            tailscale_bin=ts_https_req, systemctl_bin=sys_https_req
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_https:
+            svc_https_req.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertEqual(cm_https.exception.status_code, 422)
+        self.assertIn(
+            "https://login.tailscale.com/f/serve?node=httpsreq",
+            str(cm_https.exception),
+        )
+        calls_zero = [
+            json.loads(line)
+            for line in Path(calls_https_req).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertNotIn(
+            ["serve", "--https=443", "--set-path=/mcp", "off"], calls_zero
+        )
+        preserved = svc_https_req.tailscale_status()
+        self.assertEqual(preserved["serveConflict"], "/mcp -> http://127.0.0.1:9000")
+
+        # Non-zero serve failure must likewise leave existing /mcp route intact
+        ts_err, sys_err, calls_err, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_stdout=initial_serve,
+            serve_cmd_rc=1,
+            serve_cmd_stderr="HTTPS cert approval pending",
+        )
+        svc_err = self._service(tailscale_bin=ts_err, systemctl_bin=sys_err)
+        with self.assertRaises(rb.BridgeRequestError) as cm_err:
+            svc_err.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertEqual(cm_err.exception.status_code, 422)
+        calls_rc1 = [
+            json.loads(line)
+            for line in Path(calls_err).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertNotIn(
+            ["serve", "--https=443", "--set-path=/mcp", "off"], calls_rc1
+        )
+        self.assertEqual(
+            svc_err.tailscale_status()["serveConflict"],
+            "/mcp -> http://127.0.0.1:9000",
+        )
+
+    def test_tailscale_funnel_and_credential_redaction_in_conflicts(self) -> None:
+        running_json = json.dumps(
+            {
+                "BackendState": "Running",
+                "Self": {
+                    "HostName": "my-vps",
+                    "DNSName": "my-vps.tail42.ts.net.",
+                    "TailscaleIPs": ["100.64.10.5"],
+                },
+                "CurrentTailnet": {"Name": "tail42.ts.net", "MagicDNSEnabled": True},
+                "CertDomains": ["my-vps.tail42.ts.net"],
+            }
+        )
+
+        # Public Funnel active -> serveEnabled must be False until switched to private Serve
+        # Realistic Tailscale CLI writes Funnel removal notice to stderr even on success.
+        ts_funnel, sys_funnel, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_cmd_rc=0,
+            serve_cmd_stderr="Disabled Funnel on port 443; serving privately to your tailnet.\n",
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:3001"}}
+                        }
+                    },
+                    "AllowFunnel": {"my-vps.tail42.ts.net:443": True},
+                }
+            ),
+        )
+        svc_funnel = self._service(tailscale_bin=ts_funnel, systemctl_bin=sys_funnel)
+        funnel_status = svc_funnel.tailscale_status()
+        self.assertFalse(funnel_status["serveEnabled"])
+        self.assertIsNone(funnel_status["serveUrl"])
+        self.assertIsNone(funnel_status["mcpUrl"])
+        self.assertIsNone(funnel_status["serveConflict"])
+        self.assertIn("Funnel", funnel_status["detail"] or "")
+
+        switched = svc_funnel.set_tailscale_serve({"enabled": True})
+        self.assertTrue(switched["ok"])
+        self.assertTrue(switched["status"]["serveEnabled"])
+        self.assertEqual(switched["status"]["serveUrl"], "https://my-vps.tail42.ts.net")
+
+        # Public Funnel + non-VPSAgent sibling routes must surface as a port-wide conflict (409)
+        # unless force=True, and credentials on sibling routes must be redacted.
+        ts_funnel_sib, sys_funnel_sib, calls_funnel_sib, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_cmd_rc=0,
+            serve_cmd_stderr="Disabled Funnel on port 443; serving privately to your tailnet.\n",
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:3001"},
+                                "/status": {
+                                    "Proxy": "http://bot:secret99@127.0.0.1:8080/health?key=leakme"
+                                },
+                            }
+                        }
+                    },
+                    "AllowFunnel": {"my-vps.tail42.ts.net:443": True},
+                }
+            ),
+        )
+        svc_funnel_sib = self._service(
+            tailscale_bin=ts_funnel_sib, systemctl_bin=sys_funnel_sib
+        )
+        sib_status = svc_funnel_sib.tailscale_status()
+        self.assertFalse(sib_status["serveEnabled"])
+        self.assertTrue(
+            (sib_status["serveConflict"] or "").startswith(
+                "public Funnel sibling routes"
+            )
+        )
+        self.assertIn(
+            "/status -> http://[REDACTED]@127.0.0.1:8080/health",
+            sib_status["serveConflict"] or "",
+        )
+        self.assertEqual(
+            sib_status["serveConflictDetails"],
+            {
+                "funnelActive": True,
+                "preservedFunnelSiblings": [
+                    "/status -> http://[REDACTED]@127.0.0.1:8080/health"
+                ],
+                "replacedRootRoute": None,
+                "removedMcpRoute": None,
+            },
+        )
+        self.assertIn("tailnet only", sib_status["detail"] or "")
+        for leaked in ("bot", "secret99", "leakme"):
+            self.assertNotIn(leaked, str(sib_status))
+
+        with self.assertRaises(rb.BridgeRequestError) as cm_sib_409:
+            svc_funnel_sib.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_sib_409.exception.status_code, 409)
+        self.assertIn("entire port 443 listener", str(cm_sib_409.exception))
+        for leaked in ("bot", "secret99", "leakme"):
+            self.assertNotIn(leaked, str(cm_sib_409.exception))
+        sib_calls_before = [
+            json.loads(line)
+            for line in Path(calls_funnel_sib).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertFalse(any(c[:2] == ["serve", "--bg"] for c in sib_calls_before))
+
+        sib_forced = svc_funnel_sib.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertTrue(sib_forced["ok"])
+        self.assertTrue(sib_forced["status"]["serveEnabled"])
+        self.assertIsNone(sib_forced["status"]["serveConflict"])
+        self.assertIsNone(sib_forced["status"]["serveConflictDetails"])
+
+        # Public Funnel + preserved sibling /status + conflicting /mcp must separate
+        # preserved sibling from removed /mcp route, keep secrets redacted, and preserve /status on force=True
+        ts_funnel_mcp, sys_funnel_mcp, calls_funnel_mcp, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_cmd_rc=0,
+            serve_cmd_stderr="Disabled Funnel on port 443; serving privately to your tailnet.\n",
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:3001"},
+                                "/status": {"Proxy": "http://127.0.0.1:8080/health"},
+                                "/mcp": {
+                                    "Proxy": "http://mcpbot:mcpsecret@127.0.0.1:9000/mcp?tok=mcpquery"
+                                },
+                            }
+                        }
+                    },
+                    "AllowFunnel": {"my-vps.tail42.ts.net:443": True},
+                }
+            ),
+        )
+        svc_funnel_mcp = self._service(
+            tailscale_bin=ts_funnel_mcp, systemctl_bin=sys_funnel_mcp
+        )
+        fm_status = svc_funnel_mcp.tailscale_status()
+        self.assertFalse(fm_status["serveEnabled"])
+        self.assertIn(
+            "public Funnel sibling routes (/status -> http://127.0.0.1:8080/health)",
+            fm_status["serveConflict"] or "",
+        )
+        self.assertIn(
+            "removed /mcp route (/mcp -> http://[REDACTED]@127.0.0.1:9000/mcp)",
+            fm_status["serveConflict"] or "",
+        )
+        self.assertEqual(
+            fm_status["serveConflictDetails"],
+            {
+                "funnelActive": True,
+                "preservedFunnelSiblings": [
+                    "/status -> http://127.0.0.1:8080/health"
+                ],
+                "replacedRootRoute": None,
+                "removedMcpRoute": "/mcp -> http://[REDACTED]@127.0.0.1:9000/mcp",
+            },
+        )
+        self.assertIn("tailnet only", fm_status["detail"] or "")
+        self.assertIn("will be removed", fm_status["detail"] or "")
+        self.assertIn("even inside your tailnet", fm_status["detail"] or "")
+        for leaked in ("mcpbot", "mcpsecret", "mcpquery"):
+            self.assertNotIn(leaked, str(fm_status))
+
+        with self.assertRaises(rb.BridgeRequestError) as cm_fm_409:
+            svc_funnel_mcp.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_fm_409.exception.status_code, 409)
+        self.assertIn("tailnet only", str(cm_fm_409.exception))
+        self.assertIn("will be removed", str(cm_fm_409.exception))
+        self.assertIn("even inside your tailnet", str(cm_fm_409.exception))
+        for leaked in ("mcpbot", "mcpsecret", "mcpquery"):
+            self.assertNotIn(leaked, str(cm_fm_409.exception))
+        fm_calls_before = [
+            json.loads(line)
+            for line in Path(calls_funnel_mcp).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertFalse(any(c[:2] == ["serve", "--bg"] for c in fm_calls_before))
+        self.assertNotIn(
+            ["serve", "--https=443", "--set-path=/mcp", "off"], fm_calls_before
+        )
+
+        fm_forced = svc_funnel_mcp.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertTrue(fm_forced["ok"])
+        self.assertTrue(fm_forced["status"]["serveEnabled"])
+        self.assertIsNone(fm_forced["status"]["serveConflict"])
+        self.assertIsNone(fm_forced["status"]["serveConflictDetails"])
+        fm_state = json.loads(
+            (Path(calls_funnel_mcp).parent / "ts-serve-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fm_handlers = fm_state["Web"]["my-vps.tail42.ts.net:443"]["Handlers"]
+        self.assertEqual(fm_handlers["/"], {"Proxy": "http://127.0.0.1:3001"})
+        self.assertEqual(
+            fm_handlers["/status"], {"Proxy": "http://127.0.0.1:8080/health"}
+        )
+        self.assertNotIn("/mcp", fm_handlers)
+        self.assertFalse(fm_state["AllowFunnel"]["my-vps.tail42.ts.net:443"])
+
+        # Public Funnel + preserved sibling + conflicting / + conflicting /mcp
+        ts_funnel_all, sys_funnel_all, calls_funnel_all, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_cmd_rc=0,
+            serve_cmd_stderr="Disabled Funnel on port 443; serving privately to your tailnet.\n",
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:9000"},
+                                "/status": {"Proxy": "http://127.0.0.1:8080/health"},
+                                "/mcp": {"Proxy": "http://127.0.0.1:9001/mcp"},
+                            }
+                        }
+                    },
+                    "AllowFunnel": {"my-vps.tail42.ts.net:443": True},
+                }
+            ),
+        )
+        svc_funnel_all = self._service(
+            tailscale_bin=ts_funnel_all, systemctl_bin=sys_funnel_all
+        )
+        fa_status = svc_funnel_all.tailscale_status()
+        self.assertEqual(
+            fa_status["serveConflictDetails"],
+            {
+                "funnelActive": True,
+                "preservedFunnelSiblings": [
+                    "/status -> http://127.0.0.1:8080/health"
+                ],
+                "replacedRootRoute": "/ -> http://127.0.0.1:9000",
+                "removedMcpRoute": "/mcp -> http://127.0.0.1:9001/mcp",
+            },
+        )
+        self.assertIn("will be replaced by VPSAgent", fa_status["detail"] or "")
+        self.assertIn("will be removed", fa_status["detail"] or "")
+        with self.assertRaises(rb.BridgeRequestError) as cm_fa_409:
+            svc_funnel_all.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_fa_409.exception.status_code, 409)
+        self.assertIn("will be replaced by VPSAgent", str(cm_fa_409.exception))
+        self.assertIn("will be removed", str(cm_fa_409.exception))
+
+        fa_forced = svc_funnel_all.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertTrue(fa_forced["ok"])
+        self.assertTrue(fa_forced["status"]["serveEnabled"])
+        fa_state = json.loads(
+            (Path(calls_funnel_all).parent / "ts-serve-state.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        fa_handlers = fa_state["Web"]["my-vps.tail42.ts.net:443"]["Handlers"]
+        self.assertEqual(fa_handlers["/"], {"Proxy": "http://127.0.0.1:3001"})
+        self.assertEqual(
+            fa_handlers["/status"], {"Proxy": "http://127.0.0.1:8080/health"}
+        )
+        self.assertNotIn("/mcp", fa_handlers)
+
+        # If Funnel stays active after serve command, fail closed with 422
+        ts_stuck, sys_stuck, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            keep_funnel_on_serve=True,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:3001"}}
+                        }
+                    },
+                    "AllowFunnel": {"my-vps.tail42.ts.net:443": True},
+                }
+            ),
+        )
+        svc_stuck = self._service(tailscale_bin=ts_stuck, systemctl_bin=sys_stuck)
+        with self.assertRaises(rb.BridgeRequestError) as cm_stuck:
+            svc_stuck.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_stuck.exception.status_code, 422)
+        self.assertIn("Funnel", str(cm_stuck.exception))
+
+        # Proxy URL credentials & query secrets are redacted from status and 409 conflict messages
+        ts_creds, sys_creds, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {
+                                    "Proxy": "http://admin:supersecret@127.0.0.1:9000/app?token=querysecret"
+                                },
+                                "/mcp": {
+                                    "Proxy": "http://tokensecret@127.0.0.1:9000/mcp?code=fragsecret#hash"
+                                },
+                            }
+                        }
+                    }
+                }
+            ),
+        )
+        svc_creds = self._service(tailscale_bin=ts_creds, systemctl_bin=sys_creds)
+        cred_status = svc_creds.tailscale_status()
+        self.assertIn("[REDACTED]@127.0.0.1:9000/mcp", cred_status["serveConflict"] or "")
+        for leaked in (
+            "admin",
+            "supersecret",
+            "querysecret",
+            "tokensecret",
+            "fragsecret",
+            "hash",
+        ):
+            self.assertNotIn(leaked, str(cred_status))
+        with self.assertRaises(rb.BridgeRequestError) as cm_cred_409:
+            svc_creds.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_cred_409.exception.status_code, 409)
+        for leaked in ("tokensecret", "fragsecret", "hash"):
+            self.assertNotIn(leaked, str(cm_cred_409.exception))
+
+        # Root-only proxy URL with credentials & query string also redacts cleanly
+        ts_root_creds, sys_root_creds, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {
+                                    "Proxy": "http://admin:supersecret@127.0.0.1:9000/app?token=querysecret#frag"
+                                }
+                            }
+                        }
+                    }
+                }
+            ),
+        )
+        root_cred_status = self._service(
+            tailscale_bin=ts_root_creds, systemctl_bin=sys_root_creds
+        ).tailscale_status()
+        self.assertEqual(
+            root_cred_status["serveConflict"],
+            "http://[REDACTED]@127.0.0.1:9000/app",
+        )
+        for leaked in ("admin", "supersecret", "querysecret", "frag"):
+            self.assertNotIn(leaked, str(root_cred_status))
+
+
 if __name__ == "__main__":
     unittest.main()

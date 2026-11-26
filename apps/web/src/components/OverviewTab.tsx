@@ -372,31 +372,66 @@ export function OverviewTab({
               </span>
             </div>
 
-            <div className="surface-well rounded-lg p-3.5 text-xs leading-relaxed text-[#9CA3AF]">
-              {data.setup.domain &&
-              data.setup.httpsActive &&
-              data.setup.tlsStatus === "active" ? (
-                <div className="space-y-1">
-                  <span className="text-emerald-400 font-medium">
-                    Verified automatic HTTPS
-                  </span>
-                  <p className="font-mono text-[#F4F5F7] break-all">
-                    https://{data.setup.domain}/mcp
-                  </p>
-                </div>
-              ) : data.setup.domain ? (
-                <span className="text-amber-300">
-                  HTTPS certificate for{" "}
-                  <code className="text-amber-200">{data.setup.domain}</code> is{" "}
-                  <strong className="font-semibold">
-                    {data.setup.tlsStatus}
-                  </strong>
-                  {data.setup.tlsError ? ` (${data.setup.tlsError})` : ""}. Keep
-                  using your local SSH tunnel until DNS and HTTPS verify.
-                </span>
-              ) : (
-                "Connect a domain in AI Keys & Settings to enable remote HTTPS access for Claude Code, Cursor, T3 Code, or Codex."
-              )}
+            <div className="surface-well rounded-lg p-3.5 text-xs leading-relaxed text-[#9CA3AF] space-y-2.5">
+              {(() => {
+                const customActive = Boolean(
+                  data.setup.domain &&
+                    data.setup.httpsActive &&
+                    data.setup.tlsStatus === "active",
+                );
+                const tailscaleActive = Boolean(
+                  data.setup.tailscaleDomain && data.setup.tailscaleServeEnabled,
+                );
+                if (!customActive && !tailscaleActive && !data.setup.domain) {
+                  return (
+                    <span>
+                      Connect a domain or enable Tailscale in AI Keys &amp;
+                      Settings to get remote HTTPS access for Claude Code,
+                      Cursor, T3 Code, or Codex.
+                    </span>
+                  );
+                }
+                return (
+                  <>
+                    {customActive && (
+                      <div className="space-y-1">
+                        <span className="text-emerald-400 font-medium">
+                          Verified automatic HTTPS
+                        </span>
+                        <p className="font-mono text-[#F4F5F7] break-all">
+                          https://{data.setup.domain}/mcp
+                        </p>
+                      </div>
+                    )}
+                    {tailscaleActive && (
+                      <div className="space-y-1">
+                        <span className="text-emerald-400 font-medium">
+                          Private Tailscale HTTPS
+                        </span>
+                        <p className="font-mono text-[#F4F5F7] break-all">
+                          https://{data.setup.tailscaleDomain}/mcp
+                        </p>
+                      </div>
+                    )}
+                    {!customActive && data.setup.domain && (
+                      <p className="text-amber-300">
+                        HTTPS certificate for{" "}
+                        <code className="text-amber-200">
+                          {data.setup.domain}
+                        </code>{" "}
+                        is{" "}
+                        <strong className="font-semibold">
+                          {data.setup.tlsStatus}
+                        </strong>
+                        {data.setup.tlsError ? ` (${data.setup.tlsError})` : ""}
+                        .
+                        {!tailscaleActive &&
+                          " Keep using your local SSH tunnel or enable Tailscale until DNS and HTTPS verify."}
+                      </p>
+                    )}
+                  </>
+                );
+              })()}
             </div>
 
             <div className="flex items-start gap-2.5 pt-2 border-t border-white/[0.06] text-xs text-[#9CA3AF]">

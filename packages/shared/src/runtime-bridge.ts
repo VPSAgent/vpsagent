@@ -11,6 +11,7 @@ import {
   validateGitAccessToken,
   validateGitBranch,
   validateHttpBaseUrl,
+  validateTailscaleAuthKey,
 } from "./safety.js";
 import type { RegistryStore } from "./store.js";
 import {
@@ -421,6 +422,71 @@ export type RuntimeCoreUpdateApplyResult = z.infer<
   typeof RuntimeCoreUpdateApplyResultSchema
 >;
 
+export const TailscaleBackendStateSchema = z.enum([
+  "not_installed",
+  "stopped",
+  "needs_login",
+  "needs_machine_auth",
+  "starting",
+  "running",
+  "unknown",
+]);
+export type TailscaleBackendState = z.infer<typeof TailscaleBackendStateSchema>;
+
+export const RuntimeTailscaleServeConflictDetailsSchema = z.object({
+  funnelActive: z.boolean().default(false),
+  preservedFunnelSiblings: z.array(z.string()).default([]),
+  replacedRootRoute: z.string().nullable().default(null),
+  removedMcpRoute: z.string().nullable().default(null),
+});
+export type RuntimeTailscaleServeConflictDetails = z.infer<
+  typeof RuntimeTailscaleServeConflictDetailsSchema
+>;
+
+export const RuntimeTailscaleStatusSchema = z.object({
+  installed: z.boolean(),
+  serviceActive: z.boolean(),
+  connected: z.boolean(),
+  backendState: TailscaleBackendStateSchema,
+  tailscaleIp: z.string().nullable(),
+  tailscaleIps: z.array(z.string()).default([]),
+  hostname: z.string().nullable(),
+  dnsName: z.string().nullable(),
+  tailnetName: z.string().nullable(),
+  magicDnsEnabled: z.boolean().default(false),
+  httpsCertsAvailable: z.boolean().default(false),
+  loginUrl: z.string().nullable().default(null),
+  serveEnabled: z.boolean().default(false),
+  serveTarget: z.string().nullable().default(null),
+  serveUrl: z.string().nullable().default(null),
+  mcpUrl: z.string().nullable().default(null),
+  serveConflict: z.string().nullable().default(null),
+  serveConflictDetails: RuntimeTailscaleServeConflictDetailsSchema.nullable().default(null),
+  cliVersion: z.string().nullable().default(null),
+  detail: z.string().nullable().default(null),
+});
+export type RuntimeTailscaleStatus = z.infer<
+  typeof RuntimeTailscaleStatusSchema
+>;
+
+export const RuntimeTailscaleActionResultSchema = z.object({
+  ok: z.boolean(),
+  status: RuntimeTailscaleStatusSchema,
+  actionUrl: z.string().nullable().default(null),
+});
+export type RuntimeTailscaleActionResult = z.infer<
+  typeof RuntimeTailscaleActionResultSchema
+>;
+
+export const RuntimeTailscaleConnectResultSchema = z.object({
+  ok: z.boolean(),
+  status: RuntimeTailscaleStatusSchema,
+  loginUrl: z.string().nullable().default(null),
+});
+export type RuntimeTailscaleConnectResult = z.infer<
+  typeof RuntimeTailscaleConnectResultSchema
+>;
+
 export interface RuntimeExecInAppInput {
   slug: string;
   command: string;
@@ -508,6 +574,16 @@ export interface RuntimeReadinessOptions {
   pollIntervalMs?: number | undefined;
 }
 
+export interface RuntimeTailscaleServeInput {
+  enabled: boolean;
+  force?: boolean | undefined;
+}
+
+export interface RuntimeTailscaleConnectInput {
+  mode?: "login" | "authkey" | undefined;
+  authKey?: string | undefined;
+}
+
 /** Narrow, allowlisted runtime bridge interface between core services and host Docker/Caddy. */
 export interface RuntimeBridge {
   health(): Promise<RuntimeHealthResult>;
@@ -565,6 +641,13 @@ export interface RuntimeBridge {
   applyCoreUpdate?(
     input?: RuntimeCoreUpdateApplyInput,
   ): Promise<RuntimeCoreUpdateApplyResult>;
+  getTailscaleStatus?(): Promise<RuntimeTailscaleStatus>;
+  setTailscaleServe?(
+    input: RuntimeTailscaleServeInput,
+  ): Promise<RuntimeTailscaleActionResult>;
+  connectTailscale?(
+    input?: RuntimeTailscaleConnectInput,
+  ): Promise<RuntimeTailscaleConnectResult>;
 }
 
 export class RuntimeBridgeError extends Error {
@@ -1300,6 +1383,99 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
     return {
       ...parsed,
       status: this.sanitizeUpdateStatus(parsed.status),
+    };
+  }
+
+  private sanitizeTailscaleStatus(
+    parsed: RuntimeTailscaleStatus,
+  ): RuntimeTailscaleStatus {
+    return {
+      ...parsed,
+      serveConflict: parsed.serveConflict
+        ? redactSecrets(parsed.serveConflict)
+        : null,
+      serveConflictDetails: parsed.serveConflictDetails
+        ? {
+            funnelActive: parsed.serveConflictDetails.funnelActive,
+            preservedFunnelSiblings:
+              parsed.serveConflictDetails.preservedFunnelSiblings.map((item) =>
+                redactSecrets(item),
+              ),
+            replacedRootRoute: parsed.serveConflictDetails.replacedRootRoute
+              ? redactSecrets(parsed.serveConflictDetails.replacedRootRoute)
+              : null,
+            removedMcpRoute: parsed.serveConflictDetails.removedMcpRoute
+              ? redactSecrets(parsed.serveConflictDetails.removedMcpRoute)
+              : null,
+          }
+        : null,
+      detail: parsed.detail ? redactSecrets(parsed.detail) : null,
+    };
+  }
+
+  async getTailscaleStatus(): Promise<RuntimeTailscaleStatus> {
+    const raw = await this.requestJson(
+      "GET",
+      "/v1/host/tailscale/status",
+      undefined,
+      SHORT_TIMEOUT_MS,
+    );
+    return this.sanitizeTailscaleStatus(
+      RuntimeTailscaleStatusSchema.parse(raw),
+    );
+  }
+
+  async setTailscaleServe(
+    input: RuntimeTailscaleServeInput,
+  ): Promise<RuntimeTailscaleActionResult> {
+    const enabled = z.boolean().parse(input.enabled);
+    const force = Boolean(input.force);
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/host/tailscale/serve",
+      { enabled, force },
+      45_000,
+    );
+    const parsed = RuntimeTailscaleActionResultSchema.parse(raw);
+    return {
+      ...parsed,
+      status: this.sanitizeTailscaleStatus(parsed.status),
+    };
+  }
+
+  async connectTailscale(
+    input?: RuntimeTailscaleConnectInput,
+  ): Promise<RuntimeTailscaleConnectResult> {
+    const mode = z.enum(["login", "authkey"]).parse(input?.mode ?? "login");
+    const safeKey =
+      mode === "authkey"
+        ? validateTailscaleAuthKey(input?.authKey ?? "")
+        : undefined;
+    let raw: unknown;
+    try {
+      raw = await this.requestJson(
+        "POST",
+        "/v1/host/tailscale/connect",
+        {
+          mode,
+          ...(safeKey !== undefined ? { authKey: safeKey } : {}),
+        },
+        45_000,
+      );
+    } catch (err) {
+      if (err instanceof RuntimeBridgeError) {
+        throw new RuntimeBridgeError(
+          err.statusCode,
+          scrubTokenFromText(err.message, safeKey),
+          err.buildLogTail.map((line) => scrubTokenFromText(line, safeKey)),
+        );
+      }
+      throw err;
+    }
+    const parsed = RuntimeTailscaleConnectResultSchema.parse(raw);
+    return {
+      ...parsed,
+      status: this.sanitizeTailscaleStatus(parsed.status),
     };
   }
 

@@ -7,6 +7,53 @@ export interface SetupState {
   tlsStatus: "inactive" | "pending" | "active" | "failed";
   tlsError: string | null;
   claimedAt: string | null;
+  tailscaleDomain: string | null;
+  tailscaleServeEnabled: boolean;
+}
+
+export type TailscaleBackendState =
+  | "not_installed"
+  | "stopped"
+  | "needs_login"
+  | "needs_machine_auth"
+  | "starting"
+  | "running"
+  | "unknown";
+
+export interface TailscaleServeConflictDetails {
+  funnelActive: boolean;
+  preservedFunnelSiblings: string[];
+  replacedRootRoute: string | null;
+  removedMcpRoute: string | null;
+}
+
+export interface TailscaleStatus {
+  installed: boolean;
+  serviceActive: boolean;
+  connected: boolean;
+  backendState: TailscaleBackendState;
+  tailscaleIp: string | null;
+  tailscaleIps: string[];
+  hostname: string | null;
+  dnsName: string | null;
+  tailnetName: string | null;
+  magicDnsEnabled: boolean;
+  httpsCertsAvailable: boolean;
+  loginUrl: string | null;
+  serveEnabled: boolean;
+  serveTarget: string | null;
+  serveUrl: string | null;
+  mcpUrl: string | null;
+  serveConflict: string | null;
+  serveConflictDetails: TailscaleServeConflictDetails | null;
+  cliVersion: string | null;
+  detail: string | null;
+}
+
+export interface TailscaleStatusResponse {
+  status: TailscaleStatus;
+  bridgeSupported: boolean;
+  setup: SetupState;
 }
 
 export interface SessionInfo {
@@ -202,7 +249,7 @@ export interface McpTokenRecord {
   revokedAt: string | null;
 }
 
-export interface McpSnippets {
+export interface McpSnippetVariant {
   mcpUrl: string;
   httpsReady: boolean;
   tokenPlaceholder: string;
@@ -214,9 +261,23 @@ export interface McpSnippets {
   curlTest: string;
 }
 
+export interface McpSnippetEndpoint {
+  url: string;
+  httpsReady: boolean;
+  snippets: McpSnippetVariant;
+}
+
+export interface McpSnippets extends McpSnippetVariant {
+  primarySource?: "domain" | "tailscale" | "local";
+  customDomain?: McpSnippetEndpoint | null;
+  tailscale?: McpSnippetEndpoint | null;
+}
+
 export interface McpConnectionTestResult {
   ok: boolean;
   mcpUrl: string;
+  domainMcpUrl?: string | null;
+  tailscaleMcpUrl?: string | null;
   httpsReady: boolean;
   bridgeOk: boolean;
   toolCount: number;
@@ -362,6 +423,28 @@ export const api = {
   recheckTls: () =>
     apiFetch<{ ok: true; setup: SetupState }>("/api/setup/tls-recheck", {
       method: "POST",
+    }),
+  getTailscaleStatus: () =>
+    apiFetch<TailscaleStatusResponse>("/api/tailscale/status"),
+  setTailscaleServe: (enabled: boolean, force = false) =>
+    apiFetch<{
+      ok: boolean;
+      status: TailscaleStatus;
+      actionUrl: string | null;
+      setup: SetupState;
+    }>("/api/tailscale/serve", {
+      method: "POST",
+      body: JSON.stringify({ enabled, force }),
+    }),
+  connectTailscale: (body?: { mode?: "login" | "authkey"; authKey?: string }) =>
+    apiFetch<{
+      ok: boolean;
+      status: TailscaleStatus;
+      loginUrl: string | null;
+      setup: SetupState;
+    }>("/api/tailscale/connect", {
+      method: "POST",
+      body: JSON.stringify(body ?? { mode: "login" }),
     }),
   login: (passphrase: string) =>
     apiFetch<{ ok: true; setup: SetupState }>("/api/auth/login", {

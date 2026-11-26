@@ -10,10 +10,13 @@ import {
   type RegistryStore,
   type RuntimeBridge,
   RuntimeBridgeError,
+  type RuntimeTailscaleStatus,
+  type SetupState,
   redactSecrets,
   scrubTokenFromText,
   syncAppStatuses,
   validateDomain,
+  validateTailscaleAuthKey,
 } from "@vpsagent/shared";
 import {
   SessionManager,
@@ -21,6 +24,7 @@ import {
   assertSecureTransport,
   getRequestHost,
   getRequestProtocol,
+  normalizeHostWithoutDefaultPort,
 } from "./auth.js";
 import {
   AppExecutor,
@@ -94,6 +98,16 @@ const CreateGitCredentialBodySchema = z.object({
   label: z.string().trim().max(80).optional(),
   token: z.string().trim().min(1, "GitHub token is required.").max(512),
   isDefault: z.boolean().optional(),
+});
+
+const TailscaleServeBodySchema = z.object({
+  enabled: z.boolean(),
+  force: z.boolean().optional(),
+});
+
+const TailscaleConnectBodySchema = z.object({
+  mode: z.enum(["login", "authkey"]).default("login"),
+  authKey: z.string().trim().min(1).max(300).optional(),
 });
 
 const MIME_TYPES: Record<string, string> = {
@@ -368,8 +382,8 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   );
 
   // Streamable HTTP spec: return 405 Method Not Allowed on GET /mcp when SSE is not offered
-  app.get("/mcp", (c) => {
-    const guard = enforceMcpBoundary(c, store, transportOptions);
+  app.get("/mcp", async (c) => {
+    const guard = await enforceMcpBoundary(c, store, transportOptions, bridge);
     if (!guard.ok) {
       return guard.response;
     }
@@ -381,8 +395,8 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
 
   // Streamable HTTP spec: close & invalidate a server-issued session via DELETE /mcp
-  app.delete("/mcp", (c) => {
-    const guard = enforceMcpBoundary(c, store, transportOptions);
+  app.delete("/mcp", async (c) => {
+    const guard = await enforceMcpBoundary(c, store, transportOptions, bridge);
     if (!guard.ok) {
       return guard.response;
     }
@@ -428,6 +442,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   app.use("/api/audit", requireOwner);
   app.use("/api/mcp/*", requireOwner);
   app.use("/api/system/*", requireOwner);
+  app.use("/api/tailscale/*", requireOwner);
 
   const assertSameOriginPost = (
     c: Parameters<Parameters<typeof app.use>[1]>[0],
@@ -447,15 +462,20 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       } catch {
         return c.json({ error: "Invalid Origin header." }, 403);
       }
-      const expectedHost = (getRequestHost(c, trustProxy) || "").toLowerCase();
-      if (!expectedHost || parsedOrigin.host.toLowerCase() !== expectedHost) {
+      const expectedProto = getRequestProtocol(c, trustProxy);
+      const isHttps = expectedProto === "https";
+      const expectedHost = normalizeHostWithoutDefaultPort(
+        getRequestHost(c, trustProxy) || "",
+        isHttps,
+      );
+      const originHost = normalizeHostWithoutDefaultPort(
+        parsedOrigin.host,
+        parsedOrigin.protocol.toLowerCase() === "https:",
+      );
+      if (!expectedHost || originHost !== expectedHost) {
         return c.json({ error: "Cross-origin request blocked." }, 403);
       }
-      const expectedProto = getRequestProtocol(c, trustProxy);
-      if (
-        expectedProto === "https" &&
-        parsedOrigin.protocol.toLowerCase() !== "https:"
-      ) {
+      if (isHttps && parsedOrigin.protocol.toLowerCase() !== "https:") {
         return c.json(
           { error: "HTTPS Origin is required for this request." },
           403,
@@ -1142,25 +1162,67 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
 
   app.get("/api/mcp/snippets", (c) => {
     const setup = store.getSetupState();
-    const httpsReady = Boolean(
+    const domainHttpsReady = Boolean(
       setup.domain && setup.httpsActive && setup.tlsStatus === "active",
     );
+    const tailscaleHttpsReady = Boolean(
+      setup.tailscaleDomain && setup.tailscaleServeEnabled,
+    );
+    const domainMcpUrl = setup.domain ? `https://${setup.domain}/mcp` : null;
+    const tailscaleMcpUrl = tailscaleHttpsReady
+      ? `https://${setup.tailscaleDomain}/mcp`
+      : null;
+    const primarySource: "domain" | "tailscale" | "local" = domainHttpsReady
+      ? "domain"
+      : tailscaleHttpsReady
+        ? "tailscale"
+        : "local";
+    const httpsReady = domainHttpsReady || tailscaleHttpsReady;
     const host = getRequestHost(c, trustProxy) || "localhost:3002";
-    const mcpUrl = httpsReady
-      ? `https://${setup.domain}/mcp`
-      : `http://${host}/mcp`;
-    return c.json(buildMcpSetupSnippets(mcpUrl, httpsReady));
+    const mcpUrl = domainHttpsReady
+      ? domainMcpUrl!
+      : tailscaleHttpsReady
+        ? tailscaleMcpUrl!
+        : `http://${host}/mcp`;
+    return c.json({
+      ...buildMcpSetupSnippets(mcpUrl, httpsReady),
+      primarySource,
+      customDomain: domainMcpUrl
+        ? {
+            url: domainMcpUrl,
+            httpsReady: domainHttpsReady,
+            snippets: buildMcpSetupSnippets(domainMcpUrl, domainHttpsReady),
+          }
+        : null,
+      tailscale: tailscaleMcpUrl
+        ? {
+            url: tailscaleMcpUrl,
+            httpsReady: true,
+            snippets: buildMcpSetupSnippets(tailscaleMcpUrl, true),
+          }
+        : null,
+    });
   });
 
   app.post("/api/mcp/test", async (c) => {
     const setup = store.getSetupState();
-    const httpsReady = Boolean(
+    const domainHttpsReady = Boolean(
       setup.domain && setup.httpsActive && setup.tlsStatus === "active",
     );
+    const tailscaleHttpsReady = Boolean(
+      setup.tailscaleDomain && setup.tailscaleServeEnabled,
+    );
+    const domainMcpUrl = setup.domain ? `https://${setup.domain}/mcp` : null;
+    const tailscaleMcpUrl = tailscaleHttpsReady
+      ? `https://${setup.tailscaleDomain}/mcp`
+      : null;
+    const httpsReady = domainHttpsReady || tailscaleHttpsReady;
     const host = getRequestHost(c, trustProxy) || "localhost:3002";
-    const mcpUrl = httpsReady
-      ? `https://${setup.domain}/mcp`
-      : `http://${host}/mcp`;
+    const mcpUrl = domainHttpsReady
+      ? domainMcpUrl!
+      : tailscaleHttpsReady
+        ? tailscaleMcpUrl!
+        : `http://${host}/mcp`;
 
     let bridgeOk = false;
     try {
@@ -1177,13 +1239,19 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       ? "The server handyman (Runtime Bridge) is not responding right now."
       : activeTokens === 0
         ? "Gateway is healthy, but you haven't created an AI visitor pass yet."
-        : httpsReady
-          ? `Server-side gateway check OK: bridge healthy, HTTPS active, ${MCP_TOOLS.length} tools loaded, ${activeTokens} active pass(es). Use the Curl Test tab to run a live client handshake.`
-          : `Server-side gateway check OK locally (${MCP_TOOLS.length} tools loaded, ${activeTokens} active pass(es)). Connect a domain below for remote HTTPS access.`;
+        : domainHttpsReady && tailscaleHttpsReady
+          ? `Server-side gateway check OK: bridge healthy, HTTPS active on both your custom domain and Tailscale, ${MCP_TOOLS.length} tools loaded, ${activeTokens} active pass(es). Use the Curl tab to run a live client handshake.`
+          : domainHttpsReady
+            ? `Server-side gateway check OK: bridge healthy, HTTPS active, ${MCP_TOOLS.length} tools loaded, ${activeTokens} active pass(es). Use the Curl Test tab to run a live client handshake.`
+            : tailscaleHttpsReady
+              ? `Server-side gateway check OK: bridge healthy, Tailscale private HTTPS active (${tailscaleMcpUrl}), ${MCP_TOOLS.length} tools loaded, ${activeTokens} active pass(es). Use the Curl tab to run a live client handshake from a device on your tailnet.`
+              : `Server-side gateway check OK locally (${MCP_TOOLS.length} tools loaded, ${activeTokens} active pass(es)). Connect a domain or enable Tailscale private HTTPS below for remote access.`;
 
     return c.json({
       ok,
       mcpUrl,
+      domainMcpUrl,
+      tailscaleMcpUrl,
       httpsReady,
       bridgeOk,
       toolCount: MCP_TOOLS.length,
@@ -1191,6 +1259,182 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       protocolVersion: SUPPORTED_MCP_PROTOCOL_VERSIONS[0],
       message,
     });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Tailscale Private HTTPS Access (Owner-only + strict CSRF/HTTPS guards)
+  // ---------------------------------------------------------------------------
+
+  const unavailableTailscaleDetail =
+    "The host Runtime Bridge needs a one-time update before Tailscale management can run. Re-run the installer once on your server.";
+
+  const unavailableTailscaleStatus: RuntimeTailscaleStatus = {
+    installed: false,
+    serviceActive: false,
+    connected: false,
+    backendState: "not_installed",
+    tailscaleIp: null,
+    tailscaleIps: [],
+    hostname: null,
+    dnsName: null,
+    tailnetName: null,
+    magicDnsEnabled: false,
+    httpsCertsAvailable: false,
+    loginUrl: null,
+    serveEnabled: false,
+    serveTarget: null,
+    serveUrl: null,
+    mcpUrl: null,
+    serveConflict: null,
+    serveConflictDetails: null,
+    cliVersion: null,
+    detail: unavailableTailscaleDetail,
+  };
+
+  const syncSetupWithTailscaleStatus = (
+    tsStatus: RuntimeTailscaleStatus,
+  ): SetupState => {
+    const nextDomain = tsStatus.dnsName || null;
+    const nextEnabled = Boolean(tsStatus.serveEnabled && tsStatus.dnsName);
+    const current = store.getSetupState();
+    if (
+      current.tailscaleDomain === nextDomain &&
+      current.tailscaleServeEnabled === nextEnabled
+    ) {
+      return current;
+    }
+    return store.updateSetupState({
+      tailscaleDomain: nextDomain,
+      tailscaleServeEnabled: nextEnabled,
+    });
+  };
+
+  app.get("/api/tailscale/status", async (c) => {
+    try {
+      if (!bridge.getTailscaleStatus) {
+        return c.json({
+          status: unavailableTailscaleStatus,
+          bridgeSupported: false,
+          setup: store.getSetupState(),
+        });
+      }
+      const status = await bridge.getTailscaleStatus();
+      const setup = syncSetupWithTailscaleStatus(status);
+      return c.json({
+        status,
+        bridgeSupported: true,
+        setup,
+      });
+    } catch (err) {
+      if (err instanceof RuntimeBridgeError && err.statusCode === 404) {
+        return c.json({
+          status: unavailableTailscaleStatus,
+          bridgeSupported: false,
+          setup: store.getSetupState(),
+        });
+      }
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/tailscale/serve", async (c) => {
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+    try {
+      const body = TailscaleServeBodySchema.parse(await c.req.json());
+      if (!bridge.setTailscaleServe) {
+        return c.json({ error: unavailableTailscaleDetail }, 501);
+      }
+      const res = await bridge.setTailscaleServe({
+        enabled: body.enabled,
+        ...(body.force !== undefined ? { force: body.force } : {}),
+      });
+      const setup = syncSetupWithTailscaleStatus(res.status);
+      store.recordAudit({
+        actor: "user",
+        action: body.enabled
+          ? "tailscale.serve_enabled"
+          : "tailscale.serve_disabled",
+        summary: body.enabled
+          ? `Enabled Tailscale private HTTPS access (${res.status.serveUrl || res.status.dnsName || "port 443"})`
+          : "Disabled Tailscale private HTTPS access",
+        riskLevel: "medium",
+      });
+      return c.json({
+        ok: res.ok,
+        status: res.status,
+        actionUrl: res.actionUrl,
+        setup,
+      });
+    } catch (err) {
+      if (err instanceof RuntimeBridgeError && err.statusCode === 404) {
+        return c.json({ error: unavailableTailscaleDetail }, 501);
+      }
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/tailscale/connect", async (c) => {
+    try {
+      assertSecureTransport(c, transportOptions);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "HTTPS required." },
+        403,
+      );
+    }
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+
+    let rawAuthKey: string | undefined;
+    try {
+      const body = TailscaleConnectBodySchema.parse(await c.req.json());
+      if (body.mode === "authkey") {
+        if (!body.authKey) {
+          return c.json(
+            { error: "A Tailscale auth key (tskey-auth-...) is required." },
+            400,
+          );
+        }
+        rawAuthKey = validateTailscaleAuthKey(body.authKey);
+      }
+      if (!bridge.connectTailscale) {
+        return c.json({ error: unavailableTailscaleDetail }, 501);
+      }
+      const res = await bridge.connectTailscale({
+        mode: body.mode,
+        ...(rawAuthKey !== undefined ? { authKey: rawAuthKey } : {}),
+      });
+      const setup = syncSetupWithTailscaleStatus(res.status);
+      store.recordAudit({
+        actor: "user",
+        action: res.status.connected
+          ? "tailscale.connected"
+          : "tailscale.login_started",
+        summary: res.status.connected
+          ? `Connected Tailscale (${res.status.dnsName || res.status.tailscaleIp || "tailnet"})`
+          : "Started Tailscale interactive sign-in",
+        riskLevel: "medium",
+      });
+      return c.json({
+        ok: res.ok,
+        status: res.status,
+        loginUrl: res.loginUrl,
+        setup,
+      });
+    } catch (err) {
+      if (err instanceof RuntimeBridgeError && err.statusCode === 404) {
+        return c.json({ error: unavailableTailscaleDetail }, 501);
+      }
+      const { status, error } = handleError(err);
+      return c.json({ error: scrubTokenFromText(error, rawAuthKey) }, status);
+    }
   });
 
   // ---------------------------------------------------------------------------

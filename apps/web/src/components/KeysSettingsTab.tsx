@@ -12,6 +12,7 @@ import {
   KeyRound,
   Loader2,
   Lock,
+  Network,
   Plus,
   RefreshCw,
   Star,
@@ -27,7 +28,12 @@ import {
   type McpTokenScope,
   type SetupState,
   type SystemUpdateStatus,
+  type TailscaleStatus,
 } from "../api";
+import { describeTailscaleConflict } from "../tailscale-conflict";
+
+const TAILSCALE_INSTALL_CMD =
+  "curl -fsSL https://tailscale.com/install.sh | sudo sh && sudo tailscale up";
 
 interface KeysSettingsTabProps {
   tokens: McpTokenRecord[];
@@ -149,6 +155,9 @@ export function KeysSettingsTab({
   const [activeClient, setActiveClient] = useState<
     "claudeCode" | "t3AndAgy" | "cursor" | "codex" | "genericHttp" | "curlTest"
   >("claudeCode");
+  const [endpointSource, setEndpointSource] = useState<
+    "auto" | "domain" | "tailscale"
+  >("auto");
   const [testResult, setTestResult] = useState<McpConnectionTestResult | null>(
     null,
   );
@@ -181,6 +190,18 @@ export function KeysSettingsTab({
   const [githubLabel, setGithubLabel] = useState("");
   const [githubBusy, setGithubBusy] = useState(false);
   const [testingCredId, setTestingCredId] = useState<string | null>(null);
+
+  const [tailscaleStatus, setTailscaleStatus] =
+    useState<TailscaleStatus | null>(null);
+  const [tailscaleBridgeSupported, setTailscaleBridgeSupported] =
+    useState(true);
+  const [tailscaleLoading, setTailscaleLoading] = useState(true);
+  const [tailscaleBusy, setTailscaleBusy] = useState(false);
+  const [tailscaleLoginUrl, setTailscaleLoginUrl] = useState<string | null>(
+    null,
+  );
+  const [showTailscaleAuthKey, setShowTailscaleAuthKey] = useState(false);
+  const [tailscaleAuthKey, setTailscaleAuthKey] = useState("");
 
   const applyLocalUpdateStatus = useCallback(
     (next: SystemUpdateStatus) => {
@@ -227,6 +248,96 @@ export function KeysSettingsTab({
   useEffect(() => {
     void loadUpdateStatus();
   }, [loadUpdateStatus]);
+
+  const loadTailscaleStatus = useCallback(async () => {
+    setTailscaleLoading(true);
+    try {
+      const res = await api.getTailscaleStatus();
+      setTailscaleStatus(res.status);
+      setTailscaleBridgeSupported(res.bridgeSupported);
+      if (res.status.loginUrl) {
+        setTailscaleLoginUrl(res.status.loginUrl);
+      } else if (res.status.connected) {
+        setTailscaleLoginUrl(null);
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not check Tailscale status on this server.",
+      );
+    } finally {
+      setTailscaleLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadTailscaleStatus();
+  }, [loadTailscaleStatus]);
+
+  const handleTailscaleConnect = async (mode: "login" | "authkey") => {
+    setTailscaleBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.connectTailscale(
+        mode === "authkey"
+          ? { mode: "authkey", authKey: tailscaleAuthKey.trim() }
+          : { mode: "login" },
+      );
+      setTailscaleStatus(res.status);
+      setTailscaleLoginUrl(res.loginUrl ?? res.status.loginUrl);
+      if (mode === "authkey") {
+        setTailscaleAuthKey("");
+        setShowTailscaleAuthKey(false);
+      }
+      if (res.status.connected) {
+        setNotice(
+          `Connected Tailscale (${res.status.dnsName || res.status.tailscaleIp || "tailnet"}).`,
+        );
+      } else if (res.loginUrl || res.status.loginUrl) {
+        setNotice(
+          "Tailscale sign-in link ready. Open it in your browser, approve this server, then click Refresh.",
+        );
+      }
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not connect Tailscale.",
+      );
+    } finally {
+      setTailscaleBusy(false);
+    }
+  };
+
+  const handleToggleTailscaleServe = async (enabled: boolean, force = false) => {
+    setTailscaleBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.setTailscaleServe(enabled, force);
+      setTailscaleStatus(res.status);
+      setNotice(
+        enabled
+          ? `Tailscale private HTTPS enabled at ${res.status.serveUrl || "port 443"}.`
+          : "Tailscale private HTTPS turned off.",
+      );
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Could not update Tailscale private HTTPS.",
+      );
+      void loadTailscaleStatus();
+    } finally {
+      setTailscaleBusy(false);
+    }
+  };
+
+  const tailscaleConflict = tailscaleStatus
+    ? describeTailscaleConflict(tailscaleStatus)
+    : null;
 
   useEffect(() => {
     if (updateStatus?.state !== "updating") {
@@ -550,12 +661,32 @@ export function KeysSettingsTab({
   };
 
   const newRawToken = newCreatedToken?.rawToken ?? null;
-  const rawActiveSnippet = snippets ? snippets[activeClient] : "";
-  const placeholder = snippets?.tokenPlaceholder || "vpsmcp_YOUR_TOKEN_HERE";
+  const selectedSnippetEndpoint =
+    endpointSource === "tailscale" && snippets?.tailscale?.httpsReady
+      ? snippets.tailscale
+      : endpointSource === "domain" && snippets?.customDomain?.httpsReady
+        ? snippets.customDomain
+        : null;
+  const activeSnippetVariant = selectedSnippetEndpoint?.snippets ?? snippets;
+  const rawActiveSnippet = activeSnippetVariant
+    ? activeSnippetVariant[activeClient]
+    : "";
+  const placeholder =
+    activeSnippetVariant?.tokenPlaceholder ||
+    snippets?.tokenPlaceholder ||
+    "vpsmcp_YOUR_TOKEN_HERE";
   const activeSnippet =
     newRawToken && rawActiveSnippet
       ? rawActiveSnippet.split(placeholder).join(newRawToken)
       : rawActiveSnippet;
+  const activeMcpUrl = selectedSnippetEndpoint?.url ?? snippets?.mcpUrl ?? "";
+  const hasBothRemoteEndpoints = Boolean(
+    snippets?.customDomain?.httpsReady && snippets?.tailscale?.httpsReady,
+  );
+  const customDomainReady = Boolean(
+    setup.domain && setup.httpsActive && setup.tlsStatus === "active",
+  );
+  const tailscaleReady = Boolean(snippets?.tailscale?.httpsReady);
 
   return (
     <div className="space-y-7 panel-enter">
@@ -724,12 +855,12 @@ export function KeysSettingsTab({
       {/* Connect Your AI Tool */}
       {snippets && (
         <section className="surface-panel rounded-xl p-6 space-y-4">
-          {!snippets.httpsReady && (
+          {!snippets.httpsReady ? (
             <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-2">
               <span>
                 {setup.domain
-                  ? `HTTPS certificate for ${setup.domain} is currently ${setup.tlsStatus}${setup.tlsError ? `: ${setup.tlsError}` : ""}. Remote HTTPS MCP will be advertised once TLS succeeds.`
-                  : "No verified HTTPS domain yet. Using local URL until you bind a domain below."}
+                  ? `HTTPS certificate for ${setup.domain} is currently ${setup.tlsStatus}${setup.tlsError ? `: ${setup.tlsError}` : ""}. Remote HTTPS MCP will be advertised once TLS succeeds — or enable Tailscale private HTTPS below with no domain needed.`
+                  : "No verified HTTPS address yet. Connect a domain or enable Tailscale private HTTPS below (no domain needed)."}
               </span>
               {setup.domain && (
                 <button
@@ -749,25 +880,164 @@ export function KeysSettingsTab({
                 </button>
               )}
             </div>
+          ) : (
+            setup.domain &&
+            !customDomainReady &&
+            tailscaleReady && (
+              <div className="rounded-lg border border-white/[0.08] bg-[#0C0E12] px-4 py-2.5 text-xs text-[#D1D5DB] flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  Tailscale private HTTPS is active. Your custom domain{" "}
+                  <code className="text-amber-300">{setup.domain}</code> is
+                  still{" "}
+                  <strong className="font-medium text-amber-200">
+                    {setup.tlsStatus}
+                  </strong>
+                  .
+                </span>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setBusy(true);
+                    try {
+                      await api.recheckTls();
+                      await onRefresh();
+                    } finally {
+                      setBusy(false);
+                    }
+                  }}
+                  className="btn-press rounded-lg border border-white/[0.1] bg-[#111317] px-2.5 py-1 text-[11px] font-medium text-[#F4F5F7] hover:bg-[#161920] cursor-pointer"
+                >
+                  Re-check HTTPS
+                </button>
+              </div>
+            )
           )}
 
           <div className="flex flex-wrap items-start justify-between gap-4">
-            <div className="space-y-1">
+            <div className="space-y-1.5">
               <div className="flex flex-wrap items-center gap-2.5">
                 <h2 className="text-sm font-semibold text-white">
                   Connect your AI tool
                 </h2>
+                {tailscaleReady && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                    {customDomainReady
+                      ? "Custom domain + Tailscale HTTPS"
+                      : "Tailscale private HTTPS"}
+                  </span>
+                )}
                 {newRawToken && (
                   <span className="text-xs font-medium text-emerald-400">
                     New key auto-filled
                   </span>
                 )}
               </div>
+
+              {hasBothRemoteEndpoints && (
+                <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                  <span className="text-[11px] text-[#9CA3AF]">
+                    Snippet address:
+                  </span>
+                  <div className="inline-flex rounded-md border border-white/[0.08] bg-[#0C0E12] p-0.5 gap-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setEndpointSource("domain")}
+                      className={`btn-press rounded px-2 py-0.5 text-[11px] font-medium cursor-pointer ${
+                        (endpointSource === "auto"
+                          ? snippets.primarySource !== "tailscale"
+                          : endpointSource === "domain")
+                          ? "bg-white/[0.1] text-white"
+                          : "text-[#9CA3AF] hover:text-white"
+                      }`}
+                    >
+                      Custom domain
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEndpointSource("tailscale")}
+                      className={`btn-press rounded px-2 py-0.5 text-[11px] font-medium cursor-pointer ${
+                        (endpointSource === "auto"
+                          ? snippets.primarySource === "tailscale"
+                          : endpointSource === "tailscale")
+                          ? "bg-white/[0.1] text-white"
+                          : "text-[#9CA3AF] hover:text-white"
+                      }`}
+                    >
+                      Tailscale (private)
+                    </button>
+                  </div>
+                </div>
+              )}
+
               <div className="flex flex-wrap items-center gap-2.5 text-xs text-[#9CA3AF]">
-                <span>
-                  Doorway URL:{" "}
-                  <code className="text-emerald-300">{snippets.mcpUrl}</code>
-                </span>
+                {snippets.customDomain && snippets.tailscale ? (
+                  <div className="flex flex-wrap items-center gap-3">
+                    <span className="inline-flex items-center gap-1.5">
+                      <span>Custom domain:</span>
+                      <code className="text-emerald-300">
+                        {snippets.customDomain.url}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          copyText(
+                            "mcp-url-domain",
+                            snippets.customDomain!.url,
+                          )
+                        }
+                        className="inline-flex items-center text-[#9CA3AF] hover:text-white cursor-pointer"
+                        title="Copy custom domain MCP URL"
+                      >
+                        {copiedId === "mcp-url-domain" ? (
+                          <Check className="h-3 w-3 text-emerald-400" />
+                        ) : (
+                          <Copy className="h-3 w-3" />
+                        )}
+                      </button>
+                    </span>
+                    <span className="inline-flex items-center gap-1.5">
+                      <span>Tailscale:</span>
+                      <code className="text-emerald-300">
+                        {snippets.tailscale.url}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          copyText(
+                            "mcp-url-tailscale",
+                            snippets.tailscale!.url,
+                          )
+                        }
+                        className="inline-flex items-center text-[#9CA3AF] hover:text-white cursor-pointer"
+                        title="Copy Tailscale MCP URL"
+                      >
+                        {copiedId === "mcp-url-tailscale" ? (
+                          <Check className="h-3 w-3 text-emerald-400" />
+                        ) : (
+                          <Copy className="h-3 w-3" />
+                        )}
+                      </button>
+                    </span>
+                  </div>
+                ) : (
+                  <span className="inline-flex items-center gap-1.5">
+                    <span>Doorway URL:</span>
+                    <code className="text-emerald-300">{activeMcpUrl}</code>
+                    <button
+                      type="button"
+                      onClick={() => copyText("mcp-url-primary", activeMcpUrl)}
+                      className="inline-flex items-center text-[#9CA3AF] hover:text-white cursor-pointer"
+                      title="Copy MCP URL"
+                    >
+                      {copiedId === "mcp-url-primary" ? (
+                        <Check className="h-3 w-3 text-emerald-400" />
+                      ) : (
+                        <Copy className="h-3 w-3" />
+                      )}
+                    </button>
+                  </span>
+                )}
                 <button
                   type="button"
                   disabled={testing}
@@ -1141,6 +1411,391 @@ export function KeysSettingsTab({
             ))}
           </div>
         )}
+      </section>
+
+      {/* Tailscale Private Access (No Domain Required) */}
+      <section className="surface-panel rounded-xl p-6 space-y-5">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="space-y-1">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <Network className="h-4 w-4 text-emerald-400" />
+              <h2 className="text-sm font-semibold text-white">
+                Tailscale private access
+              </h2>
+              {tailscaleLoading && !tailscaleStatus ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.1] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-[#9CA3AF]">
+                  Checking...
+                </span>
+              ) : tailscaleStatus?.serveEnabled ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+                  Private HTTPS active
+                </span>
+              ) : tailscaleStatus?.connected ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-sky-500/35 bg-sky-500/10 px-2.5 py-0.5 text-[11px] font-medium text-sky-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-sky-400" />
+                  Connected
+                </span>
+              ) : tailscaleStatus?.backendState === "needs_login" ||
+                tailscaleStatus?.backendState === "needs_machine_auth" ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-2.5 py-0.5 text-[11px] font-medium text-amber-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                  Sign-in needed
+                </span>
+              ) : tailscaleStatus?.installed ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.1] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-[#9CA3AF]">
+                  Stopped
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-white/[0.1] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-medium text-[#9CA3AF]">
+                  Not installed
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-[#9CA3AF] leading-relaxed">
+              Reach your dashboard and AI doorway over your private Tailscale
+              network with automatic{" "}
+              <code className="text-emerald-300">https://</code> — no domain
+              purchase or DNS setup needed.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={tailscaleLoading || tailscaleBusy}
+              onClick={() =>
+                void Promise.all([loadTailscaleStatus(), onRefresh()])
+              }
+              className="btn-press inline-flex items-center gap-1.5 rounded-lg border border-white/[0.1] bg-[#0C0E12] px-3 py-2 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] disabled:opacity-50 cursor-pointer"
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${tailscaleLoading ? "animate-spin" : ""}`}
+              />
+              Refresh
+            </button>
+            {tailscaleBridgeSupported &&
+              tailscaleStatus?.connected &&
+              (tailscaleStatus.serveEnabled ? (
+                <button
+                  type="button"
+                  disabled={tailscaleBusy}
+                  onClick={() => void handleToggleTailscaleServe(false)}
+                  className="btn-press rounded-lg border border-rose-500/30 bg-rose-500/[0.05] px-3.5 py-2 text-xs font-medium text-rose-300 hover:bg-rose-500/15 disabled:opacity-50 cursor-pointer"
+                >
+                  {tailscaleBusy ? "Updating..." : "Disable private HTTPS"}
+                </button>
+              ) : !tailscaleStatus.serveConflict ? (
+                <button
+                  type="button"
+                  disabled={tailscaleBusy || !tailscaleStatus.dnsName}
+                  onClick={() => void handleToggleTailscaleServe(true, false)}
+                  className="btn-press rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+                >
+                  {tailscaleBusy ? "Enabling..." : "Enable private HTTPS"}
+                </button>
+              ) : null)}
+            {tailscaleBridgeSupported &&
+              tailscaleStatus?.installed &&
+              !tailscaleStatus.connected && (
+                <button
+                  type="button"
+                  disabled={tailscaleBusy}
+                  onClick={() => void handleTailscaleConnect("login")}
+                  className="btn-press rounded-lg bg-emerald-500 px-4 py-2 text-[13px] font-semibold text-[#042F1E] hover:bg-emerald-400 disabled:opacity-50 cursor-pointer"
+                >
+                  {tailscaleBusy ? "Starting..." : "Sign in to Tailscale"}
+                </button>
+              )}
+          </div>
+        </div>
+
+        {!tailscaleBridgeSupported ? (
+          <p className="text-xs text-[#9CA3AF]">
+            {tailscaleStatus?.detail ||
+              "Update VPSAgent on your server once to enable Tailscale status detection and private HTTPS."}
+          </p>
+        ) : tailscaleStatus && !tailscaleStatus.installed ? (
+          <div className="surface-well rounded-lg p-4 space-y-3 text-xs">
+            <p className="text-[#D1D5DB]">
+              Tailscale is not installed on this server yet. Run this command on
+              your server via SSH (or run{" "}
+              <code className="font-mono text-[#F4F5F7]">
+                sudo bash ~/vpsagent/bootstrap/install.sh --tailscale
+              </code>
+              ), then click <strong className="text-white">Refresh</strong>:
+            </p>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 overflow-x-auto rounded-md bg-[#090A0C] border border-white/[0.08] px-3 py-2 font-mono text-[11px] text-emerald-300">
+                {TAILSCALE_INSTALL_CMD}
+              </code>
+              <button
+                type="button"
+                onClick={() => copyText("ts-install-cmd", TAILSCALE_INSTALL_CMD)}
+                className="btn-press inline-flex items-center gap-1.5 rounded-md border border-white/[0.1] bg-[#111317] px-3 py-2 text-xs font-medium text-[#F4F5F7] hover:bg-[#161920] cursor-pointer shrink-0"
+              >
+                {copiedId === "ts-install-cmd" ? (
+                  <Check className="h-3.5 w-3.5 text-emerald-400" />
+                ) : (
+                  <Copy className="h-3.5 w-3.5" />
+                )}
+                {copiedId === "ts-install-cmd" ? "Copied" : "Copy"}
+              </button>
+            </div>
+          </div>
+        ) : tailscaleStatus?.installed && !tailscaleStatus.connected ? (
+          <div className="space-y-3">
+            {tailscaleLoginUrl && (
+              <div className="rounded-lg border border-emerald-500/35 bg-emerald-500/10 p-4 text-xs space-y-2.5">
+                <p className="font-medium text-emerald-200">
+                  Open this Tailscale link to sign in and approve your server,
+                  then click Refresh above:
+                </p>
+                <a
+                  href={tailscaleLoginUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3.5 py-2 font-semibold text-[#042F1E] hover:bg-emerald-400"
+                >
+                  <span>Open Tailscale sign-in</span>
+                  <ExternalLink className="h-3.5 w-3.5" />
+                </a>
+              </div>
+            )}
+            {tailscaleStatus.backendState === "needs_machine_auth" && (
+              <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+                This server is waiting for device approval in your{" "}
+                <a
+                  href="https://login.tailscale.com/admin/machines"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline font-medium text-amber-100"
+                >
+                  Tailscale Machines page
+                </a>
+                .
+              </div>
+            )}
+            {tailscaleStatus.detail && (
+              <p className="text-xs text-[#9CA3AF]">{tailscaleStatus.detail}</p>
+            )}
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowTailscaleAuthKey((prev) => !prev)}
+                className="inline-flex items-center gap-1.5 text-xs font-medium text-[#9CA3AF] hover:text-white cursor-pointer"
+              >
+                {showTailscaleAuthKey ? (
+                  <ChevronUp className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                )}
+                Advanced: sign in with a Tailscale auth key
+              </button>
+              {showTailscaleAuthKey && (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    void handleTailscaleConnect("authkey");
+                  }}
+                  className="mt-3 flex flex-wrap items-center gap-2.5"
+                >
+                  <input
+                    type="password"
+                    value={tailscaleAuthKey}
+                    onChange={(e) => setTailscaleAuthKey(e.target.value)}
+                    placeholder="tskey-auth-..."
+                    autoComplete="off"
+                    required
+                    className="field-input flex-1 min-w-[220px] rounded-lg px-3.5 py-2 text-sm font-mono"
+                  />
+                  <button
+                    type="submit"
+                    disabled={tailscaleBusy || !tailscaleAuthKey.trim()}
+                    className="btn-press rounded-lg bg-[#F4F5F7] px-4 py-2 text-xs font-semibold text-[#090A0C] hover:bg-white disabled:opacity-50 cursor-pointer"
+                  >
+                    {tailscaleBusy ? "Connecting..." : "Connect with key"}
+                  </button>
+                </form>
+              )}
+            </div>
+          </div>
+        ) : tailscaleStatus?.connected ? (
+          <div className="space-y-3.5">
+            <div className="surface-well rounded-lg p-4 grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+              <div className="space-y-1">
+                <span className="text-[#9CA3AF]">Tailscale IP</span>
+                <div className="flex items-center gap-2">
+                  <code className="font-mono text-sm text-white">
+                    {tailscaleStatus.tailscaleIp || "Unavailable"}
+                  </code>
+                  {tailscaleStatus.tailscaleIp && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copyText("ts-ip", tailscaleStatus.tailscaleIp!)
+                      }
+                      className="text-[#9CA3AF] hover:text-white cursor-pointer"
+                      title="Copy Tailscale IP"
+                    >
+                      {copiedId === "ts-ip" ? (
+                        <Check className="h-3.5 w-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <span className="text-[#9CA3AF]">
+                  MagicDNS hostname
+                  {tailscaleStatus.tailnetName
+                    ? ` (${tailscaleStatus.tailnetName})`
+                    : ""}
+                </span>
+                <div className="flex items-center gap-2">
+                  <code className="font-mono text-sm text-emerald-300 break-all">
+                    {tailscaleStatus.dnsName || "Not enabled yet"}
+                  </code>
+                  {tailscaleStatus.dnsName && (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        copyText("ts-dns", tailscaleStatus.dnsName!)
+                      }
+                      className="text-[#9CA3AF] hover:text-white cursor-pointer shrink-0"
+                      title="Copy MagicDNS hostname"
+                    >
+                      {copiedId === "ts-dns" ? (
+                        <Check className="h-3.5 w-3.5 text-emerald-400" />
+                      ) : (
+                        <Copy className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {tailscaleStatus.serveEnabled && tailscaleStatus.serveUrl && (
+                <>
+                  <div className="space-y-1 pt-2 border-t border-white/[0.06]">
+                    <span className="text-[#9CA3AF]">
+                      Private dashboard URL
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <a
+                        href={tailscaleStatus.serveUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 font-mono text-emerald-300 hover:text-emerald-200 break-all"
+                      >
+                        <span>{tailscaleStatus.serveUrl}</span>
+                        <ExternalLink className="h-3 w-3 shrink-0" />
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          copyText("ts-dash-url", tailscaleStatus.serveUrl!)
+                        }
+                        className="text-[#9CA3AF] hover:text-white cursor-pointer shrink-0"
+                        title="Copy private dashboard URL"
+                      >
+                        {copiedId === "ts-dash-url" ? (
+                          <Check className="h-3.5 w-3.5 text-emerald-400" />
+                        ) : (
+                          <Copy className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+
+                  {tailscaleStatus.mcpUrl && (
+                    <div className="space-y-1 pt-2 border-t border-white/[0.06]">
+                      <span className="text-[#9CA3AF]">
+                        Private AI doorway (MCP) URL
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <code className="font-mono text-emerald-300 break-all">
+                          {tailscaleStatus.mcpUrl}
+                        </code>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            copyText("ts-mcp-url", tailscaleStatus.mcpUrl!)
+                          }
+                          className="text-[#9CA3AF] hover:text-white cursor-pointer shrink-0"
+                          title="Copy private MCP URL"
+                        >
+                          {copiedId === "ts-mcp-url" ? (
+                            <Check className="h-3.5 w-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="h-3.5 w-3.5" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            {(!tailscaleStatus.magicDnsEnabled ||
+              !tailscaleStatus.httpsCertsAvailable) && (
+              <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+                Turn on <strong className="font-semibold">MagicDNS</strong> and{" "}
+                <strong className="font-semibold">HTTPS Certificates</strong> in{" "}
+                <a
+                  href="https://login.tailscale.com/admin/dns"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline font-medium text-amber-100"
+                >
+                  Tailscale DNS settings
+                </a>
+                , then click{" "}
+                <strong className="font-semibold">Enable private HTTPS</strong>.
+              </div>
+            )}
+
+            {tailscaleConflict && tailscaleStatus && (
+              <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 space-y-3">
+                <p>{tailscaleConflict.headline}</p>
+                <ul className="space-y-2">
+                  {tailscaleConflict.effects.map((effect) => (
+                    <li
+                      key={`${effect.kind}:${effect.routes}`}
+                      className="rounded-md border border-amber-500/25 bg-black/20 px-3 py-2 space-y-0.5"
+                    >
+                      <div className="font-semibold text-amber-100">
+                        {effect.label}
+                      </div>
+                      <div className="font-mono text-[11px] text-amber-50 break-all">
+                        {effect.routes}
+                      </div>
+                      <div className="text-[11px] text-amber-200/90">
+                        {effect.explanation}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    disabled={tailscaleBusy || !tailscaleStatus.dnsName}
+                    onClick={() => void handleToggleTailscaleServe(true, true)}
+                    className="btn-press rounded-lg bg-amber-400 px-3 py-1.5 text-xs font-semibold text-[#1A1200] hover:bg-amber-300 disabled:opacity-50 cursor-pointer"
+                  >
+                    {tailscaleBusy
+                      ? "Updating..."
+                      : tailscaleConflict.confirmButtonLabel}
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ) : null}
       </section>
 
       {/* Domains & Automatic HTTPS */}

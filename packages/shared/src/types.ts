@@ -212,6 +212,8 @@ export const SetupStateSchema = z.object({
   tlsStatus: TlsStatusSchema.default("inactive"),
   tlsError: z.string().nullable().default(null),
   claimedAt: z.string().nullable(),
+  tailscaleDomain: z.string().nullable().default(null),
+  tailscaleServeEnabled: z.boolean().default(false),
 });
 export type SetupState = z.infer<typeof SetupStateSchema>;
 
