@@ -672,6 +672,81 @@ configure_tailscale
             self.assertNotIn(secret_part, proc.stdout)
             self.assertNotIn(secret_part, proc.stderr)
 
+    def test_tailscale_install_preserves_public_funnel_with_sibling_routes(
+        self,
+    ) -> None:
+        bin_sib = Path(self.tmp) / "bin-funnel-siblings"
+        bin_sib.mkdir()
+        ts_calls = Path(self.tmp) / "funnel-siblings-calls.log"
+        vpsagent_root = Path(self.tmp) / "var-lib-vpsagent-funnel-siblings"
+        vpsagent_root.mkdir(parents=True)
+
+        (bin_sib / "tailscale").write_text(
+            f"""#!/usr/bin/env python3
+import json, sys
+args = sys.argv[1:]
+with open({str(ts_calls)!r}, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+if args == ["status", "--json"]:
+    print(json.dumps({{
+        "BackendState": "Running",
+        "Self": {{"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]}},
+        "CertDomains": ["vps-node.tail99.ts.net"],
+    }}))
+    sys.exit(0)
+if args == ["serve", "status", "--json"]:
+    print(json.dumps({{
+        "Web": {{
+            "vps-node.tail99.ts.net:443": {{
+                "Handlers": {{
+                    "/": {{"Proxy": "http://127.0.0.1:3001"}},
+                    "/status": {{"Proxy": "http://alice:pw123@127.0.0.1:8080/status?tok=hideme"}},
+                }}
+            }}
+        }},
+        "AllowFunnel": {{"vps-node.tail99.ts.net:443": True}},
+    }}))
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_sib / "tailscale", 0o755)
+        proc = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f"""
+set -euo pipefail
+export PATH="{bin_sib}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+CLAIM_TOKEN="claim_ts_funnel_sib"
+PUBLIC_IP="203.0.113.10"
+configure_tailscale
+print_ready_banner
+""",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        calls_text = ts_calls.read_text(encoding="utf-8")
+        self.assertNotIn("serve --bg --https=443", calls_text)
+        self.assertIn("public Funnel sibling routes", proc.stdout)
+        self.assertIn("/status -> http://[REDACTED]@127.0.0.1:8080/status", proc.stdout)
+        self.assertNotIn(
+            "https://vps-node.tail99.ts.net/#claim=claim_ts_funnel_sib",
+            proc.stdout,
+        )
+        self.assertIn("http://localhost:3002/#claim=claim_ts_funnel_sib", proc.stdout)
+        for secret_part in ("alice", "pw123", "hideme"):
+            self.assertNotIn(secret_part, proc.stdout)
+            self.assertNotIn(secret_part, proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

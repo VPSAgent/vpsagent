@@ -1765,11 +1765,29 @@ export function KeysSettingsTab({
             {tailscaleStatus.serveConflict && (
               <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-200 flex flex-wrap items-center justify-between gap-3">
                 <span>
-                  Tailscale Serve port 443 is currently forwarding to{" "}
-                  <code className="font-mono text-amber-100">
-                    {tailscaleStatus.serveConflict}
-                  </code>
-                  . Replace it to route private HTTPS to VPSAgent instead.
+                  {tailscaleStatus.serveConflict.startsWith(
+                    "public Funnel sibling routes",
+                  ) ? (
+                    <>
+                      Port 443 is currently open to the public internet via{" "}
+                      <strong className="font-semibold">Tailscale Funnel</strong>{" "}
+                      with{" "}
+                      <code className="font-mono text-amber-100">
+                        {tailscaleStatus.serveConflict}
+                      </code>
+                      . Turning on private HTTPS disables public Funnel across the
+                      entire port 443 listener, which stops public internet access
+                      to those routes until you move them to another port.
+                    </>
+                  ) : (
+                    <>
+                      Tailscale Serve port 443 is currently forwarding to{" "}
+                      <code className="font-mono text-amber-100">
+                        {tailscaleStatus.serveConflict}
+                      </code>
+                      . Replace it to route private HTTPS to VPSAgent instead.
+                    </>
+                  )}
                 </span>
                 <button
                   type="button"
@@ -1777,7 +1795,11 @@ export function KeysSettingsTab({
                   onClick={() => void handleToggleTailscaleServe(true, true)}
                   className="btn-press rounded-lg bg-amber-400 px-3 py-1.5 text-xs font-semibold text-[#1A1200] hover:bg-amber-300 disabled:opacity-50 cursor-pointer"
                 >
-                  Replace port 443 route with VPSAgent
+                  {tailscaleStatus.serveConflict.startsWith(
+                    "public Funnel sibling routes",
+                  )
+                    ? "Make port 443 private anyway"
+                    : "Replace port 443 route with VPSAgent"}
                 </button>
               </div>
             )}

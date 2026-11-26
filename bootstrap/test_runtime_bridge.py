@@ -3543,6 +3543,7 @@ class TestRuntimeBridgeTailscale(unittest.TestCase):
         serve_cmd_stderr: str = "",
         systemctl_active: bool = False,
         serve_stateful: bool = False,
+        serve_apply_state: bool = True,
         keep_funnel_on_serve: bool = False,
     ) -> tuple[str, str, str, str]:
         sub_dir = tempfile.mkdtemp(dir=self.tmp_dir)
@@ -3582,7 +3583,7 @@ if args[:1] == ["up"]:
     sys.exit({up_rc!r})
 
 if args[:1] == ["serve"]:
-    if {serve_stateful!r} and {serve_cmd_rc!r} == 0 and not {serve_cmd_stderr!r}:
+    if {serve_stateful!r} and {serve_apply_state!r} and {serve_cmd_rc!r} == 0:
         data = json.loads(open({serve_state_file!r}, "r", encoding="utf-8").read() or "{{}}")
         web = data.setdefault("Web", {{}})
         host_key = "my-vps.tail42.ts.net:443"
@@ -4085,6 +4086,7 @@ sys.exit(0)
         ts_https_req, sys_https_req, calls_https_req, _ = self._make_fake_tailscale(
             status_stdout=running_json,
             serve_stateful=True,
+            serve_apply_state=False,
             serve_stdout=initial_serve,
             serve_cmd_rc=0,
             serve_cmd_stderr="To enable HTTPS, visit: https://login.tailscale.com/f/serve?node=httpsreq",
@@ -4148,9 +4150,12 @@ sys.exit(0)
         )
 
         # Public Funnel active -> serveEnabled must be False until switched to private Serve
+        # Realistic Tailscale CLI writes Funnel removal notice to stderr even on success.
         ts_funnel, sys_funnel, _, _ = self._make_fake_tailscale(
             status_stdout=running_json,
             serve_stateful=True,
+            serve_cmd_rc=0,
+            serve_cmd_stderr="Disabled Funnel on port 443; serving privately to your tailnet.\n",
             serve_stdout=json.dumps(
                 {
                     "Web": {
@@ -4174,6 +4179,63 @@ sys.exit(0)
         self.assertTrue(switched["ok"])
         self.assertTrue(switched["status"]["serveEnabled"])
         self.assertEqual(switched["status"]["serveUrl"], "https://my-vps.tail42.ts.net")
+
+        # Public Funnel + non-VPSAgent sibling routes must surface as a port-wide conflict (409)
+        # unless force=True, and credentials on sibling routes must be redacted.
+        ts_funnel_sib, sys_funnel_sib, calls_funnel_sib, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stateful=True,
+            serve_cmd_rc=0,
+            serve_cmd_stderr="Disabled Funnel on port 443; serving privately to your tailnet.\n",
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {
+                                "/": {"Proxy": "http://127.0.0.1:3001"},
+                                "/status": {
+                                    "Proxy": "http://bot:secret99@127.0.0.1:8080/health?key=leakme"
+                                },
+                            }
+                        }
+                    },
+                    "AllowFunnel": {"my-vps.tail42.ts.net:443": True},
+                }
+            ),
+        )
+        svc_funnel_sib = self._service(
+            tailscale_bin=ts_funnel_sib, systemctl_bin=sys_funnel_sib
+        )
+        sib_status = svc_funnel_sib.tailscale_status()
+        self.assertFalse(sib_status["serveEnabled"])
+        self.assertTrue(
+            (sib_status["serveConflict"] or "").startswith(
+                "public Funnel sibling routes"
+            )
+        )
+        self.assertIn(
+            "/status -> http://[REDACTED]@127.0.0.1:8080/health",
+            sib_status["serveConflict"] or "",
+        )
+        for leaked in ("bot", "secret99", "leakme"):
+            self.assertNotIn(leaked, str(sib_status))
+
+        with self.assertRaises(rb.BridgeRequestError) as cm_sib_409:
+            svc_funnel_sib.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_sib_409.exception.status_code, 409)
+        self.assertIn("entire port 443 listener", str(cm_sib_409.exception))
+        for leaked in ("bot", "secret99", "leakme"):
+            self.assertNotIn(leaked, str(cm_sib_409.exception))
+        sib_calls_before = [
+            json.loads(line)
+            for line in Path(calls_funnel_sib).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertFalse(any(c[:2] == ["serve", "--bg"] for c in sib_calls_before))
+
+        sib_forced = svc_funnel_sib.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertTrue(sib_forced["ok"])
+        self.assertTrue(sib_forced["status"]["serveEnabled"])
+        self.assertIsNone(sib_forced["status"]["serveConflict"])
 
         # If Funnel stays active after serve command, fail closed with 422
         ts_stuck, sys_stuck, _, _ = self._make_fake_tailscale(

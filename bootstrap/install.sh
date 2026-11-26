@@ -538,6 +538,7 @@ if raw_serve.strip():
         other_proxy = ""
         mcp_conflict = ""
         any_handler_key = ""
+        funnel_siblings = []
         for k in candidate_keys:
             entry = web.get(k)
             if not isinstance(entry, dict):
@@ -567,8 +568,30 @@ if raw_serve.strip():
                         mcp_conflict = f"/mcp -> {sanitize_proxy_display(cleaned_mcp)}"
                 elif not mcp_conflict:
                     mcp_conflict = f"/mcp on {k}"
+            for path_key, handler_val in sorted(handlers.items()):
+                if not isinstance(path_key, str) or path_key in ("/", "/mcp"):
+                    continue
+                if isinstance(handler_val, dict):
+                    sib_proxy = handler_val.get("Proxy")
+                    if isinstance(sib_proxy, str) and sib_proxy.strip():
+                        summary = f"{path_key} -> {sanitize_proxy_display(sib_proxy)}"
+                    else:
+                        summary = f"{path_key} on {k}"
+                else:
+                    summary = f"{path_key} on {k}"
+                if summary not in funnel_siblings:
+                    funnel_siblings.append(summary)
 
-        if mcp_conflict:
+        if funnel_active and funnel_siblings:
+            affected = []
+            if other_proxy:
+                affected.append(f"/ -> {other_proxy}")
+            if mcp_conflict:
+                affected.append(mcp_conflict)
+            affected.extend(funnel_siblings)
+            serve_conflict = f"public Funnel sibling routes ({', '.join(affected)})"
+            serve_url = ""
+        elif mcp_conflict:
             serve_conflict = mcp_conflict
             serve_url = ""
         elif root_matched:
@@ -627,6 +650,10 @@ configure_tailscale() {
 
   if [[ "${TAILSCALE_BACKEND_STATE}" == "Running" && -n "${TAILSCALE_DNS_NAME}" ]]; then
     if [[ -n "${TAILSCALE_SERVE_CONFLICT}" ]]; then
+      if [[ "${TAILSCALE_SERVE_CONFLICT}" == "public Funnel sibling routes"* ]]; then
+        log "Warning: Port 443 is currently open to the public internet via Tailscale Funnel with ${TAILSCALE_SERVE_CONFLICT}. Turning on private Tailscale HTTPS would disable public Funnel for the entire port 443 listener and cut off public access to those services. Leaving your existing Funnel setup untouched; move those services to another port or confirm the switch in AI Keys & Settings -> Tailscale private access."
+        return
+      fi
       log "Warning: Tailscale Serve port 443 is already forwarding to ${TAILSCALE_SERVE_CONFLICT}. Keeping your existing route; open AI Keys & Settings -> Tailscale private access if you want to replace it."
       return
     fi

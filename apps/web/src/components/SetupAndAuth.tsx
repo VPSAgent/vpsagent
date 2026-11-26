@@ -530,8 +530,27 @@ export function SetupAndAuth({ session, onAuthenticated }: SetupAndAuthProps) {
                     )}
                     {tsStatus.serveConflict && (
                       <div className="rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2 text-amber-200">
-                        Port 443 is currently forwarding to{" "}
-                        <code className="font-mono">{tsStatus.serveConflict}</code>.
+                        {tsStatus.serveConflict.startsWith(
+                          "public Funnel sibling routes",
+                        ) ? (
+                          <>
+                            Port 443 shares public Tailscale Funnel with{" "}
+                            <code className="font-mono">
+                              {tsStatus.serveConflict}
+                            </code>
+                            . Switching makes the entire port private; move
+                            those services to another port first or confirm in AI
+                            Keys &amp; Settings.
+                          </>
+                        ) : (
+                          <>
+                            Port 443 is currently forwarding to{" "}
+                            <code className="font-mono">
+                              {tsStatus.serveConflict}
+                            </code>
+                            .
+                          </>
+                        )}
                       </div>
                     )}
                   </div>
