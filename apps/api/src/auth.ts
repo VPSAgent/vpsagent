@@ -133,7 +133,7 @@ export function assertSecureTransport(
   );
 }
 
-function normalizeHostWithoutDefaultPort(
+export function normalizeHostWithoutDefaultPort(
   hostHeader: string,
   isHttps: boolean,
 ): string {
@@ -162,6 +162,7 @@ export function validateMcpHostAndOrigin(
   params: {
     setupDomain: string | null;
     httpsActive: boolean;
+    additionalAllowedHttpsHosts?: string[] | undefined;
     transport: { isHttps: boolean; isLocalLoopback: boolean };
     trustProxy: boolean;
   },
@@ -175,17 +176,24 @@ export function validateMcpHostAndOrigin(
     rawHost,
     params.transport.isHttps,
   );
-  const expectedDomain =
-    params.setupDomain && params.httpsActive
-      ? params.setupDomain.trim().toLowerCase()
-      : null;
+  const allowedHttpsHosts = new Set<string>();
+  if (params.setupDomain && params.httpsActive) {
+    const cleanDomain = params.setupDomain.trim().toLowerCase();
+    if (cleanDomain) {
+      allowedHttpsHosts.add(cleanDomain);
+    }
+  }
+  for (const extra of params.additionalAllowedHttpsHosts ?? []) {
+    const cleanExtra = extra.trim().toLowerCase();
+    if (cleanExtra) {
+      allowedHttpsHosts.add(cleanExtra);
+    }
+  }
 
   const hostIsLoopback =
     params.transport.isLocalLoopback && isLoopbackHost(rawHost);
   const hostMatchesDomain =
-    expectedDomain !== null &&
-    params.transport.isHttps &&
-    normalizedHost === expectedDomain;
+    params.transport.isHttps && allowedHttpsHosts.has(normalizedHost);
 
   if (!hostIsLoopback && !hostMatchesDomain) {
     throw new Error(`Unexpected Host header "${rawHost}" for /mcp.`);
@@ -205,9 +213,8 @@ export function validateMcpHostAndOrigin(
   }
 
   if (
-    expectedDomain !== null &&
     parsedOrigin.protocol === "https:" &&
-    parsedOrigin.hostname.toLowerCase() === expectedDomain &&
+    allowedHttpsHosts.has(parsedOrigin.hostname.toLowerCase()) &&
     (parsedOrigin.port === "" || parsedOrigin.port === "443")
   ) {
     return;

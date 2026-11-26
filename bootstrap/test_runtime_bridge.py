@@ -2217,5 +2217,388 @@ sys.exit(0)
         self.assertTrue(seen_df["hasGitDir"])
 
 
+class TestRuntimeBridgeTailscale(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.mkdtemp(prefix="vpsagent-ts-py-test-")
+        self.apps_root = os.path.join(self.tmp_dir, "apps")
+        self.caddy_dir = os.path.join(self.tmp_dir, "caddy-apps")
+        os.makedirs(self.apps_root, exist_ok=True)
+        os.makedirs(self.caddy_dir, exist_ok=True)
+        self.git_sh, self.docker_sh = _write_fake_git_and_docker(self.tmp_dir)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _make_fake_tailscale(
+        self,
+        *,
+        status_rc: int = 0,
+        status_stdout: str = "",
+        status_stderr: str = "",
+        serve_stdout: str = "{}",
+        up_rc: int = 0,
+        up_stdout: str = "",
+        up_stderr: str = "",
+        serve_cmd_rc: int = 0,
+        serve_cmd_stderr: str = "",
+        systemctl_active: bool = False,
+    ) -> tuple[str, str, str, str]:
+        sub_dir = tempfile.mkdtemp(dir=self.tmp_dir)
+        calls_file = os.path.join(sub_dir, "ts-calls.jsonl")
+        seen_key_file = os.path.join(sub_dir, "ts-seen-key.txt")
+        ts_py = os.path.join(sub_dir, "fake_tailscale.py")
+        Path(ts_py).write_text(
+            f"""import json, os, sys
+args = sys.argv[1:]
+with open({calls_file!r}, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(args) + "\\n")
+
+if args == ["status", "--json"]:
+    sys.stdout.write({status_stdout!r})
+    sys.stderr.write({status_stderr!r})
+    sys.exit({status_rc!r})
+
+if args == ["serve", "status", "--json"]:
+    sys.stdout.write({serve_stdout!r})
+    sys.exit(0)
+
+if args[:1] == ["up"]:
+    for arg in args[1:]:
+        if arg.startswith("--auth-key=file:"):
+            path = arg.split(":", 1)[1]
+            with open(path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+            with open({seen_key_file!r}, "w", encoding="utf-8") as out:
+                out.write(content)
+    sys.stdout.write({up_stdout!r})
+    sys.stderr.write({up_stderr!r})
+    sys.exit({up_rc!r})
+
+if args[:1] == ["serve"]:
+    sys.stderr.write({serve_cmd_stderr!r})
+    sys.exit({serve_cmd_rc!r})
+
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        ts_sh = os.path.join(sub_dir, "fake-tailscale")
+        Path(ts_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{ts_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(ts_sh, 0o755)
+
+        sys_py = os.path.join(sub_dir, "fake_systemctl.py")
+        Path(sys_py).write_text(
+            f"""import sys
+args = sys.argv[1:]
+if args[:2] == ["is-active", "tailscaled"]:
+    if {systemctl_active!r}:
+        print("active")
+        sys.exit(0)
+    print("inactive")
+    sys.exit(3)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        sys_sh = os.path.join(sub_dir, "fake-systemctl")
+        Path(sys_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{sys_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(sys_sh, 0o755)
+        return ts_sh, sys_sh, calls_file, seen_key_file
+
+    def _service(
+        self,
+        *,
+        tailscale_bin: str,
+        systemctl_bin: str = "systemctl",
+        target_reachable: bool = True,
+    ) -> rb.RuntimeService:
+        return rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=self.docker_sh,
+            git_bin=self.git_sh,
+            systemctl_bin=systemctl_bin,
+            tailscale_bin=tailscale_bin,
+            tailscale_target_url="http://127.0.0.1:3001",
+            tailscale_target_checker=lambda _h, _p: target_reachable,
+            runtime_token="secret-token-for-unit-test-1234",
+        )
+
+    def test_tailscale_key_redaction(self) -> None:
+        raw = "auth=tskey-auth-kSecret1234567890 api=tskey-api-kApiSecret987654"
+        redacted = rb.redact_secrets(raw)
+        self.assertNotIn("tskey-auth-kSecret1234567890", redacted)
+        self.assertNotIn("tskey-api-kApiSecret987654", redacted)
+        self.assertIn("[REDACTED]", redacted)
+
+    def test_tailscale_status_variants(self) -> None:
+        # 1. Not installed
+        svc_missing = self._service(
+            tailscale_bin=os.path.join(self.tmp_dir, "does-not-exist-tailscale")
+        )
+        missing_status = svc_missing.tailscale_status()
+        self.assertFalse(missing_status["installed"])
+        self.assertFalse(missing_status["connected"])
+        self.assertEqual(missing_status["backendState"], "not_installed")
+
+        # 2. Daemon stopped (non-JSON error)
+        ts_stopped, sys_stopped, _, _ = self._make_fake_tailscale(
+            status_rc=1,
+            status_stderr="failed to connect to local tailscaled; it doesn't appear to be running",
+        )
+        stopped_status = self._service(
+            tailscale_bin=ts_stopped, systemctl_bin=sys_stopped
+        ).tailscale_status()
+        self.assertTrue(stopped_status["installed"])
+        self.assertFalse(stopped_status["serviceActive"])
+        self.assertFalse(stopped_status["connected"])
+        self.assertEqual(stopped_status["backendState"], "stopped")
+
+        # 3. NeedsLogin with loginUrl (must NOT redact loginUrl!) and non-zero rc
+        ts_login, sys_login, _, _ = self._make_fake_tailscale(
+            status_rc=1,
+            status_stdout=json.dumps(
+                {
+                    "Version": "1.78.0",
+                    "BackendState": "NeedsLogin",
+                    "AuthURL": "https://login.tailscale.com/a/abc987def",
+                    "Self": {"HostName": "box", "DNSName": "", "TailscaleIPs": []},
+                    "CertDomains": [],
+                }
+            ),
+        )
+        login_status = self._service(
+            tailscale_bin=ts_login, systemctl_bin=sys_login
+        ).tailscale_status()
+        self.assertTrue(login_status["installed"])
+        self.assertTrue(login_status["serviceActive"])
+        self.assertFalse(login_status["connected"])
+        self.assertEqual(login_status["backendState"], "needs_login")
+        self.assertEqual(
+            login_status["loginUrl"], "https://login.tailscale.com/a/abc987def"
+        )
+
+        # 4. Connected without Serve
+        running_json = json.dumps(
+            {
+                "Version": "1.78.0",
+                "BackendState": "Running",
+                "Self": {
+                    "HostName": "my-vps",
+                    "DNSName": "my-vps.tail42.ts.net.",
+                    "TailscaleIPs": ["100.64.10.5", "fd7a:115c:a1e0::5"],
+                },
+                "CurrentTailnet": {
+                    "Name": "tail42.ts.net",
+                    "MagicDNSSuffix": "tail42.ts.net",
+                    "MagicDNSEnabled": True,
+                },
+                "CertDomains": ["my-vps.tail42.ts.net"],
+            }
+        )
+        ts_conn, sys_conn, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json, serve_stdout="{}"
+        )
+        conn_status = self._service(
+            tailscale_bin=ts_conn, systemctl_bin=sys_conn
+        ).tailscale_status()
+        self.assertTrue(conn_status["connected"])
+        self.assertEqual(conn_status["tailscaleIp"], "100.64.10.5")
+        self.assertEqual(conn_status["dnsName"], "my-vps.tail42.ts.net")
+        self.assertTrue(conn_status["magicDnsEnabled"])
+        self.assertTrue(conn_status["httpsCertsAvailable"])
+        self.assertFalse(conn_status["serveEnabled"])
+        self.assertIsNone(conn_status["serveConflict"])
+
+        # 5. Connected with Serve matching http://127.0.0.1:3001
+        ts_serve, sys_serve, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:3001"}}
+                        }
+                    }
+                }
+            ),
+        )
+        serve_status = self._service(
+            tailscale_bin=ts_serve, systemctl_bin=sys_serve
+        ).tailscale_status()
+        self.assertTrue(serve_status["serveEnabled"])
+        self.assertEqual(serve_status["serveUrl"], "https://my-vps.tail42.ts.net")
+        self.assertEqual(serve_status["mcpUrl"], "https://my-vps.tail42.ts.net/mcp")
+        self.assertIsNone(serve_status["serveConflict"])
+
+        # 6. Connected with port 443 conflict
+        ts_conflict, sys_conflict, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}
+                        }
+                    }
+                }
+            ),
+        )
+        conflict_status = self._service(
+            tailscale_bin=ts_conflict, systemctl_bin=sys_conflict
+        ).tailscale_status()
+        self.assertFalse(conflict_status["serveEnabled"])
+        self.assertEqual(conflict_status["serveConflict"], "http://127.0.0.1:9000")
+
+    def test_set_tailscale_serve_enable_disable_conflict_and_errors(self) -> None:
+        running_json = json.dumps(
+            {
+                "BackendState": "Running",
+                "Self": {
+                    "HostName": "my-vps",
+                    "DNSName": "my-vps.tail42.ts.net.",
+                    "TailscaleIPs": ["100.64.10.5"],
+                },
+                "CurrentTailnet": {"Name": "tail42.ts.net", "MagicDNSEnabled": True},
+                "CertDomains": ["my-vps.tail42.ts.net"],
+            }
+        )
+
+        # Enable succeeds and passes --bg --https=443 http://127.0.0.1:3001
+        ts_ok, sys_ok, calls_file, _ = self._make_fake_tailscale(
+            status_stdout=running_json, serve_stdout="{}"
+        )
+        svc_ok = self._service(tailscale_bin=ts_ok, systemctl_bin=sys_ok)
+        res_on = svc_ok.set_tailscale_serve({"enabled": True})
+        self.assertTrue(res_on["ok"])
+        res_off = svc_ok.set_tailscale_serve({"enabled": False})
+        self.assertTrue(res_off["ok"])
+        calls = [
+            json.loads(line)
+            for line in Path(calls_file).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(
+            ["serve", "--bg", "--https=443", "http://127.0.0.1:3001"], calls
+        )
+        self.assertIn(["serve", "--https=443", "off"], calls)
+
+        # Conflict returns 409 unless force=True
+        ts_conflict, sys_conflict, calls_conflict, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout=json.dumps(
+                {
+                    "Web": {
+                        "my-vps.tail42.ts.net:443": {
+                            "Handlers": {"/": {"Proxy": "http://127.0.0.1:9000"}}
+                        }
+                    }
+                }
+            ),
+        )
+        svc_conflict = self._service(
+            tailscale_bin=ts_conflict, systemctl_bin=sys_conflict
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_conflict:
+            svc_conflict.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_conflict.exception.status_code, 409)
+        forced = svc_conflict.set_tailscale_serve({"enabled": True, "force": True})
+        self.assertTrue(forced["ok"])
+        conflict_calls = [
+            json.loads(line)
+            for line in Path(calls_conflict).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(
+            ["serve", "--bg", "--https=443", "http://127.0.0.1:3001"], conflict_calls
+        )
+
+        # Unreachable loopback target returns 422
+        svc_unreach = self._service(
+            tailscale_bin=ts_ok, systemctl_bin=sys_ok, target_reachable=False
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_unreach:
+            svc_unreach.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_unreach.exception.status_code, 422)
+
+        # Tailscale admin enablement link surfaced cleanly on error
+        ts_admin_err, sys_admin_err, _, _ = self._make_fake_tailscale(
+            status_stdout=running_json,
+            serve_stdout="{}",
+            serve_cmd_rc=1,
+            serve_cmd_stderr="Serve is not enabled on your tailnet. To enable, visit: https://login.tailscale.com/f/serve?node=n123",
+        )
+        svc_admin_err = self._service(
+            tailscale_bin=ts_admin_err, systemctl_bin=sys_admin_err
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_admin:
+            svc_admin_err.set_tailscale_serve({"enabled": True})
+        self.assertEqual(cm_admin.exception.status_code, 422)
+        self.assertIn(
+            "https://login.tailscale.com/f/serve?node=n123",
+            str(cm_admin.exception),
+        )
+
+    def test_connect_tailscale_login_and_authkey_security(self) -> None:
+        needs_login_json = json.dumps(
+            {
+                "BackendState": "Stopped",
+                "Self": {"HostName": "my-vps", "DNSName": "", "TailscaleIPs": []},
+            }
+        )
+        ts_login, sys_login, _, _ = self._make_fake_tailscale(
+            status_stdout=needs_login_json,
+            up_rc=0,
+            up_stderr="To authenticate, visit:\n\thttps://login.tailscale.com/a/interactive777\n",
+        )
+        svc_login = self._service(tailscale_bin=ts_login, systemctl_bin=sys_login)
+        login_res = svc_login.connect_tailscale({"mode": "login"})
+        self.assertTrue(login_res["ok"])
+        self.assertEqual(
+            login_res["loginUrl"], "https://login.tailscale.com/a/interactive777"
+        )
+
+        # authkey uses --auth-key=file:<tmp>, deletes temp file, and scrubs key from errors
+        secret_key = "tskey-auth-kSuperSecretUnitKey-9999"
+        ts_key_err, sys_key_err, calls_file, seen_key_file = self._make_fake_tailscale(
+            status_stdout=needs_login_json,
+            up_rc=1,
+            up_stderr=f"invalid key {secret_key}",
+        )
+        svc_key_err = self._service(
+            tailscale_bin=ts_key_err, systemctl_bin=sys_key_err
+        )
+        with self.assertRaises(rb.BridgeRequestError) as cm_err:
+            svc_key_err.connect_tailscale({"mode": "authkey", "authKey": secret_key})
+        self.assertEqual(cm_err.exception.status_code, 422)
+        self.assertNotIn(secret_key, str(cm_err.exception))
+
+        calls = [
+            json.loads(line)
+            for line in Path(calls_file).read_text(encoding="utf-8").splitlines()
+        ]
+        up_call = next(c for c in calls if c[:1] == ["up"])
+        auth_arg = next(a for a in up_call if a.startswith("--auth-key=file:"))
+        self.assertNotIn(secret_key, " ".join(up_call))
+        temp_key_path = auth_arg.split(":", 1)[1]
+        self.assertFalse(os.path.exists(temp_key_path))
+        self.assertEqual(
+            Path(seen_key_file).read_text(encoding="utf-8"),
+            secret_key,
+        )
+
+        # Invalid authKey returns 400
+        with self.assertRaises(rb.BridgeRequestError) as cm_bad:
+            svc_key_err.connect_tailscale(
+                {"mode": "authkey", "authKey": "bad-invalid-key"}
+            )
+        self.assertEqual(cm_bad.exception.status_code, 400)
+
+
 if __name__ == "__main__":
     unittest.main()

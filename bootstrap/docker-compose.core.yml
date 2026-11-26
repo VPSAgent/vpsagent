@@ -38,9 +38,11 @@ services:
     image: vpsagent/core:local
     container_name: vpsagent-core
     restart: unless-stopped
-    # Loopback-only local setup listener for safe SSH-tunneled first-time setup
-    # (port 3001 is strictly internal for Caddy HTTPS proxy; port 3002 is host-loopback only)
+    # Loopback-only host ports (NEVER exposed on public interfaces):
+    # - 127.0.0.1:3001 -> proxy-aware server (trustProxy=true) for host-side Tailscale Serve HTTPS
+    # - 127.0.0.1:3002 -> local-only setup listener for SSH-tunneled first-time setup
     ports:
+      - "127.0.0.1:3001:3001"
       - "127.0.0.1:3002:3002"
     environment:
       - PORT=3001

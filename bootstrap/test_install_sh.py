@@ -144,6 +144,115 @@ start_core_stack
         self.assertIn(f"VPSAGENT_REPO_DIR={home_checkout}\n", docker_call)
         self.assertIn("up -d --build", docker_call)
 
+    def test_tailscale_install_configures_serve_banner_and_never_leaks_authkey(
+        self,
+    ) -> None:
+        bin_dir = Path(self.tmp) / "bin"
+        bin_dir.mkdir()
+        ts_state = Path(self.tmp) / "ts-state.json"
+        ts_calls = Path(self.tmp) / "ts-calls.log"
+        vpsagent_root = Path(self.tmp) / "var-lib-vpsagent"
+        vpsagent_root.mkdir(parents=True)
+        env_file = vpsagent_root / ".env"
+        env_file.write_text("VPSAGENT_CLAIM_TOKEN=claim_ts_banner_123\n", encoding="utf-8")
+        os.chmod(env_file, 0o600)
+
+        (bin_dir / "tailscale").write_text(
+            f"""#!/usr/bin/env python3
+import json, os, sys
+state_path = {str(ts_state)!r}
+calls_path = {str(ts_calls)!r}
+args = sys.argv[1:]
+with open(calls_path, "a", encoding="utf-8") as fh:
+    fh.write(" ".join(args) + "\\n")
+
+st = {{"connected": False, "serve": False}}
+if os.path.exists(state_path):
+    with open(state_path, "r", encoding="utf-8") as fh:
+        st = json.load(fh)
+
+if args[:1] == ["up"]:
+    for arg in args[1:]:
+        if arg.startswith("--auth-key=file:"):
+            key_path = arg.split(":", 1)[1]
+            with open(key_path, "r", encoding="utf-8") as kf:
+                assert kf.read().startswith("tskey-auth-")
+    st["connected"] = True
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+    sys.exit(0)
+
+if args == ["serve", "--bg", "--https=443", "http://127.0.0.1:3001"]:
+    st["serve"] = True
+    with open(state_path, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+    sys.exit(0)
+
+if args == ["status", "--json"]:
+    if not st["connected"]:
+        print(json.dumps({{"BackendState": "Stopped", "Self": {{"TailscaleIPs": []}}}}))
+    else:
+        print(json.dumps({{
+            "BackendState": "Running",
+            "Self": {{"DNSName": "vps-node.tail99.ts.net.", "TailscaleIPs": ["100.64.0.99"]}},
+            "CertDomains": ["vps-node.tail99.ts.net"],
+        }}))
+    sys.exit(0)
+
+if args == ["serve", "status", "--json"]:
+    if st["serve"]:
+        print(json.dumps({{
+            "Web": {{
+                "vps-node.tail99.ts.net:443": {{
+                    "Handlers": {{"/": {{"Proxy": "http://127.0.0.1:3001"}}}}
+                }}
+            }}
+        }}))
+    else:
+        print("{{}}")
+    sys.exit(0)
+
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        os.chmod(bin_dir / "tailscale", 0o755)
+
+        secret_auth_key = "tskey-auth-kInstallSecret99998888"
+        script = f"""
+set -euo pipefail
+export PATH="{bin_dir}:$PATH"
+export VPSAGENT_ROOT="{vpsagent_root}"
+export VPSAGENT_INSTALL_LIBRARY_ONLY=true
+export VPSAGENT_TAILSCALE_AUTHKEY="{secret_auth_key}"
+source "{INSTALL_SH}"
+ARG_TAILSCALE="true"
+CLAIM_TOKEN="claim_ts_banner_123"
+configure_tailscale
+print_ready_banner
+"""
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"configure_tailscale failed:\nstdout={proc.stdout}\nstderr={proc.stderr}",
+        )
+        self.assertIn(
+            "https://vps-node.tail99.ts.net/#claim=claim_ts_banner_123",
+            proc.stdout,
+        )
+        self.assertNotIn(secret_auth_key, proc.stdout)
+        self.assertNotIn(secret_auth_key, proc.stderr)
+        self.assertNotIn(secret_auth_key, env_file.read_text(encoding="utf-8"))
+        calls_text = ts_calls.read_text(encoding="utf-8")
+        self.assertIn("serve --bg --https=443 http://127.0.0.1:3001", calls_text)
+        self.assertNotIn(secret_auth_key, calls_text)
+
 
 if __name__ == "__main__":
     unittest.main()

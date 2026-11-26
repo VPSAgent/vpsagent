@@ -15,6 +15,7 @@ import {
   validateEnvKey,
   validateGitAccessToken,
   validateGitRepoUrl,
+  validateTailscaleAuthKey,
 } from "./safety.js";
 
 describe("safety validators and secret redaction", () => {
@@ -185,5 +186,36 @@ describe("safety validators and secret redaction", () => {
     );
     expect(formatGitTokenHint("ghp_abcdef123456wxyz")).toBe("ghp_••••wxyz");
     expect(formatGitTokenHint("customtokenvalue9999")).toBe("••••9999");
+  });
+
+  it("redacts and validates Tailscale auth/API keys without echoing raw keys", () => {
+    const authKey = "tskey-auth-kTestAbCd123456-9999";
+    const apiKey = "tskey-api-kApiTest123456-8888";
+    const redacted = redactSecrets(
+      `AUTH=${authKey} API=${apiKey} URL=https://login.tailscale.com/a/abc123`,
+    );
+    expect(redacted).not.toContain(authKey);
+    expect(redacted).not.toContain(apiKey);
+    expect(redacted).toContain("https://login.tailscale.com/a/abc123");
+
+    expect(validateTailscaleAuthKey(`  ${authKey}  `)).toBe(authKey);
+
+    const badSamples = [
+      "not-a-tailscale-key-secret123",
+      "tskey-auth-bad with space",
+      "--flag-injection-tskey-auth-12345678",
+      "tskey-auth-newline\nvalue1234",
+      "tskey-api-wrongprefix12345",
+    ];
+    for (const sample of badSamples) {
+      try {
+        validateTailscaleAuthKey(sample);
+        expect.unreachable("Expected validateTailscaleAuthKey to throw");
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        expect(msg).toMatch(/Invalid Tailscale auth key/);
+        expect(msg).not.toContain(sample);
+      }
+    }
   });
 });

@@ -1146,11 +1146,23 @@ export interface McpGatewayDeps {
   sessions?: McpSessionStore | undefined;
 }
 
-function buildDashboardBaseUrl(store: RegistryStore): string | null {
+function buildActiveHttpsDashboardUrl(store: RegistryStore): string | null {
   const setup = store.getSetupState();
   if (setup.domain && setup.httpsActive && setup.tlsStatus === "active") {
     return `https://${setup.domain}`;
   }
+  if (setup.tailscaleDomain && setup.tailscaleServeEnabled) {
+    return `https://${setup.tailscaleDomain}`;
+  }
+  return null;
+}
+
+function buildDashboardBaseUrl(store: RegistryStore): string | null {
+  const active = buildActiveHttpsDashboardUrl(store);
+  if (active) {
+    return active;
+  }
+  const setup = store.getSetupState();
   if (setup.domain) {
     return `https://${setup.domain}`;
   }
@@ -1212,6 +1224,10 @@ export function enforceMcpBoundary(
     validateMcpHostAndOrigin(c, {
       setupDomain: setup.domain,
       httpsActive: setup.httpsActive,
+      additionalAllowedHttpsHosts:
+        setup.tailscaleServeEnabled && setup.tailscaleDomain
+          ? [setup.tailscaleDomain]
+          : [],
       transport,
       trustProxy: transportOptions.trustProxy,
     });
@@ -1310,11 +1326,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
         summary: `AI key "${token.name}" requested approval (${approval.id}): ${input.summary}`,
         riskLevel: input.riskLevel,
       });
-      const setup = store.getSetupState();
-      const dashboardUrl =
-        setup.domain && setup.httpsActive && setup.tlsStatus === "active"
-          ? `https://${setup.domain}`
-          : null;
+      const dashboardUrl = buildActiveHttpsDashboardUrl(store);
       return toolOk({
         status: "pending_approval",
         approvalId: approval.id,
@@ -1443,11 +1455,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
       ).includes(requestedVersion)
         ? requestedVersion
         : DEFAULT_MCP_PROTOCOL_VERSION;
-      const setup = store.getSetupState();
-      const dashboardUrl =
-        setup.domain && setup.httpsActive && setup.tlsStatus === "active"
-          ? `https://${setup.domain}`
-          : null;
+      const dashboardUrl = buildActiveHttpsDashboardUrl(store);
       c.header("MCP-Protocol-Version", negotiatedVersion);
       if (sessionStore) {
         c.header("Mcp-Session-Id", sessionStore.create(token.id));
@@ -1564,6 +1572,12 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
               appsBaseDomain: setup.appsBaseDomain,
               httpsActive: setup.httpsActive,
               tlsStatus: setup.tlsStatus,
+              tailscaleDomain: setup.tailscaleDomain,
+              tailscaleServeEnabled: setup.tailscaleServeEnabled,
+              tailscaleUrl:
+                setup.tailscaleServeEnabled && setup.tailscaleDomain
+                  ? `https://${setup.tailscaleDomain}`
+                  : null,
               publicReposSupported: true,
               privateReposSupported: true,
               githubConnected: gitCredentials.length > 0,
@@ -2099,7 +2113,28 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
               tlsError: checked.tlsError,
             });
           }
-          callResult = toolOk({ setup });
+          let tailscale = null;
+          if (bridge.getTailscaleStatus) {
+            try {
+              tailscale = await bridge.getTailscaleStatus();
+              const nextDomain = tailscale.dnsName || null;
+              const nextEnabled = Boolean(
+                tailscale.serveEnabled && tailscale.dnsName,
+              );
+              if (
+                setup.tailscaleDomain !== nextDomain ||
+                setup.tailscaleServeEnabled !== nextEnabled
+              ) {
+                setup = store.updateSetupState({
+                  tailscaleDomain: nextDomain,
+                  tailscaleServeEnabled: nextEnabled,
+                });
+              }
+            } catch {
+              tailscale = null;
+            }
+          }
+          callResult = toolOk({ setup, tailscale });
           break;
         }
 

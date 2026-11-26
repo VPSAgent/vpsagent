@@ -168,6 +168,8 @@ const DEFAULT_SETUP_STATE: SetupState = {
   tlsStatus: "inactive",
   tlsError: null,
   claimedAt: null,
+  tailscaleDomain: null,
+  tailscaleServeEnabled: false,
 };
 
 const ENV_SECRET_KEY_HINT =
@@ -1463,11 +1465,18 @@ export class RegistryStore {
         : patch.appsBaseDomain === null
           ? null
           : validateDomain(patch.appsBaseDomain);
+    const nextTailscaleDomain =
+      patch.tailscaleDomain === undefined
+        ? current.tailscaleDomain
+        : patch.tailscaleDomain === null
+          ? null
+          : validateDomain(patch.tailscaleDomain);
     const next = SetupStateSchema.parse({
       ...current,
       ...patch,
       domain: nextDomain,
       appsBaseDomain: nextAppsBaseDomain,
+      tailscaleDomain: nextTailscaleDomain,
     });
     const now = new Date().toISOString();
     this.db

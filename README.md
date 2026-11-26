@@ -15,12 +15,23 @@ git clone git@github.com:VPSAgent/vpsagent.git "$HOME/vpsagent"
 sudo bash "$HOME/vpsagent/bootstrap/install.sh" --domain vps.yourdomain.com --email you@yourdomain.com
 ```
 
-Or install without a domain yet (uses a private SSH tunnel on `127.0.0.1:3002` so passwords never travel over plaintext HTTP, then lets you bind your domain in Step 2):
+Or install without a domain yet (uses a private SSH tunnel on `127.0.0.1:3002` so passwords never travel over plaintext HTTP, then lets you bind your domain or turn on Tailscale in Step 2):
 
 ```bash
 git clone git@github.com:VPSAgent/vpsagent.git "$HOME/vpsagent"
 sudo bash "$HOME/vpsagent/bootstrap/install.sh"
 ```
+
+### Private HTTPS via Tailscale (No Domain or DNS Required)
+
+If you don't want to buy a domain or set up DNS records, pass `--tailscale` to install Tailscale and enable private HTTPS for both your dashboard and AI doorway (`https://<machine>.<tailnet>.ts.net/mcp`):
+
+```bash
+git clone git@github.com:VPSAgent/vpsagent.git "$HOME/vpsagent"
+sudo bash "$HOME/vpsagent/bootstrap/install.sh" --tailscale
+```
+
+(Optional for headless installs: set `VPSAGENT_TAILSCALE_AUTHKEY=tskey-auth-...` before `sudo -E bash ...` to sign the server into your tailnet automatically.)
 
 ### Option B — One-Line Public / Release Install (Public Repo Only)
 

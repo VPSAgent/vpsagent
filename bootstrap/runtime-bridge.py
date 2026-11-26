@@ -237,12 +237,73 @@ ENV_OR_YAML_SECRET_RE = re.compile(
     re.IGNORECASE,
 )
 KNOWN_TOKEN_RE = re.compile(
-    r"\b(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|vpsmcp_[A-Za-z0-9_-]{16,}|\d{6,12}:AA[A-Za-z0-9_-]{25,})\b"
+    r"\b(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|vpsmcp_[A-Za-z0-9_-]{16,}|tskey-[a-z]+-[A-Za-z0-9_-]{8,}|\d{6,12}:AA[A-Za-z0-9_-]{25,})\b"
 )
 GIT_AUTH_ERROR_RE = re.compile(
     r"(?:authentication failed|could not read username|terminal prompts disabled|repository not found|returned error:\s*40[134]|access denied|invalid username or (?:password|token))",
     re.IGNORECASE,
 )
+TAILSCALE_AUTHKEY_PATTERN = re.compile(r"^tskey-auth-[A-Za-z0-9_-]{8,256}$")
+TAILSCALE_LOGIN_URL_RE = re.compile(
+    r"https://login\.tailscale\.com/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+"
+)
+DEFAULT_TAILSCALE_TARGET_URL = "http://127.0.0.1:3001"
+
+
+def _validate_tailscale_target_url(raw: str) -> tuple[str, str, int]:
+    """
+    Validates that the Tailscale Serve upstream target is strictly an HTTP loopback
+    host:port (e.g. http://127.0.0.1:3001) with no credentials, path, query, or fragment.
+    """
+    cleaned = raw.strip()
+    parsed = urlparse(cleaned)
+    if parsed.scheme != "http":
+        raise ValueError("Tailscale target URL must use http:// on loopback.")
+    if parsed.username or parsed.password:
+        raise ValueError("Tailscale target URL cannot contain credentials.")
+    host = (parsed.hostname or "").lower()
+    if host not in ("127.0.0.1", "localhost"):
+        raise ValueError(
+            "Tailscale target URL must point to 127.0.0.1 or localhost."
+        )
+    if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError(
+            "Tailscale target URL cannot include a path, query, or fragment."
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid Tailscale target port.") from exc
+    if port is None or port < 1 or port > 65535:
+        raise ValueError(
+            "Tailscale target URL must specify a port between 1 and 65535."
+        )
+    return f"http://{host}:{port}", host, port
+
+
+def _default_loopback_port_checker(
+    host: str, port: int, timeout_s: float = 1.0
+) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _normalize_tailscale_url(raw: str | None) -> str | None:
+    if not raw or not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().rstrip(".,);]")
+    if not cleaned:
+        return None
+    parsed = urlparse(cleaned)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not host:
+        return None
+    if host != "tailscale.com" and not host.endswith(".tailscale.com"):
+        return None
+    return cleaned
 
 DnsResolver = Callable[[str, int], list[str]]
 TlsChecker = Callable[[str, float], tuple[bool, str, str | None]]
@@ -2414,6 +2475,9 @@ class RuntimeService:
         docker_bin: str = "docker",
         git_bin: str = "git",
         systemctl_bin: str = "systemctl",
+        tailscale_bin: str = "tailscale",
+        tailscale_target_url: str | None = None,
+        tailscale_target_checker: Callable[[str, int], bool] | None = None,
         vpsagent_root: str | None = None,
         repo_dir: str | None = None,
         runtime_token: str | None = None,
@@ -2433,6 +2497,8 @@ class RuntimeService:
             raise ValueError("Invalid git binary path.")
         if not systemctl_bin or any(ch.isspace() for ch in systemctl_bin):
             raise ValueError("Invalid systemctl binary path.")
+        if not tailscale_bin or any(ch.isspace() for ch in tailscale_bin):
+            raise ValueError("Invalid tailscale binary path.")
         cleaned_token = (runtime_token or "").strip() or None
         if not cleaned_token and not allow_unauthenticated:
             raise ValueError(
@@ -2447,6 +2513,24 @@ class RuntimeService:
         self.docker_bin = docker_bin
         self.git_bin = git_bin
         self.systemctl_bin = systemctl_bin
+        raw_ts_target = (
+            tailscale_target_url
+            if isinstance(tailscale_target_url, str) and tailscale_target_url.strip()
+            else os.environ.get(
+                "VPSAGENT_TAILSCALE_TARGET_URL", DEFAULT_TAILSCALE_TARGET_URL
+            )
+        )
+        normalized_ts_target, ts_host, ts_port = _validate_tailscale_target_url(
+            raw_ts_target
+        )
+        self.tailscale_bin = tailscale_bin
+        self.tailscale_target_url = normalized_ts_target
+        self._tailscale_target_host = ts_host
+        self._tailscale_target_port = ts_port
+        self._tailscale_target_checker = (
+            tailscale_target_checker or _default_loopback_port_checker
+        )
+        self._tailscale_lock = threading.Lock()
         if vpsagent_root:
             self.vpsagent_root = os.path.abspath(vpsagent_root)
         else:
@@ -4894,6 +4978,544 @@ class RuntimeService:
         }
 
     # ------------------------------------------------------------------
+    # Tailscale Status & Serve Management (Allowlisted Host Integration)
+    # ------------------------------------------------------------------
+
+    def _is_tailscale_installed(self) -> bool:
+        if os.sep in self.tailscale_bin:
+            return os.path.isfile(self.tailscale_bin) and os.access(
+                self.tailscale_bin, os.X_OK
+            )
+        return shutil.which(self.tailscale_bin) is not None
+
+    def _is_matching_serve_target(self, proxy_val: str) -> bool:
+        normalized = proxy_val.strip().rstrip("/").lower()
+        port = self._tailscale_target_port
+        return normalized in (
+            f"http://127.0.0.1:{port}",
+            f"http://localhost:{port}",
+        )
+
+    def _inspect_tailscale_serve(
+        self, dns_name: str | None
+    ) -> tuple[bool, str | None, str | None]:
+        proc = self._run_cmd(
+            [self.tailscale_bin, "serve", "status", "--json"],
+            label="Tailscale",
+            timeout=8,
+            check=False,
+        )
+        raw = (proc.stdout or "").strip()
+        if not raw or proc.returncode != 0:
+            return False, None, None
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return False, None, None
+        if not isinstance(data, dict):
+            return False, None, None
+        web = data.get("Web")
+        if not isinstance(web, dict) or not web:
+            return False, None, None
+
+        preferred_key = f"{dns_name}:443" if dns_name else None
+        candidate_keys: list[str] = []
+        if preferred_key and preferred_key in web:
+            candidate_keys.append(preferred_key)
+        for key in web:
+            if (
+                isinstance(key, str)
+                and key.endswith(":443")
+                and key not in candidate_keys
+            ):
+                candidate_keys.append(key)
+
+        other_proxy: str | None = None
+        for key in candidate_keys:
+            entry = web.get(key)
+            if not isinstance(entry, dict):
+                continue
+            handlers = entry.get("Handlers")
+            if not isinstance(handlers, dict):
+                continue
+            root_handler = handlers.get("/")
+            if not isinstance(root_handler, dict):
+                continue
+            proxy = root_handler.get("Proxy")
+            if isinstance(proxy, str) and proxy.strip():
+                cleaned_proxy = proxy.strip()
+                if self._is_matching_serve_target(cleaned_proxy):
+                    return True, cleaned_proxy, None
+                if other_proxy is None:
+                    other_proxy = cleaned_proxy
+
+        if other_proxy is not None:
+            return False, other_proxy, other_proxy
+        for key in candidate_keys:
+            entry = web.get(key)
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("Handlers"), dict)
+                and entry.get("Handlers")
+            ):
+                return False, f"tailscale-serve:{key}", f"existing handler on {key}"
+        return False, None, None
+
+    def tailscale_status(self) -> dict[str, Any]:
+        if not self._is_tailscale_installed():
+            return {
+                "installed": False,
+                "serviceActive": False,
+                "connected": False,
+                "backendState": "not_installed",
+                "tailscaleIp": None,
+                "tailscaleIps": [],
+                "hostname": None,
+                "dnsName": None,
+                "tailnetName": None,
+                "magicDnsEnabled": False,
+                "httpsCertsAvailable": False,
+                "loginUrl": None,
+                "serveEnabled": False,
+                "serveTarget": None,
+                "serveUrl": None,
+                "mcpUrl": None,
+                "serveConflict": None,
+                "cliVersion": None,
+                "detail": None,
+            }
+
+        proc = self._run_cmd(
+            [self.tailscale_bin, "status", "--json"],
+            label="Tailscale",
+            timeout=8,
+            check=False,
+        )
+        parsed_status: dict[str, Any] | None = None
+        raw_stdout = (proc.stdout or "").strip()
+        if raw_stdout:
+            try:
+                loaded = json.loads(raw_stdout)
+                if isinstance(loaded, dict):
+                    parsed_status = loaded
+            except json.JSONDecodeError:
+                parsed_status = None
+
+        if parsed_status is None:
+            combined_err = redact_secrets(
+                ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+            )
+            err_lower = combined_err.lower()
+            service_active = False
+            if not any(
+                marker in err_lower
+                for marker in (
+                    "failed to connect to local tailscaled",
+                    "not running",
+                    "stopped",
+                )
+            ):
+                try:
+                    svc_proc = self._run_cmd(
+                        [self.systemctl_bin, "is-active", "tailscaled"],
+                        label="systemd",
+                        timeout=5,
+                        check=False,
+                    )
+                    service_active = (
+                        svc_proc.returncode == 0
+                        and (svc_proc.stdout or "").strip() == "active"
+                    )
+                except BridgeRequestError:
+                    service_active = False
+            return {
+                "installed": True,
+                "serviceActive": service_active,
+                "connected": False,
+                "backendState": "stopped",
+                "tailscaleIp": None,
+                "tailscaleIps": [],
+                "hostname": None,
+                "dnsName": None,
+                "tailnetName": None,
+                "magicDnsEnabled": False,
+                "httpsCertsAvailable": False,
+                "loginUrl": None,
+                "serveEnabled": False,
+                "serveTarget": None,
+                "serveUrl": None,
+                "mcpUrl": None,
+                "serveConflict": None,
+                "cliVersion": None,
+                "detail": combined_err
+                or "Tailscale background service (tailscaled) is not running yet.",
+            }
+
+        raw_backend = str(parsed_status.get("BackendState") or "").strip()
+        backend_map = {
+            "running": "running",
+            "needslogin": "needs_login",
+            "needsmachineauth": "needs_machine_auth",
+            "stopped": "stopped",
+            "starting": "starting",
+        }
+        backend_state = backend_map.get(raw_backend.lower(), "unknown")
+        service_active = True
+
+        self_info = (
+            parsed_status.get("Self")
+            if isinstance(parsed_status.get("Self"), dict)
+            else {}
+        )
+        raw_hostname = self_info.get("HostName")
+        hostname = (
+            raw_hostname.strip()
+            if isinstance(raw_hostname, str) and raw_hostname.strip()
+            else None
+        )
+
+        raw_dns = self_info.get("DNSName")
+        dns_name: str | None = None
+        if isinstance(raw_dns, str):
+            candidate_dns = raw_dns.strip().rstrip(".").lower()
+            if candidate_dns and DOMAIN_PATTERN.match(candidate_dns):
+                dns_name = candidate_dns
+
+        raw_ips = self_info.get("TailscaleIPs")
+        if not isinstance(raw_ips, list):
+            raw_ips = parsed_status.get("TailscaleIPs")
+        tailscale_ips: list[str] = []
+        if isinstance(raw_ips, list):
+            for item in raw_ips:
+                if isinstance(item, str) and item.strip():
+                    candidate_ip = item.strip()
+                    try:
+                        ipaddress.ip_address(candidate_ip)
+                        tailscale_ips.append(candidate_ip)
+                    except ValueError:
+                        continue
+
+        tailscale_ip: str | None = None
+        for ip in tailscale_ips:
+            if ipaddress.ip_address(ip).version == 4:
+                tailscale_ip = ip
+                break
+        if tailscale_ip is None and tailscale_ips:
+            tailscale_ip = tailscale_ips[0]
+
+        current_tailnet = (
+            parsed_status.get("CurrentTailnet")
+            if isinstance(parsed_status.get("CurrentTailnet"), dict)
+            else {}
+        )
+        raw_tailnet_name = current_tailnet.get("Name")
+        tailnet_name = (
+            raw_tailnet_name.strip()
+            if isinstance(raw_tailnet_name, str) and raw_tailnet_name.strip()
+            else None
+        )
+        magic_dns_suffix = (
+            current_tailnet.get("MagicDNSSuffix")
+            or parsed_status.get("MagicDNSSuffix")
+        )
+        if "MagicDNSEnabled" in current_tailnet:
+            magic_dns_enabled = bool(current_tailnet.get("MagicDNSEnabled"))
+        else:
+            magic_dns_enabled = bool(
+                dns_name
+                or (isinstance(magic_dns_suffix, str) and magic_dns_suffix.strip())
+            )
+
+        cert_domains = parsed_status.get("CertDomains")
+        https_certs_available = isinstance(cert_domains, list) and any(
+            isinstance(d, str) and d.strip() for d in cert_domains
+        )
+        login_url = _normalize_tailscale_url(parsed_status.get("AuthURL"))
+
+        raw_version = parsed_status.get("Version")
+        cli_version = (
+            raw_version.strip()
+            if isinstance(raw_version, str) and raw_version.strip()
+            else None
+        )
+
+        connected = backend_state == "running" and tailscale_ip is not None
+        if connected:
+            serve_enabled, serve_target, serve_conflict = self._inspect_tailscale_serve(
+                dns_name
+            )
+        else:
+            serve_enabled, serve_target, serve_conflict = False, None, None
+
+        serve_url = f"https://{dns_name}" if (serve_enabled and dns_name) else None
+        mcp_url = f"https://{dns_name}/mcp" if (serve_enabled and dns_name) else None
+
+        detail: str | None = None
+        if backend_state == "needs_machine_auth":
+            detail = "This server is waiting for device approval in your Tailscale admin console."
+        elif connected and not magic_dns_enabled:
+            detail = (
+                "MagicDNS is currently turned off in your tailnet. Enable MagicDNS and HTTPS "
+                "Certificates in Tailscale DNS settings for automatic private HTTPS."
+            )
+        elif connected and not https_certs_available:
+            detail = (
+                "Tailscale HTTPS Certificates are not enabled for this tailnet yet. "
+                "Enable MagicDNS and HTTPS Certificates in Tailscale DNS settings."
+            )
+        elif serve_conflict:
+            detail = f"Tailscale Serve port 443 is currently forwarding to {serve_conflict}."
+
+        return {
+            "installed": True,
+            "serviceActive": service_active,
+            "connected": connected,
+            "backendState": backend_state,
+            "tailscaleIp": tailscale_ip,
+            "tailscaleIps": tailscale_ips,
+            "hostname": hostname,
+            "dnsName": dns_name,
+            "tailnetName": tailnet_name,
+            "magicDnsEnabled": magic_dns_enabled,
+            "httpsCertsAvailable": https_certs_available,
+            "loginUrl": login_url,
+            "serveEnabled": serve_enabled,
+            "serveTarget": serve_target,
+            "serveUrl": serve_url,
+            "mcpUrl": mcp_url,
+            "serveConflict": serve_conflict,
+            "cliVersion": cli_version,
+            "detail": detail,
+        }
+
+    def set_tailscale_serve(self, payload: dict[str, Any]) -> dict[str, Any]:
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise BridgeRequestError(400, "Field 'enabled' must be a boolean.")
+        force = bool(payload.get("force", False))
+
+        with self._tailscale_lock:
+            status = self.tailscale_status()
+            if enabled:
+                if not status["installed"]:
+                    raise BridgeRequestError(
+                        400, "Tailscale is not installed on this server yet."
+                    )
+                if not status["connected"]:
+                    raise BridgeRequestError(
+                        400,
+                        "Tailscale is not connected yet. Sign in to Tailscale first.",
+                    )
+                if not status["dnsName"]:
+                    raise BridgeRequestError(
+                        400,
+                        "MagicDNS hostname is not available yet. Enable MagicDNS and HTTPS Certificates at https://login.tailscale.com/admin/dns and refresh.",
+                    )
+                if status["serveConflict"] and not force:
+                    raise BridgeRequestError(
+                        409,
+                        f'Tailscale Serve port 443 is currently forwarding to {status["serveConflict"]}. Confirm replacement to switch port 443 to VPSAgent.',
+                    )
+                if not self._tailscale_target_checker(
+                    self._tailscale_target_host, self._tailscale_target_port
+                ):
+                    raise BridgeRequestError(
+                        422,
+                        f"VPSAgent's private local proxy port ({self._tailscale_target_host}:{self._tailscale_target_port}) is not open yet. Run the VPSAgent updater or re-run bootstrap/install.sh once so Docker publishes the private loopback port.",
+                    )
+
+                proc = self._run_cmd(
+                    [
+                        self.tailscale_bin,
+                        "serve",
+                        "--bg",
+                        "--https=443",
+                        self.tailscale_target_url,
+                    ],
+                    label="Tailscale",
+                    timeout=25,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    raw_out = (proc.stderr or "") + "\n" + (proc.stdout or "")
+                    action_match = TAILSCALE_LOGIN_URL_RE.search(raw_out)
+                    action_url = (
+                        _normalize_tailscale_url(action_match.group(0))
+                        if action_match
+                        else None
+                    )
+                    if action_url:
+                        raise BridgeRequestError(
+                            422,
+                            f"Tailscale Serve needs HTTPS enabled in your Tailscale DNS settings first. Open {action_url} to enable it, then try again.",
+                        )
+                    combined = redact_secrets(raw_out.strip())
+                    raise BridgeRequestError(
+                        422,
+                        combined or "Could not enable Tailscale Serve on port 443.",
+                    )
+
+                updated = self.tailscale_status()
+                return {
+                    "ok": True,
+                    "status": updated,
+                    "actionUrl": None,
+                }
+
+            if not status["installed"]:
+                return {"ok": True, "status": status, "actionUrl": None}
+            if status["serveConflict"] and not force:
+                raise BridgeRequestError(
+                    409,
+                    f'Refusing to turn off Tailscale Serve port 443 because it is forwarding to another service ({status["serveConflict"]}).',
+                )
+            proc = self._run_cmd(
+                [self.tailscale_bin, "serve", "--https=443", "off"],
+                label="Tailscale",
+                timeout=20,
+                check=False,
+            )
+            raw_out = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()
+            if proc.returncode != 0 and not any(
+                msg in raw_out.lower()
+                for msg in ("not serving", "no serve config", "nothing to turn off")
+            ):
+                raise BridgeRequestError(
+                    422,
+                    redact_secrets(raw_out)
+                    or "Could not turn off Tailscale Serve on port 443.",
+                )
+            updated = self.tailscale_status()
+            return {"ok": True, "status": updated, "actionUrl": None}
+
+    def connect_tailscale(self, payload: dict[str, Any]) -> dict[str, Any]:
+        mode = payload.get("mode", "login")
+        if not isinstance(mode, str) or mode not in ("login", "authkey"):
+            raise BridgeRequestError(
+                400, "Field 'mode' must be either 'login' or 'authkey'."
+            )
+
+        auth_key = ""
+        if mode == "authkey":
+            raw_key = payload.get("authKey")
+            if not isinstance(raw_key, str) or not TAILSCALE_AUTHKEY_PATTERN.match(
+                raw_key.strip()
+            ):
+                raise BridgeRequestError(
+                    400,
+                    "Invalid Tailscale auth key format: expected a tskey-auth-... key.",
+                )
+            auth_key = raw_key.strip()
+
+        with self._tailscale_lock:
+            status = self.tailscale_status()
+            if not status["installed"]:
+                raise BridgeRequestError(
+                    400, "Tailscale is not installed on this server yet."
+                )
+
+            if not status["serviceActive"]:
+                try:
+                    self._run_cmd(
+                        [self.systemctl_bin, "start", "tailscaled"],
+                        label="systemd",
+                        timeout=15,
+                        check=False,
+                    )
+                except BridgeRequestError:
+                    pass
+                status = self.tailscale_status()
+
+            if mode == "login":
+                if status["connected"]:
+                    return {"ok": True, "status": status, "loginUrl": None}
+                if status["loginUrl"] and status["backendState"] == "needs_login":
+                    return {
+                        "ok": True,
+                        "status": status,
+                        "loginUrl": status["loginUrl"],
+                    }
+
+                proc = self._run_cmd(
+                    [self.tailscale_bin, "up", "--timeout=4s"],
+                    label="Tailscale",
+                    timeout=12,
+                    check=False,
+                )
+                raw_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                extracted_match = TAILSCALE_LOGIN_URL_RE.search(raw_out)
+                updated = self.tailscale_status()
+                login_url = updated["loginUrl"] or _normalize_tailscale_url(
+                    extracted_match.group(0) if extracted_match else None
+                )
+                if not updated["connected"] and not login_url and proc.returncode != 0:
+                    raise BridgeRequestError(
+                        422,
+                        redact_secrets(
+                            (
+                                proc.stderr
+                                or proc.stdout
+                                or "Could not start Tailscale sign-in."
+                            ).strip()
+                        ),
+                    )
+                return {
+                    "ok": True,
+                    "status": updated,
+                    "loginUrl": login_url,
+                }
+
+            tmp_dir = tempfile.mkdtemp(prefix="vpsagent-ts-")
+            os.chmod(tmp_dir, 0o700)
+            key_file = os.path.join(tmp_dir, "authkey")
+            try:
+                fd = os.open(
+                    key_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+                )
+                try:
+                    os.write(fd, auth_key.encode("utf-8"))
+                finally:
+                    os.close(fd)
+                os.chmod(key_file, 0o600)
+
+                proc = self._run_cmd(
+                    [
+                        self.tailscale_bin,
+                        "up",
+                        f"--auth-key=file:{key_file}",
+                        "--timeout=25s",
+                    ],
+                    label="Tailscale",
+                    timeout=35,
+                    check=False,
+                )
+            finally:
+                try:
+                    if os.path.exists(key_file):
+                        os.unlink(key_file)
+                except OSError:
+                    pass
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+            if proc.returncode != 0:
+                detail = _scrub_secret_values(
+                    (
+                        proc.stderr
+                        or proc.stdout
+                        or "Tailscale sign-in with auth key failed."
+                    ).strip(),
+                    [auth_key],
+                )
+                raise BridgeRequestError(422, detail)
+
+            updated = self.tailscale_status()
+            return {
+                "ok": True,
+                "status": updated,
+                "loginUrl": updated["loginUrl"],
+            }
+
+    # ------------------------------------------------------------------
     # VPSAgent Self-Update (Check + Safe Detached Rebuild)
     # ------------------------------------------------------------------
 
@@ -5716,6 +6338,16 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                 except Exception as exc:  # pragma: no cover
                     self._send_json(500, {"error": redact_secrets(str(exc))})
                 return
+            if self.path == "/v1/host/tailscale/status":
+                if not self._require_auth():
+                    return
+                try:
+                    self._send_json(200, service.tailscale_status())
+                except BridgeRequestError as exc:
+                    self._send_json(exc.status_code, {"error": str(exc)})
+                except Exception as exc:  # pragma: no cover
+                    self._send_json(500, {"error": redact_secrets(str(exc))})
+                return
             if self.path == "/v1/core/update/status":
                 if not self._require_auth():
                     return
@@ -5777,6 +6409,10 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(200, service.manage_service(payload))
                 elif self.path == "/v1/host/docker/cleanup":
                     self._send_json(200, service.docker_cleanup(payload))
+                elif self.path == "/v1/host/tailscale/serve":
+                    self._send_json(200, service.set_tailscale_serve(payload))
+                elif self.path == "/v1/host/tailscale/connect":
+                    self._send_json(200, service.connect_tailscale(payload))
                 else:
                     self._send_json(404, {"error": "Not found."})
             except BridgeRequestError as exc:
@@ -5865,6 +6501,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("VPSAGENT_SYSTEMCTL_BIN", "systemctl"),
     )
     parser.add_argument(
+        "--tailscale-bin",
+        default=os.environ.get("VPSAGENT_TAILSCALE_BIN", "tailscale"),
+    )
+    parser.add_argument(
+        "--tailscale-target-url",
+        default=os.environ.get(
+            "VPSAGENT_TAILSCALE_TARGET_URL", DEFAULT_TAILSCALE_TARGET_URL
+        ),
+    )
+    parser.add_argument(
         "--vpsagent-root",
         default=os.environ.get("VPSAGENT_ROOT", ""),
     )
@@ -5919,6 +6565,8 @@ def main(argv: list[str] | None = None) -> int:
         docker_bin=args.docker_bin,
         git_bin=args.git_bin,
         systemctl_bin=args.systemctl_bin,
+        tailscale_bin=args.tailscale_bin,
+        tailscale_target_url=args.tailscale_target_url,
         vpsagent_root=args.vpsagent_root or None,
         repo_dir=args.repo_dir or None,
         runtime_token=token or None,
