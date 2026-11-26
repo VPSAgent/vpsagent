@@ -32,14 +32,24 @@ curl -fsSL https://raw.githubusercontent.com/VPSAgent/vpsagent/main/bootstrap/in
 
 ### Upgrading an Existing Install
 
-Pull the latest code in your checkout and re-run the installer:
+**One-click dashboard update (recommended):**
+
+Open **AI Keys & Settings → VPSAgent updates** in your dashboard and click **Check for updates**. When a new GitHub Release is published, click **Update** to download, verify its SHA-256 checksum, rebuild `vpsagent-core`, restart the host Runtime Bridge, and reconnect automatically—or track your repository branch automatically if no release is published yet.
+
+You can also check for newer releases directly from your server shell:
+
+```bash
+python3 /var/lib/vpsagent/runtime-bridge.py --check-update
+```
+
+**Manual shell fallback:** pull the latest code in your checkout and re-run the installer:
 
 ```bash
 git -C "$HOME/vpsagent" pull --ff-only
 sudo bash "$HOME/vpsagent/bootstrap/install.sh"
 ```
 
-Your existing secrets, database, apps, and sessions are preserved. Even if an older install originally built from `/opt/vpsagent`, running `install.sh` from `$HOME/vpsagent` automatically updates `VPSAGENT_REPO_DIR`, restarts and health-checks `vpsagent-runtime.service`, and rebuilds `vpsagent-core` from the checkout that launched the installer.
+Your existing secrets, database, apps, and sessions are preserved in every upgrade path. Even if an older install originally built from `/opt/vpsagent`, running `install.sh` from `$HOME/vpsagent` automatically updates `VPSAGENT_REPO_DIR`, restarts and health-checks `vpsagent-runtime.service`, and rebuilds `vpsagent-core` from the checkout that launched the installer.
 
 ## Core Pillars
 

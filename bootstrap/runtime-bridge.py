@@ -26,6 +26,7 @@ import base64
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
 import hmac
 import http.client
 import ipaddress
@@ -46,12 +47,13 @@ import ssl
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler
 from typing import Any, Callable, Iterator
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 MAX_BODY_BYTES = 512 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 48 * 1024
@@ -126,6 +128,35 @@ DEFAULT_BUILD_TIMEOUT_S = 300
 MIN_BUILD_TIMEOUT_S = 10
 MAX_BUILD_TIMEOUT_S = 600
 MAX_BUILD_LOG_LINES = 80
+
+DEFAULT_RELEASE_REPO = "VPSAgent/vpsagent"
+DEFAULT_GITHUB_API_BASE = "https://api.github.com"
+RELEASE_REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$")
+RELEASE_TAG_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
+SHA256_HEX_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+SEMVER_PATTERN = re.compile(
+    r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
+GITHUB_REMOTE_URL_RE = re.compile(
+    r"^(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$",
+    re.IGNORECASE,
+)
+ALLOWED_RELEASE_DOWNLOAD_HOSTS = frozenset(
+    {
+        "api.github.com",
+        "github.com",
+        "codeload.github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "github-releases.githubusercontent.com",
+    }
+)
+MAX_RELEASE_JSON_BYTES = 1 * 1024 * 1024
+MAX_CHECKSUM_FILE_BYTES = 256 * 1024
+MAX_RELEASE_ARCHIVE_BYTES = 100 * 1024 * 1024
+MAX_RELEASE_EXTRACT_BYTES = 256 * 1024 * 1024
+MAX_RELEASE_EXTRACT_MEMBERS = 10_000
+MAX_RELEASE_NOTES_CHARS = 1500
 
 PROBE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=-]{0,127}$")
 SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,46}[a-z0-9]$")
@@ -2403,6 +2434,389 @@ def _strip_git_metadata_dir(clone_dir: str) -> None:
             pass
 
 
+def normalize_version_label(raw: str | None) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) >= 2 and cleaned[0] in ("v", "V") and cleaned[1].isdigit():
+        return cleaned[1:]
+    return cleaned
+
+
+def parse_semver(
+    raw: str | None,
+) -> tuple[int, int, int, tuple[tuple[int, int | str], ...]] | None:
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned:
+        return None
+    match = SEMVER_PATTERN.match(cleaned)
+    if not match:
+        return None
+    major = int(match.group(1))
+    minor = int(match.group(2))
+    patch = int(match.group(3))
+    pre_raw = match.group(4)
+    if not pre_raw:
+        return (major, minor, patch, ())
+    pre_parts: list[tuple[int, int | str]] = []
+    for ident in pre_raw.split("."):
+        if ident.isdigit():
+            pre_parts.append((0, int(ident)))
+        else:
+            pre_parts.append((1, ident))
+    return (major, minor, patch, tuple(pre_parts))
+
+
+def compare_versions(a: str | None, b: str | None) -> int | None:
+    pa = parse_semver(a)
+    pb = parse_semver(b)
+    if pa is None or pb is None:
+        return None
+    core_a = pa[:3]
+    core_b = pb[:3]
+    if core_a < core_b:
+        return -1
+    if core_a > core_b:
+        return 1
+    pre_a = pa[3]
+    pre_b = pb[3]
+    if not pre_a and not pre_b:
+        return 0
+    if not pre_a:
+        return 1
+    if not pre_b:
+        return -1
+    for item_a, item_b in zip(pre_a, pre_b):
+        if item_a < item_b:
+            return -1
+        if item_a > item_b:
+            return 1
+    if len(pre_a) < len(pre_b):
+        return -1
+    if len(pre_a) > len(pre_b):
+        return 1
+    return 0
+
+
+def is_release_newer(
+    current_version: str | None,
+    latest_tag: str | None,
+    *,
+    current_release_tag: str | None = None,
+) -> bool:
+    if not isinstance(latest_tag, str) or not latest_tag.strip():
+        return False
+    latest = latest_tag.strip()
+    if (
+        isinstance(current_release_tag, str)
+        and current_release_tag.strip()
+        and current_release_tag.strip() == latest
+    ):
+        return False
+    cmp_val = compare_versions(current_version, latest)
+    if cmp_val is not None:
+        return cmp_val < 0
+    cur_norm = normalize_version_label(current_version)
+    lat_norm = normalize_version_label(latest)
+    if not cur_norm:
+        return bool(lat_norm)
+    return cur_norm != lat_norm
+
+
+def parse_sha256_checksum(
+    text: str, asset_name: str, *, allow_bare_hash: bool = False
+) -> str | None:
+    if not isinstance(text, str) or not asset_name:
+        return None
+    target_name = asset_name.strip()
+    target_base = os.path.basename(target_name)
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m_gnu = re.match(r"^([0-9a-fA-F]{64})\s+[* ]?(.+?)$", line)
+        if m_gnu:
+            digest = m_gnu.group(1).lower()
+            cand = m_gnu.group(2).strip()
+            if cand.startswith("./"):
+                cand = cand[2:]
+            if cand == target_name or os.path.basename(cand) == target_base:
+                return digest
+            continue
+        m_bsd = re.match(
+            r"^SHA256\s*\((.+?)\)\s*=\s*([0-9a-fA-F]{64})$",
+            line,
+            re.IGNORECASE,
+        )
+        if m_bsd:
+            cand = m_bsd.group(1).strip()
+            if cand.startswith("./"):
+                cand = cand[2:]
+            if cand == target_name or os.path.basename(cand) == target_base:
+                return m_bsd.group(2).lower()
+    if allow_bare_hash:
+        stripped = text.strip()
+        if SHA256_HEX_PATTERN.match(stripped):
+            return stripped.lower()
+    return None
+
+
+def safe_extract_release_tarball(archive_path: str, dest_dir: str) -> dict[str, Any]:
+    """
+    Safely extracts a VPSAgent release `.tar.gz` archive into `dest_dir`.
+    Rejects symlinks, hardlinks, device nodes, FIFOs, `..` traversal, absolute
+    paths, and oversized archives, strips a single common wrapper directory if
+    present, and validates core VPSAgent manifest & bootstrap files.
+    """
+    os.makedirs(dest_dir, mode=0o750, exist_ok=True)
+    real_dest = os.path.realpath(dest_dir)
+    if not os.path.isdir(real_dest):
+        raise RuntimeError(f"Release destination is not a directory: {dest_dir}")
+
+    validated_entries: list[tuple[tarfile.TarInfo, list[str]]] = []
+    total_bytes = 0
+
+    try:
+        with tarfile.open(archive_path, "r:gz") as tf:
+            members = tf.getmembers()
+            if len(members) > MAX_RELEASE_EXTRACT_MEMBERS:
+                raise RuntimeError(
+                    f"Release archive contains too many entries ({len(members)})."
+                )
+            for member in members:
+                if (
+                    member.type == getattr(tarfile, "XGLTYPE", b"g")
+                    or member.name == "pax_global_header"
+                ):
+                    continue
+                if (
+                    member.issym()
+                    or member.islnk()
+                    or member.isdev()
+                    or member.isfifo()
+                    or member.ischr()
+                    or member.isblk()
+                    or not (member.isdir() or member.isfile())
+                ):
+                    raise RuntimeError(
+                        f'Release archive contains unsupported entry type for "{member.name}".'
+                    )
+                raw_name = member.name
+                if (
+                    not raw_name
+                    or "\x00" in raw_name
+                    or "\\" in raw_name
+                    or raw_name.startswith("/")
+                ):
+                    raise RuntimeError(
+                        f'Release archive contains unsafe path "{raw_name}".'
+                    )
+                stripped = raw_name.rstrip("/")
+                while stripped.startswith("./"):
+                    stripped = stripped[2:]
+                if not stripped or stripped == ".":
+                    continue
+                parts = stripped.split("/")
+                if any(part in ("", ".", "..") for part in parts):
+                    raise RuntimeError(
+                        f'Release archive contains unsafe path segment in "{raw_name}".'
+                    )
+                if member.isfile():
+                    if member.size < 0:
+                        raise RuntimeError("Release archive contains invalid file size.")
+                    total_bytes += member.size
+                    if total_bytes > MAX_RELEASE_EXTRACT_BYTES:
+                        raise RuntimeError(
+                            "Release archive uncompressed size exceeds safety limit."
+                        )
+                validated_entries.append((member, parts))
+
+            if not validated_entries:
+                raise RuntimeError("Release archive is empty.")
+
+            first_parts = {parts[0] for _, parts in validated_entries}
+            strip_prefix = len(first_parts) == 1 and any(
+                len(parts) > 1 for _, parts in validated_entries
+            )
+
+            extracted_bytes = 0
+            for member, parts in validated_entries:
+                rel_parts = parts[1:] if strip_prefix else parts
+                if not rel_parts:
+                    continue
+                target_path = os.path.join(real_dest, *rel_parts)
+                # Walk every component to confirm no symlinks exist along target path
+                walk = real_dest
+                for seg in rel_parts[:-1]:
+                    walk = os.path.join(walk, seg)
+                    if os.path.islink(walk):
+                        raise RuntimeError(
+                            f'Refused symlink directory "{walk}" during release extraction.'
+                        )
+                    if not os.path.exists(walk):
+                        os.makedirs(walk, mode=0o755, exist_ok=True)
+                if os.path.islink(target_path):
+                    raise RuntimeError(
+                        f'Refused symlink target "{target_path}" during release extraction.'
+                    )
+                real_target = os.path.realpath(os.path.dirname(target_path))
+                if real_target != real_dest and not real_target.startswith(
+                    real_dest + os.sep
+                ):
+                    raise RuntimeError(
+                        f'Release entry "{member.name}" escapes destination directory.'
+                    )
+
+                if member.isdir():
+                    os.makedirs(target_path, mode=0o755, exist_ok=True)
+                    continue
+
+                src_stream = tf.extractfile(member)
+                if src_stream is None:
+                    raise RuntimeError(
+                        f'Could not read "{member.name}" from release archive.'
+                    )
+                with src_stream, open(target_path, "wb") as dst_fh:
+                    remaining = member.size
+                    while True:
+                        chunk = src_stream.read(65536)
+                        if not chunk:
+                            break
+                        extracted_bytes += len(chunk)
+                        if extracted_bytes > MAX_RELEASE_EXTRACT_BYTES:
+                            raise RuntimeError(
+                                "Release archive uncompressed size exceeds safety limit."
+                            )
+                        remaining -= len(chunk)
+                        dst_fh.write(chunk)
+                safe_mode = 0o755 if (member.mode & 0o111) else 0o644
+                os.chmod(target_path, safe_mode)
+    except (tarfile.TarError, EOFError, OSError) as exc:
+        raise RuntimeError(
+            f"Could not extract release archive cleanly: {redact_secrets(str(exc))}"
+        ) from exc
+
+    required_files = (
+        "package.json",
+        os.path.join("bootstrap", "Dockerfile"),
+        os.path.join("bootstrap", "docker-compose.core.yml"),
+        os.path.join("bootstrap", "Caddyfile"),
+        os.path.join("bootstrap", "runtime-bridge.py"),
+    )
+    for rel in required_files:
+        candidate = os.path.join(real_dest, rel)
+        if os.path.islink(candidate) or not os.path.isfile(candidate):
+            raise RuntimeError(
+                f'Release archive is missing required file "{rel}".'
+            )
+
+    pkg_text = _read_regular_file_nofollow(
+        os.path.join(real_dest, "package.json"), 128 * 1024, "package.json"
+    )
+    try:
+        pkg_json = json.loads(pkg_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Release package.json is not valid JSON.") from exc
+    if not isinstance(pkg_json, dict) or pkg_json.get("name") != "vpsagent":
+        raise RuntimeError("Release archive does not appear to be VPSAgent.")
+    raw_ver = pkg_json.get("version")
+    version = raw_ver.strip() if isinstance(raw_ver, str) and raw_ver.strip() else None
+    return {"version": version}
+
+
+def _upsert_env_file_var(env_path: str, key: str, value: str) -> None:
+    if not ENV_KEY_PATTERN.match(key):
+        raise ValueError(f"Invalid environment variable key: {key}")
+    if any(ch in value for ch in ("\r", "\n", "\x00")):
+        raise ValueError("Environment variable value contains invalid characters.")
+    if os.path.islink(env_path):
+        raise RuntimeError(f"Security boundary violation: {env_path} cannot be a symlink.")
+
+    existing_lines: list[str] = []
+    st_uid: int | None = None
+    st_gid: int | None = None
+    if os.path.isfile(env_path):
+        st = os.stat(env_path)
+        st_uid, st_gid = st.st_uid, st.st_gid
+        with open(env_path, "r", encoding="utf-8") as fh:
+            existing_lines = fh.read().splitlines()
+
+    updated = False
+    out_lines: list[str] = []
+    prefix = f"{key}="
+    for line in existing_lines:
+        if line.startswith(prefix):
+            out_lines.append(f"{key}={value}")
+            updated = True
+        else:
+            out_lines.append(line)
+    if not updated:
+        out_lines.append(f"{key}={value}")
+
+    payload = "\n".join(out_lines) + "\n"
+    parent = os.path.dirname(os.path.abspath(env_path))
+    tmp_path = os.path.join(parent, f".env.tmp.{os.getpid()}")
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+    os.chmod(tmp_path, 0o600)
+    if (
+        st_uid is not None
+        and st_gid is not None
+        and hasattr(os, "geteuid")
+        and os.geteuid() == 0
+    ):
+        try:
+            os.chown(tmp_path, st_uid, st_gid)
+        except OSError:
+            pass
+    os.replace(tmp_path, env_path)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        pinned_ips: list[str],
+        timeout: float,
+    ) -> None:
+        super().__init__(
+            host,
+            port=port,
+            timeout=timeout,
+            context=ssl.create_default_context(),
+        )
+        self._pinned_ips = list(pinned_ips)
+
+    def connect(self) -> None:
+        last_err: OSError | None = None
+        for ip in self._pinned_ips:
+            raw_sock = None
+            try:
+                _assert_public_ip_address(ip, self.host)
+                raw_sock = socket.create_connection(
+                    (ip, self.port), self.timeout, self.source_address
+                )
+                self.sock = self._context.wrap_socket(
+                    raw_sock, server_hostname=self.host
+                )
+                return
+            except (OSError, BridgeRequestError) as exc:
+                last_err = exc if isinstance(exc, OSError) else OSError(str(exc))
+                if raw_sock is not None:
+                    try:
+                        raw_sock.close()
+                    except OSError:
+                        pass
+        if last_err is not None:
+            raise last_err
+        raise OSError(f"No reachable IP address for {self.host}")
+
+
 class RuntimeService:
     def __init__(
         self,
@@ -2416,6 +2830,9 @@ class RuntimeService:
         systemctl_bin: str = "systemctl",
         vpsagent_root: str | None = None,
         repo_dir: str | None = None,
+        release_repo: str | None = None,
+        release_api_base: str | None = None,
+        release_github_token: str | None = None,
         runtime_token: str | None = None,
         allow_unauthenticated: bool = False,
         status_deadline_s: float = DEFAULT_STATUS_DEADLINE_S,
@@ -2465,6 +2882,36 @@ class RuntimeService:
         if not resolved_repo and os.path.isdir("/opt/vpsagent/.git"):
             resolved_repo = "/opt/vpsagent"
         self.repo_dir = os.path.abspath(resolved_repo) if resolved_repo else None
+        raw_release_repo = (
+            release_repo.strip()
+            if release_repo is not None
+            else os.environ.get("VPSAGENT_RELEASE_REPO", "").strip()
+        )
+        if raw_release_repo and not RELEASE_REPO_PATTERN.match(raw_release_repo):
+            raise ValueError(f"Invalid release repository slug: {raw_release_repo}")
+        self.release_repo: str | None = raw_release_repo or None
+
+        raw_api_base = (
+            release_api_base.strip()
+            if release_api_base is not None
+            else os.environ.get("VPSAGENT_RELEASE_API_BASE", "").strip()
+        ) or DEFAULT_GITHUB_API_BASE
+        raw_api_base = raw_api_base.rstrip("/")
+        parsed_api = urlparse(raw_api_base)
+        api_scheme = parsed_api.scheme.lower()
+        api_host = (parsed_api.hostname or "").lower().strip("[]").rstrip(".")
+        is_loopback_api = api_host in ("127.0.0.1", "localhost", "::1")
+        if not api_host or (api_scheme != "https" and not (is_loopback_api and api_scheme == "http")):
+            raise ValueError(f"Invalid release API base URL: {raw_api_base}")
+        self.release_api_base = raw_api_base
+        self._allow_loopback_release_api = is_loopback_api
+
+        raw_gh_token = (
+            release_github_token.strip()
+            if release_github_token is not None
+            else os.environ.get("VPSAGENT_RELEASE_GITHUB_TOKEN", "").strip()
+        )
+        self.release_github_token: str | None = raw_gh_token or None
         self.runtime_token = cleaned_token
         self.allow_unauthenticated = allow_unauthenticated
         self.status_deadline_s = max(0.2, float(status_deadline_s))
@@ -4894,16 +5341,31 @@ class RuntimeService:
         }
 
     # ------------------------------------------------------------------
-    # VPSAgent Self-Update (Check + Safe Detached Rebuild)
+    # VPSAgent Self-Update (GitHub Releases + Safe Git Branch Fallback)
     # ------------------------------------------------------------------
 
     def _default_update_state(self) -> dict[str, Any]:
         return {
             "state": "idle",
             "phase": None,
+            "updateSource": "none",
+            "releaseRepo": None,
+            "releaseStatus": "unchecked",
+            "releaseNote": None,
             "checkedAt": None,
             "startedAt": None,
             "finishedAt": None,
+            "latestVersion": None,
+            "latestReleaseTag": None,
+            "latestReleaseName": None,
+            "latestReleaseUrl": None,
+            "latestReleaseNotes": None,
+            "latestReleasePublishedAt": None,
+            "latestReleasePrerelease": False,
+            "latestReleaseAssetName": None,
+            "checksumAvailable": False,
+            "checksumStatus": "none",
+            "checksumSha256": None,
             "latestCommit": None,
             "latestCommitSubject": None,
             "latestCommitDate": None,
@@ -4912,6 +5374,10 @@ class RuntimeService:
             "message": None,
             "error": None,
             "logs": [],
+            "_releaseDownloadUrl": None,
+            "_releaseChecksumUrl": None,
+            "_releaseChecksumAssetName": None,
+            "_releaseAssetDigest": None,
         }
 
     def _load_persisted_update_state(self) -> dict[str, Any]:
@@ -4962,6 +5428,17 @@ class RuntimeService:
         except (OSError, json.JSONDecodeError, TypeError):
             return None
         return None
+
+    def _read_release_metadata(self, repo_dir: str) -> dict[str, Any] | None:
+        meta_path = os.path.join(repo_dir, ".vpsagent-release.json")
+        if not os.path.lexists(meta_path):
+            return None
+        try:
+            raw = _read_regular_file_nofollow(meta_path, 32 * 1024, ".vpsagent-release.json")
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except (BridgeRequestError, json.JSONDecodeError, TypeError, ValueError):
+            return None
 
     def _run_repo_git(
         self,
@@ -5017,45 +5494,494 @@ class RuntimeService:
                 504, f"git command timed out after {int(timeout)}s."
             ) from exc
 
+    def _resolve_release_repo(self, repo_info: dict[str, Any]) -> str | None:
+        if self.release_repo:
+            return self.release_repo
+        origin_url = repo_info.get("originUrl")
+        if isinstance(origin_url, str) and origin_url.strip():
+            match = GITHUB_REMOTE_URL_RE.match(origin_url.strip())
+            if match:
+                return match.group(1)
+            # Local filesystem or non-GitHub git remotes stay offline in git mode unless overridden
+            return None
+        meta_repo = repo_info.get("releaseRepo")
+        if isinstance(meta_repo, str) and RELEASE_REPO_PATTERN.match(meta_repo.strip()):
+            return meta_repo.strip()
+        return DEFAULT_RELEASE_REPO
+
+    def _fetch_release_http(
+        self,
+        url: str,
+        *,
+        accept: str = "application/vnd.github+json",
+        max_bytes: int = MAX_RELEASE_JSON_BYTES,
+        timeout: float = 15.0,
+        stream_to_file: str | None = None,
+    ) -> tuple[int, dict[str, str], bytes | None, str | None]:
+        """
+        Performs a strict SSRF-safe, redirect-verified HTTP(S) GET request to GitHub
+        Releases API or release asset CDNs. Strips Authorization headers whenever a
+        redirect leaves the configured API origin and pins non-loopback connections
+        to validated public IPs.
+        """
+        api_parsed = urlparse(self.release_api_base)
+        api_host = (api_parsed.hostname or "").lower().strip("[]").rstrip(".")
+        api_port = api_parsed.port or (443 if api_parsed.scheme.lower() == "https" else 80)
+
+        current_url = url.strip()
+        for _ in range(6):
+            if not current_url or any(ch.isspace() or ord(ch) < 32 for ch in current_url):
+                raise RuntimeError("Release URL contains invalid whitespace or control characters.")
+            parsed = urlparse(current_url)
+            if parsed.username or parsed.password:
+                raise RuntimeError("Release URL must not embed credentials.")
+            scheme = parsed.scheme.lower()
+            host = (parsed.hostname or "").lower().strip("[]").rstrip(".")
+            if not host:
+                raise RuntimeError("Release URL is missing a hostname.")
+            try:
+                port = parsed.port or (443 if scheme == "https" else 80)
+            except ValueError as exc:
+                raise RuntimeError("Release URL has an invalid port.") from exc
+
+            is_loopback_hop = host in ("127.0.0.1", "localhost", "::1")
+            if self._allow_loopback_release_api and is_loopback_hop:
+                if scheme not in ("http", "https"):
+                    raise RuntimeError(f'Unsupported scheme "{scheme}" in release URL.')
+            else:
+                if scheme != "https":
+                    raise RuntimeError("Release downloads must use https://.")
+                if host not in ALLOWED_RELEASE_DOWNLOAD_HOSTS and host != api_host:
+                    raise RuntimeError(f'Blocked disallowed release download host "{host}".')
+
+            req_path = parsed.path or "/"
+            if parsed.query:
+                req_path = f"{req_path}?{parsed.query}"
+
+            headers: dict[str, str] = {
+                "Accept": accept,
+                "User-Agent": "VPSAgent/2.1",
+                "Connection": "close",
+            }
+            if (
+                self.release_github_token
+                and host == api_host
+                and port == api_port
+                and (scheme == "https" or self._allow_loopback_release_api)
+            ):
+                headers["Authorization"] = f"Bearer {self.release_github_token}"
+
+            conn: http.client.HTTPConnection
+            if self._allow_loopback_release_api and is_loopback_hop:
+                if scheme == "https":
+                    conn = http.client.HTTPSConnection(host, port=port, timeout=timeout)
+                else:
+                    conn = http.client.HTTPConnection(host, port=port, timeout=timeout)
+            else:
+                resolver = self.dns_resolver or default_dns_resolver
+                resolved_ips = resolver(host, port)
+                if not resolved_ips:
+                    raise RuntimeError(f'Could not resolve release host "{host}".')
+                validated_ips: list[str] = []
+                for ip_str in resolved_ips:
+                    _assert_public_ip_address(ip_str, host)
+                    clean_ip = ip_str.strip().strip("[]").split("%", 1)[0]
+                    if clean_ip not in validated_ips:
+                        validated_ips.append(clean_ip)
+                conn = _PinnedHTTPSConnection(host, port, validated_ips, timeout=timeout)
+
+            try:
+                conn.request("GET", req_path, headers=headers)
+                resp = conn.getresponse()
+                resp_headers = {k.lower(): v for k, v in resp.getheaders()}
+                if resp.status in (301, 302, 303, 307, 308):
+                    resp.read(8192)
+                    location = resp.getheader("Location")
+                    if not location:
+                        raise RuntimeError(
+                            f"Release download returned redirect ({resp.status}) without Location."
+                        )
+                    current_url = urljoin(current_url, location.strip())
+                    continue
+
+                if stream_to_file is not None and 200 <= resp.status < 300:
+                    hasher = hashlib.sha256()
+                    total = 0
+                    with open(stream_to_file, "wb") as out_fh:
+                        while True:
+                            chunk = resp.read(65536)
+                            if not chunk:
+                                break
+                            total += len(chunk)
+                            if total > max_bytes:
+                                raise RuntimeError(
+                                    "Release download exceeded maximum allowed size."
+                                )
+                            hasher.update(chunk)
+                            out_fh.write(chunk)
+                    return resp.status, resp_headers, None, hasher.hexdigest()
+
+                chunks: list[bytes] = []
+                total = 0
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise RuntimeError(
+                            "Release response exceeded maximum allowed size."
+                        )
+                    chunks.append(chunk)
+                return resp.status, resp_headers, b"".join(chunks), None
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+        raise RuntimeError("Release download exceeded maximum redirect limit.")
+
+    def _parse_github_release_payload(
+        self, release_repo: str, rel: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        raw_tag = rel.get("tag_name")
+        if not isinstance(raw_tag, str) or not RELEASE_TAG_PATTERN.match(raw_tag.strip()):
+            return None
+        tag = raw_tag.strip()
+        raw_html = rel.get("html_url")
+        html_url = (
+            raw_html.strip()
+            if isinstance(raw_html, str)
+            and (
+                raw_html.strip().startswith("https://")
+                or (
+                    self._allow_loopback_release_api
+                    and raw_html.strip().startswith("http://")
+                )
+            )
+            else None
+        )
+        raw_name = rel.get("name")
+        release_name = (
+            redact_secrets(raw_name.strip())[:200]
+            if isinstance(raw_name, str) and raw_name.strip()
+            else tag
+        )
+        raw_body = rel.get("body")
+        release_notes: str | None = None
+        if isinstance(raw_body, str) and raw_body.strip():
+            cleaned_body = redact_secrets(raw_body.strip())
+            if len(cleaned_body) > MAX_RELEASE_NOTES_CHARS:
+                cleaned_body = cleaned_body[:MAX_RELEASE_NOTES_CHARS].rstrip() + "..."
+            release_notes = cleaned_body
+        published_at = (
+            rel.get("published_at").strip()
+            if isinstance(rel.get("published_at"), str)
+            and rel.get("published_at").strip()
+            else None
+        )
+        prerelease = bool(rel.get("prerelease"))
+
+        assets_raw = rel.get("assets")
+        assets = (
+            [a for a in assets_raw if isinstance(a, dict)]
+            if isinstance(assets_raw, list)
+            else []
+        )
+
+        tar_candidates: list[dict[str, Any]] = []
+        checksum_assets: list[dict[str, Any]] = []
+        for asset in assets:
+            name = asset.get("name")
+            dl_url = asset.get("browser_download_url")
+            if not isinstance(name, str) or not isinstance(dl_url, str):
+                continue
+            name_s = name.strip()
+            dl_s = dl_url.strip()
+            if not name_s or not dl_s:
+                continue
+            lower_name = name_s.lower()
+            if lower_name.endswith((".sha256", ".sha256sum")) or lower_name in (
+                "sha256sums",
+                "sha256sums.txt",
+                "checksums.txt",
+            ):
+                checksum_assets.append(asset)
+                continue
+            if lower_name.endswith((".tar.gz", ".tgz")):
+                tar_candidates.append(asset)
+
+        chosen_asset: dict[str, Any] | None = None
+        if tar_candidates:
+            tar_candidates.sort(
+                key=lambda a: (
+                    0 if str(a.get("name", "")).lower().startswith("vpsagent") else 1,
+                    str(a.get("name", "")).lower(),
+                )
+            )
+            chosen_asset = tar_candidates[0]
+
+        asset_name: str | None = None
+        download_url: str | None = None
+        asset_digest_sha256: str | None = None
+        checksum_url: str | None = None
+        checksum_asset_name: str | None = None
+
+        if chosen_asset is not None:
+            asset_name = str(chosen_asset.get("name", "")).strip() or None
+            download_url = str(chosen_asset.get("browser_download_url", "")).strip() or None
+            raw_digest = chosen_asset.get("digest")
+            if isinstance(raw_digest, str) and raw_digest.lower().startswith("sha256:"):
+                hex_part = raw_digest.split(":", 1)[1].strip()
+                if SHA256_HEX_PATTERN.match(hex_part):
+                    asset_digest_sha256 = hex_part.lower()
+
+            if asset_name and checksum_assets:
+                exact_names = (f"{asset_name}.sha256", f"{asset_name}.sha256sum")
+                for cs in checksum_assets:
+                    cs_name = str(cs.get("name", "")).strip()
+                    if cs_name in exact_names:
+                        checksum_url = str(cs.get("browser_download_url", "")).strip() or None
+                        checksum_asset_name = cs_name
+                        break
+                if checksum_url is None:
+                    for cs in checksum_assets:
+                        cs_name = str(cs.get("name", "")).strip()
+                        if cs_name.lower() in (
+                            "sha256sums",
+                            "sha256sums.txt",
+                            "checksums.txt",
+                        ):
+                            checksum_url = str(cs.get("browser_download_url", "")).strip() or None
+                            checksum_asset_name = cs_name
+                            break
+        else:
+            raw_tarball = rel.get("tarball_url")
+            if isinstance(raw_tarball, str) and raw_tarball.strip():
+                download_url = raw_tarball.strip()
+
+        if not download_url:
+            return None
+
+        return {
+            "status": "ok",
+            "releaseRepo": release_repo,
+            "tag": tag,
+            "version": normalize_version_label(tag) or tag,
+            "name": release_name,
+            "htmlUrl": html_url,
+            "notes": release_notes,
+            "publishedAt": published_at,
+            "prerelease": prerelease,
+            "assetName": asset_name,
+            "downloadUrl": download_url,
+            "checksumUrl": checksum_url,
+            "checksumAssetName": checksum_asset_name,
+            "assetDigestSha256": asset_digest_sha256,
+            "checksumAvailable": bool(checksum_url or asset_digest_sha256),
+        }
+
+    def _fetch_latest_github_release(self, release_repo: str) -> dict[str, Any]:
+        latest_url = f"{self.release_api_base}/repos/{release_repo}/releases/latest"
+        try:
+            status, _headers, body, _ = self._fetch_release_http(
+                latest_url,
+                accept="application/vnd.github+json",
+                max_bytes=MAX_RELEASE_JSON_BYTES,
+                timeout=15.0,
+            )
+            if status == 200 and body is not None:
+                parsed = json.loads(body.decode("utf-8"))
+                if isinstance(parsed, dict) and not parsed.get("draft"):
+                    info = self._parse_github_release_payload(release_repo, parsed)
+                    if info is not None:
+                        return info
+
+            if status in (403, 429):
+                return {
+                    "status": "unavailable",
+                    "releaseRepo": release_repo,
+                    "note": "GitHub Releases API rate limit reached. Try again later.",
+                }
+
+            if status != 404 and status != 200:
+                return {
+                    "status": "unavailable",
+                    "releaseRepo": release_repo,
+                    "note": f"GitHub Releases check returned HTTP {status}.",
+                }
+
+            # Fallback to releases list (handles pre-releases or when /latest has no stable release)
+            list_url = f"{self.release_api_base}/repos/{release_repo}/releases?per_page=10"
+            list_status, _lh, list_body, _ = self._fetch_release_http(
+                list_url,
+                accept="application/vnd.github+json",
+                max_bytes=MAX_RELEASE_JSON_BYTES,
+                timeout=15.0,
+            )
+            if list_status == 404:
+                return {
+                    "status": "no_releases",
+                    "releaseRepo": release_repo,
+                    "note": f"No GitHub release published yet for {release_repo}.",
+                }
+            if list_status in (403, 429):
+                return {
+                    "status": "unavailable",
+                    "releaseRepo": release_repo,
+                    "note": "GitHub Releases API rate limit reached. Try again later.",
+                }
+            if list_status != 200 or list_body is None:
+                return {
+                    "status": "unavailable",
+                    "releaseRepo": release_repo,
+                    "note": f"GitHub Releases check returned HTTP {list_status}.",
+                }
+
+            raw_list = json.loads(list_body.decode("utf-8"))
+            if not isinstance(raw_list, list):
+                return {
+                    "status": "unavailable",
+                    "releaseRepo": release_repo,
+                    "note": "GitHub Releases returned an unexpected response.",
+                }
+
+            candidates: list[dict[str, Any]] = []
+            for item in raw_list:
+                if not isinstance(item, dict) or item.get("draft"):
+                    continue
+                parsed_rel = self._parse_github_release_payload(release_repo, item)
+                if parsed_rel is not None:
+                    candidates.append(parsed_rel)
+
+            if not candidates:
+                return {
+                    "status": "no_releases",
+                    "releaseRepo": release_repo,
+                    "note": f"No GitHub release published yet for {release_repo}.",
+                }
+
+            best = candidates[0]
+            for cand in candidates[1:]:
+                cmp_val = compare_versions(best["version"], cand["version"])
+                if cmp_val is not None and cmp_val < 0:
+                    best = cand
+            return best
+        except (
+            OSError,
+            http.client.HTTPException,
+            RuntimeError,
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+        ) as exc:
+            scrubbed = _scrub_secret_values(
+                str(exc),
+                [self.release_github_token] if self.release_github_token else None,
+            )
+            return {
+                "status": "unavailable",
+                "releaseRepo": release_repo,
+                "note": f"Could not reach GitHub Releases: {scrubbed}",
+            }
+
     def _inspect_core_repo(self) -> dict[str, Any]:
         repo_dir = self.repo_dir
+        has_core_env = os.path.isfile(os.path.join(self.vpsagent_root, ".env"))
         if not repo_dir or not os.path.isdir(repo_dir):
             return {
+                "hasGit": False,
+                "canGitUpdate": False,
+                "canReleaseUpdate": bool(has_core_env),
                 "canUpdate": False,
-                "unavailableReason": "VPSAgent source folder is not configured on this server.",
+                "unavailableReason": (
+                    "Click \"Check for updates\" to look for a published GitHub release."
+                    if has_core_env
+                    else "VPSAgent source folder is not configured on this server."
+                ),
                 "repoDir": repo_dir,
                 "branch": None,
+                "originUrl": None,
+                "installedFrom": "unknown",
+                "releaseRepo": None,
+                "currentReleaseTag": None,
                 "currentVersion": None,
                 "currentCommit": None,
                 "dirtyWorkingTree": False,
                 "divergedBranch": False,
-            }
-        git_dir = os.path.join(repo_dir, ".git")
-        if not os.path.exists(git_dir):
-            return {
-                "canUpdate": False,
-                "unavailableReason": "VPSAgent source folder is not a Git repository.",
-                "repoDir": repo_dir,
-                "branch": None,
-                "currentVersion": self._read_repo_package_version(repo_dir),
-                "currentCommit": None,
-                "dirtyWorkingTree": False,
-                "divergedBranch": False,
+                "hasCoreEnv": has_core_env,
             }
 
         version = self._read_repo_package_version(repo_dir)
+        release_meta = self._read_release_metadata(repo_dir)
+        current_release_tag = (
+            str(release_meta.get("tag")).strip()
+            if release_meta and isinstance(release_meta.get("tag"), str) and release_meta.get("tag").strip()
+            else None
+        )
+        meta_release_repo = (
+            str(release_meta.get("releaseRepo")).strip()
+            if release_meta
+            and isinstance(release_meta.get("releaseRepo"), str)
+            and release_meta.get("releaseRepo").strip()
+            else None
+        )
+        meta_commit = (
+            str(release_meta.get("commit")).strip()
+            if release_meta and isinstance(release_meta.get("commit"), str) and release_meta.get("commit").strip()
+            else None
+        )
+        if not version and release_meta and isinstance(release_meta.get("version"), str):
+            version = release_meta["version"].strip() or None
+
+        git_dir = os.path.join(repo_dir, ".git")
+        if not os.path.exists(git_dir):
+            installed_from = "release" if release_meta else "unknown"
+            can_release = bool(has_core_env)
+            reason = (
+                None
+                if can_release
+                else f"Core .env file not found in {self.vpsagent_root}."
+            )
+            return {
+                "hasGit": False,
+                "canGitUpdate": False,
+                "canReleaseUpdate": can_release,
+                "canUpdate": can_release,
+                "unavailableReason": reason,
+                "repoDir": repo_dir,
+                "branch": None,
+                "originUrl": None,
+                "installedFrom": installed_from,
+                "releaseRepo": meta_release_repo,
+                "currentReleaseTag": current_release_tag,
+                "currentVersion": version,
+                "currentCommit": meta_commit,
+                "dirtyWorkingTree": False,
+                "divergedBranch": False,
+                "hasCoreEnv": has_core_env,
+            }
+
         head_proc = self._run_repo_git(repo_dir, ["rev-parse", "HEAD"], timeout=10)
         head_err = (head_proc.stderr or "").strip()
         if head_proc.returncode != 0 and "dubious ownership" in head_err.lower():
             return {
+                "hasGit": True,
+                "canGitUpdate": False,
+                "canReleaseUpdate": bool(has_core_env),
                 "canUpdate": False,
                 "unavailableReason": "Git refused access to the VPSAgent folder due to directory ownership mismatch.",
                 "repoDir": repo_dir,
                 "branch": None,
+                "originUrl": None,
+                "installedFrom": "git",
+                "releaseRepo": meta_release_repo,
+                "currentReleaseTag": current_release_tag,
                 "currentVersion": version,
                 "currentCommit": None,
                 "dirtyWorkingTree": False,
                 "divergedBranch": False,
+                "hasCoreEnv": has_core_env,
             }
         current_commit = (
             (head_proc.stdout or "").strip() if head_proc.returncode == 0 else None
@@ -5093,16 +6019,25 @@ class RuntimeService:
             else:
                 reason = "No 'origin' Git remote is configured for VPSAgent."
             return {
+                "hasGit": True,
+                "canGitUpdate": False,
+                "canReleaseUpdate": bool(has_core_env and not dirty),
                 "canUpdate": False,
                 "unavailableReason": reason,
                 "repoDir": repo_dir,
                 "branch": branch,
+                "originUrl": None,
+                "installedFrom": "git",
+                "releaseRepo": meta_release_repo,
+                "currentReleaseTag": current_release_tag,
                 "currentVersion": version,
                 "currentCommit": current_commit,
                 "dirtyWorkingTree": dirty,
                 "divergedBranch": False,
+                "hasCoreEnv": has_core_env,
             }
 
+        origin_url = (remote_proc.stdout or "").strip()
         diverged = False
         if current_commit:
             remote_ref = f"origin/{branch}"
@@ -5131,28 +6066,105 @@ class RuntimeService:
             unavailable_reason = None
 
         return {
+            "hasGit": True,
+            "canGitUpdate": not dirty and not diverged,
+            "canReleaseUpdate": bool(has_core_env and not dirty),
             "canUpdate": not dirty and not diverged,
             "unavailableReason": unavailable_reason,
             "repoDir": repo_dir,
             "branch": branch,
+            "originUrl": origin_url,
+            "installedFrom": "git",
+            "releaseRepo": meta_release_repo,
+            "currentReleaseTag": current_release_tag,
             "currentVersion": version,
             "currentCommit": current_commit,
             "dirtyWorkingTree": dirty,
             "divergedBranch": diverged,
+            "hasCoreEnv": has_core_env,
         }
 
     def _build_update_status_response(
         self, repo_info: dict[str, Any], state: dict[str, Any]
     ) -> dict[str, Any]:
+        resolved_release_repo = state.get("releaseRepo") or self._resolve_release_repo(repo_info)
+        update_source = state.get("updateSource") or "none"
+        if update_source not in ("release", "git", "none"):
+            update_source = "none"
+        release_status = state.get("releaseStatus") or "unchecked"
+        if release_status not in (
+            "unchecked",
+            "available",
+            "up_to_date",
+            "no_releases",
+            "unavailable",
+        ):
+            release_status = "unchecked"
+
+        if update_source == "none":
+            if repo_info.get("installedFrom") == "release" or not repo_info.get("hasGit"):
+                update_source = "release" if resolved_release_repo else "none"
+            else:
+                update_source = "git"
+
+        can_update = bool(repo_info.get("canUpdate"))
+        unavailable_reason = repo_info.get("unavailableReason")
+        if repo_info.get("dirtyWorkingTree"):
+            can_update = False
+        elif update_source == "release" and state.get("_releaseDownloadUrl"):
+            can_update = bool(repo_info.get("hasCoreEnv"))
+            if can_update:
+                unavailable_reason = None
+            else:
+                unavailable_reason = f"Core .env file not found in {self.vpsagent_root}."
+        elif not repo_info.get("hasGit"):
+            if not repo_info.get("hasCoreEnv"):
+                can_update = False
+                unavailable_reason = f"Core .env file not found in {self.vpsagent_root}."
+            elif release_status in ("no_releases", "unavailable"):
+                can_update = False
+                unavailable_reason = (
+                    state.get("releaseNote")
+                    or "No GitHub release is published yet to update from."
+                )
+            elif resolved_release_repo:
+                can_update = True
+                unavailable_reason = None
+        else:
+            can_update = bool(repo_info.get("canGitUpdate"))
+
         return {
             "state": state.get("state", "idle"),
             "phase": state.get("phase"),
-            "canUpdate": bool(repo_info["canUpdate"]),
-            "unavailableReason": repo_info["unavailableReason"],
+            "canUpdate": can_update,
+            "unavailableReason": unavailable_reason,
             "repoDir": repo_info["repoDir"],
             "branch": repo_info["branch"],
+            "updateSource": update_source,
+            "releaseRepo": resolved_release_repo,
+            "releaseStatus": release_status,
+            "releaseNote": redact_secrets(state["releaseNote"])
+            if isinstance(state.get("releaseNote"), str)
+            else None,
+            "installedFrom": repo_info.get("installedFrom", "unknown"),
             "currentVersion": repo_info["currentVersion"],
+            "currentReleaseTag": repo_info.get("currentReleaseTag"),
             "currentCommit": repo_info["currentCommit"],
+            "latestVersion": state.get("latestVersion"),
+            "latestReleaseTag": state.get("latestReleaseTag"),
+            "latestReleaseName": redact_secrets(state["latestReleaseName"])
+            if isinstance(state.get("latestReleaseName"), str)
+            else None,
+            "latestReleaseUrl": state.get("latestReleaseUrl"),
+            "latestReleaseNotes": redact_secrets(state["latestReleaseNotes"])
+            if isinstance(state.get("latestReleaseNotes"), str)
+            else None,
+            "latestReleasePublishedAt": state.get("latestReleasePublishedAt"),
+            "latestReleasePrerelease": bool(state.get("latestReleasePrerelease")),
+            "latestReleaseAssetName": state.get("latestReleaseAssetName"),
+            "checksumAvailable": bool(state.get("checksumAvailable")),
+            "checksumStatus": state.get("checksumStatus") or "none",
+            "checksumSha256": state.get("checksumSha256"),
             "latestCommit": state.get("latestCommit"),
             "latestCommitSubject": state.get("latestCommitSubject"),
             "latestCommitDate": state.get("latestCommitDate"),
@@ -5180,87 +6192,226 @@ class RuntimeService:
             snapshot = dict(self._update_state)
         repo_info = self._inspect_core_repo()
 
-        if check_remote and not is_updating and repo_info["repoDir"] and repo_info["branch"]:
-            repo_dir = repo_info["repoDir"]
-            branch = repo_info["branch"]
-            fetch_proc = self._run_repo_git(
-                repo_dir, ["fetch", "--prune", "origin", branch], timeout=45
-            )
-            if fetch_proc.returncode != 0:
-                detail = (
-                    (fetch_proc.stderr or fetch_proc.stdout or "git fetch failed").strip()
-                )
-                raise BridgeRequestError(
-                    502,
-                    f"Could not check for updates: {redact_secrets(detail)}",
-                )
+        if check_remote and not is_updating:
+            release_repo = self._resolve_release_repo(repo_info)
+            release_result: dict[str, Any] | None = None
+            if release_repo:
+                release_result = self._fetch_latest_github_release(release_repo)
 
-            # Re-inspect after fetch so diverged-branch status reflects the latest origin/<branch>
-            repo_info = self._inspect_core_repo()
-
-            remote_ref = f"origin/{branch}"
-            latest_proc = self._run_repo_git(
-                repo_dir, ["rev-parse", remote_ref], timeout=10
+            has_installable_release = bool(
+                release_result and release_result.get("status") == "ok"
             )
-            latest_commit = (
-                (latest_proc.stdout or "").strip()
-                if latest_proc.returncode == 0
-                else None
-            ) or None
-
-            meta_proc = self._run_repo_git(
-                repo_dir, ["show", "-s", "--format=%s%n%cI", remote_ref], timeout=10
-            )
+            latest_commit: str | None = None
             latest_subject: str | None = None
             latest_date: str | None = None
-            if meta_proc.returncode == 0:
-                meta_lines = (meta_proc.stdout or "").splitlines()
-                if len(meta_lines) >= 1 and meta_lines[0].strip():
-                    latest_subject = redact_secrets(meta_lines[0].strip())[:200]
-                if len(meta_lines) >= 2 and meta_lines[1].strip():
-                    latest_date = meta_lines[1].strip()
-
             commits_behind = 0
-            if repo_info["currentCommit"] and latest_commit:
-                count_proc = self._run_repo_git(
-                    repo_dir,
-                    ["rev-list", "--count", f"HEAD..{remote_ref}"],
-                    timeout=10,
-                )
-                if count_proc.returncode == 0:
-                    try:
-                        commits_behind = max(
-                            0, int((count_proc.stdout or "0").strip())
-                        )
-                    except ValueError:
-                        commits_behind = 0
 
-            can_fast_forward = not repo_info.get("divergedBranch", False)
-            update_available = bool(
+            if repo_info.get("hasGit") and repo_info["repoDir"] and repo_info["branch"]:
+                repo_dir = repo_info["repoDir"]
+                branch = repo_info["branch"]
+                fetch_proc = self._run_repo_git(
+                    repo_dir, ["fetch", "--prune", "origin", branch], timeout=45
+                )
+                if fetch_proc.returncode != 0:
+                    if not has_installable_release:
+                        detail = (
+                            fetch_proc.stderr
+                            or fetch_proc.stdout
+                            or "git fetch failed"
+                        ).strip()
+                        raise BridgeRequestError(
+                            502,
+                            f"Could not check for updates: {redact_secrets(detail)}",
+                        )
+                else:
+                    # Re-inspect after fetch so diverged-branch status reflects the latest origin/<branch>
+                    repo_info = self._inspect_core_repo()
+                    remote_ref = f"origin/{branch}"
+                    latest_proc = self._run_repo_git(
+                        repo_dir, ["rev-parse", remote_ref], timeout=10
+                    )
+                    latest_commit = (
+                        (latest_proc.stdout or "").strip()
+                        if latest_proc.returncode == 0
+                        else None
+                    ) or None
+
+                    meta_proc = self._run_repo_git(
+                        repo_dir, ["show", "-s", "--format=%s%n%cI", remote_ref], timeout=10
+                    )
+                    if meta_proc.returncode == 0:
+                        meta_lines = (meta_proc.stdout or "").splitlines()
+                        if len(meta_lines) >= 1 and meta_lines[0].strip():
+                            latest_subject = redact_secrets(meta_lines[0].strip())[:200]
+                        if len(meta_lines) >= 2 and meta_lines[1].strip():
+                            latest_date = meta_lines[1].strip()
+
+                    if repo_info["currentCommit"] and latest_commit:
+                        count_proc = self._run_repo_git(
+                            repo_dir,
+                            ["rev-list", "--count", f"HEAD..{remote_ref}"],
+                            timeout=10,
+                        )
+                        if count_proc.returncode == 0:
+                            try:
+                                commits_behind = max(
+                                    0, int((count_proc.stdout or "0").strip())
+                                )
+                            except ValueError:
+                                commits_behind = 0
+
+            can_fast_forward = bool(
+                repo_info.get("hasGit") and not repo_info.get("divergedBranch", False)
+            )
+            git_update_available = bool(
                 can_fast_forward
                 and latest_commit
                 and repo_info["currentCommit"]
                 and latest_commit != repo_info["currentCommit"]
                 and commits_behind > 0
             )
+
             now_iso = datetime.now(timezone.utc).isoformat()
+            update_source = "none"
+            release_status = "unchecked"
+            release_note: str | None = None
+            update_available = False
+            message: str | None = None
+            latest_version: str | None = None
+            latest_tag: str | None = None
+            latest_name: str | None = None
+            latest_url: str | None = None
+            latest_notes: str | None = None
+            latest_published_at: str | None = None
+            latest_prerelease = False
+            latest_asset_name: str | None = None
+            checksum_available = False
+            checksum_status = "none"
+            dl_url: str | None = None
+            cs_url: str | None = None
+            cs_asset_name: str | None = None
+            asset_digest: str | None = None
+
+            if has_installable_release and release_result is not None:
+                latest_tag = release_result["tag"]
+                latest_version = release_result["version"]
+                latest_name = release_result["name"]
+                latest_url = release_result["htmlUrl"]
+                latest_notes = release_result["notes"]
+                latest_published_at = release_result["publishedAt"]
+                latest_prerelease = bool(release_result["prerelease"])
+                latest_asset_name = release_result["assetName"]
+                checksum_available = bool(release_result["checksumAvailable"])
+                checksum_status = "available" if checksum_available else "not_provided"
+                dl_url = release_result["downloadUrl"]
+                cs_url = release_result["checksumUrl"]
+                cs_asset_name = release_result["checksumAssetName"]
+                asset_digest = release_result["assetDigestSha256"]
+
+                release_newer = is_release_newer(
+                    repo_info["currentVersion"],
+                    latest_tag,
+                    current_release_tag=repo_info.get("currentReleaseTag"),
+                )
+                if release_newer:
+                    release_status = "available"
+                    update_source = "release"
+                    update_available = True
+                    message = f"New VPSAgent release {latest_tag} is ready to install."
+                else:
+                    release_status = "up_to_date"
+                    if git_update_available:
+                        update_source = "git"
+                        update_available = True
+                        branch_name = repo_info.get("branch") or "main"
+                        release_note = (
+                            f"Latest published release is {latest_tag}; "
+                            f"{commits_behind} newer commit{'s' if commits_behind != 1 else ''} available on {branch_name}."
+                        )
+                        message = (
+                            f"{commits_behind} new update{'s' if commits_behind != 1 else ''} ready to install."
+                        )
+                    else:
+                        update_source = (
+                            "release"
+                            if not repo_info.get("hasGit")
+                            or repo_info.get("installedFrom") == "release"
+                            else "git"
+                        )
+                        update_available = False
+                        ver = repo_info["currentVersion"]
+                        message = (
+                            f"VPSAgent v{ver} is up to date."
+                            if ver
+                            else "VPSAgent is up to date."
+                        )
+            else:
+                if release_result is not None:
+                    raw_status = release_result.get("status")
+                    release_status = (
+                        "no_releases"
+                        if raw_status == "no_releases"
+                        else "unavailable"
+                    )
+                    base_note = release_result.get("note")
+                else:
+                    release_status = "unchecked"
+                    base_note = None
+
+                if repo_info.get("hasGit"):
+                    update_source = "git"
+                    update_available = git_update_available
+                    branch_name = repo_info.get("branch") or "main"
+                    if release_status == "no_releases":
+                        release_note = (
+                            f"No GitHub release published yet for {release_repo} — "
+                            f"tracking {branch_name} branch instead."
+                        )
+                    elif release_status == "unavailable" and base_note:
+                        release_note = f"{base_note} Tracking {branch_name} branch instead."
+                    if not can_fast_forward:
+                        message = repo_info["unavailableReason"]
+                    elif update_available:
+                        message = (
+                            f"{commits_behind} new update{'s' if commits_behind != 1 else ''} ready to install."
+                        )
+                    else:
+                        message = "VPSAgent is up to date."
+                else:
+                    update_source = "release" if release_repo else "none"
+                    release_note = base_note
+                    message = base_note or repo_info["unavailableReason"]
+
             with self._update_lock:
                 if self._update_state.get("state") != "updating":
                     self._update_state["checkedAt"] = now_iso
+                    self._update_state["updateSource"] = update_source
+                    self._update_state["releaseRepo"] = release_repo
+                    self._update_state["releaseStatus"] = release_status
+                    self._update_state["releaseNote"] = release_note
+                    self._update_state["latestVersion"] = latest_version
+                    self._update_state["latestReleaseTag"] = latest_tag
+                    self._update_state["latestReleaseName"] = latest_name
+                    self._update_state["latestReleaseUrl"] = latest_url
+                    self._update_state["latestReleaseNotes"] = latest_notes
+                    self._update_state["latestReleasePublishedAt"] = latest_published_at
+                    self._update_state["latestReleasePrerelease"] = latest_prerelease
+                    self._update_state["latestReleaseAssetName"] = latest_asset_name
+                    self._update_state["checksumAvailable"] = checksum_available
+                    self._update_state["checksumStatus"] = checksum_status
+                    if self._update_state.get("state") != "succeeded":
+                        self._update_state["checksumSha256"] = None
                     self._update_state["latestCommit"] = latest_commit
                     self._update_state["latestCommitSubject"] = latest_subject
                     self._update_state["latestCommitDate"] = latest_date
                     self._update_state["commitsBehind"] = commits_behind
                     self._update_state["updateAvailable"] = update_available
+                    self._update_state["_releaseDownloadUrl"] = dl_url
+                    self._update_state["_releaseChecksumUrl"] = cs_url
+                    self._update_state["_releaseChecksumAssetName"] = cs_asset_name
+                    self._update_state["_releaseAssetDigest"] = asset_digest
                     if self._update_state.get("state") in ("idle", "succeeded", "failed"):
-                        if not can_fast_forward:
-                            self._update_state["message"] = repo_info["unavailableReason"]
-                        elif update_available:
-                            self._update_state["message"] = (
-                                f"{commits_behind} new update{'s' if commits_behind != 1 else ''} ready to install."
-                            )
-                        else:
-                            self._update_state["message"] = "VPSAgent is up to date."
+                        self._update_state["message"] = message
                     self._persist_update_state(self._update_state)
                 snapshot = dict(self._update_state)
 
@@ -5279,9 +6430,251 @@ class RuntimeService:
                 self._update_state["logs"] = logs[-MAX_BUILD_LOG_LINES:]
             self._persist_update_state(self._update_state)
 
-    def start_core_update(self, _payload: dict[str, Any]) -> dict[str, Any]:
+    def _sync_core_configs(self, repo_dir: str) -> list[tuple[str, bytes | None, bytes]]:
+        """
+        Copies updated Caddyfile and docker-compose.core.yml into `self.vpsagent_root`
+        while snapshotting originals for safe rollback (never touching `00-default.caddy`).
+        """
+        config_snapshots: list[tuple[str, bytes | None, bytes]] = []
+        bootstrap_dir = os.path.join(repo_dir, "bootstrap")
+        compose_src = os.path.join(bootstrap_dir, "docker-compose.core.yml")
+        compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
+        caddyfile_src = os.path.join(bootstrap_dir, "Caddyfile")
+        caddyfile_dst = os.path.join(self.vpsagent_root, "Caddyfile")
+
+        for src_path, dst_path in (
+            (caddyfile_src, caddyfile_dst),
+            (compose_src, compose_dst),
+        ):
+            if os.path.isfile(src_path) and os.path.isdir(self.vpsagent_root):
+                old_content: bytes | None = None
+                if os.path.isfile(dst_path):
+                    with open(dst_path, "rb") as fh:
+                        old_content = fh.read()
+                with open(src_path, "rb") as fh:
+                    written_content = fh.read()
+                try:
+                    with open(dst_path, "wb") as fh:
+                        fh.write(written_content)
+                except OSError:
+                    # Immediately restore original file if write/close failed after truncation
+                    try:
+                        if old_content is None:
+                            if os.path.isfile(dst_path):
+                                os.unlink(dst_path)
+                        else:
+                            with open(dst_path, "wb") as rfh:
+                                rfh.write(old_content)
+                    except OSError:
+                        pass
+                    raise
+                config_snapshots.append((dst_path, old_content, written_content))
+        return config_snapshots
+
+    def _restore_core_configs(
+        self, config_snapshots: list[tuple[str, bytes | None, bytes]]
+    ) -> list[str]:
+        """
+        Restores snapshotted Compose & Caddy config files ONLY if they still match what we wrote
+        (never overwrite edits the owner made to active server config during the build).
+        """
+        rollback_notes: list[str] = []
+        restored_files: list[str] = []
+        for dst_path, old_content, written_content in reversed(config_snapshots):
+            fname = os.path.basename(dst_path)
+            try:
+                if not os.path.isfile(dst_path):
+                    rollback_notes.append(
+                        f"Preserved {fname} because it was modified during the build."
+                    )
+                    continue
+                with open(dst_path, "r+b") as fh:
+                    current_content = fh.read()
+                    if current_content != written_content:
+                        rollback_notes.append(
+                            f"Preserved {fname} because it was modified during the build."
+                        )
+                        continue
+                    if old_content is not None:
+                        fh.seek(0)
+                        fh.write(old_content)
+                        fh.truncate()
+                if old_content is None:
+                    os.unlink(dst_path)
+                restored_files.append(fname)
+            except OSError as restore_exc:
+                rollback_notes.append(
+                    f"Failed to restore {fname}: {redact_secrets(str(restore_exc))}"
+                )
+        if restored_files:
+            rollback_notes.append(
+                f"Restored previous configuration files: {', '.join(restored_files)}."
+            )
+        return rollback_notes
+
+    def _prune_old_releases(self, releases_dir: str, *, keep_dir: str) -> None:
+        try:
+            real_releases = os.path.realpath(releases_dir)
+            real_keep = os.path.realpath(keep_dir)
+            previous_dirs: list[tuple[float, str]] = []
+            for entry in os.listdir(real_releases):
+                full_path = os.path.join(real_releases, entry)
+                if os.path.islink(full_path):
+                    continue
+                real_entry = os.path.realpath(full_path)
+                if not real_entry.startswith(real_releases + os.sep):
+                    continue
+                if entry.startswith((".tmp-", ".staging-", ".prev-")):
+                    shutil.rmtree(real_entry, ignore_errors=True)
+                    continue
+                if os.path.isdir(real_entry) and real_entry != real_keep:
+                    try:
+                        mtime = os.stat(real_entry).st_mtime
+                    except OSError:
+                        mtime = 0.0
+                    previous_dirs.append((mtime, real_entry))
+            previous_dirs.sort(key=lambda item: item[0], reverse=True)
+            for _, old_path in previous_dirs[1:]:
+                shutil.rmtree(old_path, ignore_errors=True)
+        except OSError:
+            pass
+
+    def start_core_update(self, payload: dict[str, Any]) -> dict[str, Any]:
+        requested_source: str | None = None
+        if isinstance(payload, dict) and payload.get("source") is not None:
+            raw_src = payload.get("source")
+            if raw_src not in ("auto", "release", "git"):
+                raise BridgeRequestError(
+                    400, "Field 'source' must be one of: auto, release, git."
+                )
+            requested_source = raw_src
+
         repo_info = self._inspect_core_repo()
-        if not repo_info["canUpdate"] or not repo_info["repoDir"] or not repo_info["branch"]:
+        if repo_info.get("dirtyWorkingTree"):
+            raise BridgeRequestError(
+                400,
+                repo_info["unavailableReason"]
+                or "Local edits exist in the VPSAgent source folder. Clean or commit them before updating.",
+            )
+
+        with self._update_lock:
+            if self._update_state.get("state") == "updating":
+                raise BridgeRequestError(
+                    409, "A VPSAgent update is already in progress."
+                )
+            prev_source = self._update_state.get("updateSource")
+            cached_dl_url = self._update_state.get("_releaseDownloadUrl")
+            state_snapshot = dict(self._update_state)
+
+        if requested_source == "release":
+            use_release = True
+        elif requested_source == "git":
+            use_release = False
+        else:
+            use_release = bool(
+                (prev_source == "release" and cached_dl_url)
+                or not repo_info.get("hasGit")
+            )
+
+        if use_release:
+            if not repo_info.get("hasCoreEnv"):
+                raise BridgeRequestError(
+                    400, f"Core .env file not found in {self.vpsagent_root}."
+                )
+            release_target: dict[str, Any]
+            if cached_dl_url and state_snapshot.get("latestReleaseTag"):
+                release_target = {
+                    "releaseRepo": state_snapshot.get("releaseRepo")
+                    or self._resolve_release_repo(repo_info)
+                    or DEFAULT_RELEASE_REPO,
+                    "tag": state_snapshot["latestReleaseTag"],
+                    "version": state_snapshot.get("latestVersion")
+                    or normalize_version_label(state_snapshot["latestReleaseTag"]),
+                    "name": state_snapshot.get("latestReleaseName")
+                    or state_snapshot["latestReleaseTag"],
+                    "htmlUrl": state_snapshot.get("latestReleaseUrl"),
+                    "notes": state_snapshot.get("latestReleaseNotes"),
+                    "publishedAt": state_snapshot.get("latestReleasePublishedAt"),
+                    "prerelease": bool(state_snapshot.get("latestReleasePrerelease")),
+                    "assetName": state_snapshot.get("latestReleaseAssetName"),
+                    "downloadUrl": cached_dl_url,
+                    "checksumUrl": state_snapshot.get("_releaseChecksumUrl"),
+                    "checksumAssetName": state_snapshot.get("_releaseChecksumAssetName"),
+                    "assetDigestSha256": state_snapshot.get("_releaseAssetDigest"),
+                    "checksumAvailable": bool(state_snapshot.get("checksumAvailable")),
+                }
+            else:
+                release_repo = self._resolve_release_repo(repo_info) or DEFAULT_RELEASE_REPO
+                fetched = self._fetch_latest_github_release(release_repo)
+                if fetched.get("status") != "ok":
+                    raise BridgeRequestError(
+                        400,
+                        fetched.get("note")
+                        or "No GitHub release is available to install yet.",
+                    )
+                release_target = fetched
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+            with self._update_lock:
+                if self._update_state.get("state") == "updating":
+                    raise BridgeRequestError(
+                        409, "A VPSAgent update is already in progress."
+                    )
+                self._update_state = {
+                    **self._update_state,
+                    "state": "updating",
+                    "phase": "downloading",
+                    "updateSource": "release",
+                    "releaseRepo": release_target["releaseRepo"],
+                    "latestVersion": release_target["version"],
+                    "latestReleaseTag": release_target["tag"],
+                    "latestReleaseName": release_target["name"],
+                    "latestReleaseUrl": release_target["htmlUrl"],
+                    "latestReleaseNotes": release_target["notes"],
+                    "latestReleasePublishedAt": release_target["publishedAt"],
+                    "latestReleasePrerelease": bool(release_target["prerelease"]),
+                    "latestReleaseAssetName": release_target["assetName"],
+                    "checksumAvailable": bool(release_target["checksumAvailable"]),
+                    "checksumStatus": (
+                        "available"
+                        if release_target["checksumAvailable"]
+                        else "not_provided"
+                    ),
+                    "checksumSha256": None,
+                    "_releaseDownloadUrl": release_target["downloadUrl"],
+                    "_releaseChecksumUrl": release_target["checksumUrl"],
+                    "_releaseChecksumAssetName": release_target["checksumAssetName"],
+                    "_releaseAssetDigest": release_target["assetDigestSha256"],
+                    "startedAt": now_iso,
+                    "finishedAt": None,
+                    "error": None,
+                    "message": f"Downloading VPSAgent {release_target['tag']}...",
+                    "logs": [
+                        f"Starting VPSAgent update to release {release_target['tag']}..."
+                    ],
+                }
+                self._persist_update_state(self._update_state)
+                snapshot = dict(self._update_state)
+
+            worker = threading.Thread(
+                target=self._run_core_update_release_worker,
+                args=(release_target,),
+                name="vpsagent-release-update",
+                daemon=False,
+            )
+            worker.start()
+
+            return {
+                "ok": True,
+                "started": True,
+                "status": self._build_update_status_response(repo_info, snapshot),
+            }
+
+        if (
+            not repo_info.get("canGitUpdate")
+            or not repo_info["repoDir"]
+            or not repo_info["branch"]
+        ):
             raise BridgeRequestError(
                 400,
                 repo_info["unavailableReason"]
@@ -5298,6 +6691,9 @@ class RuntimeService:
                 **self._update_state,
                 "state": "updating",
                 "phase": "fetching",
+                "updateSource": "git",
+                "checksumStatus": "none",
+                "checksumSha256": None,
                 "startedAt": now_iso,
                 "finishedAt": None,
                 "error": None,
@@ -5320,6 +6716,361 @@ class RuntimeService:
             "started": True,
             "status": self._build_update_status_response(repo_info, snapshot),
         }
+
+    def _run_core_update_release_worker(self, release_target: dict[str, Any]) -> None:
+        bridge_changed = False
+        config_snapshots: list[tuple[str, bytes | None, bytes]] = []
+        tmp_dir: str | None = None
+        staging_dir: str | None = None
+        backup_release_dir: str | None = None
+        final_release_dir: str | None = None
+        swapped_new_release = False
+        checksum_status = "not_provided"
+        actual_sha256: str | None = None
+        tag = str(release_target["tag"]).strip()
+        release_repo = str(release_target.get("releaseRepo") or DEFAULT_RELEASE_REPO)
+
+        try:
+            env_file = os.path.join(self.vpsagent_root, ".env")
+            if not os.path.isfile(env_file):
+                raise RuntimeError(
+                    f"Core .env file not found in {self.vpsagent_root}."
+                )
+
+            releases_dir = os.path.join(self.vpsagent_root, "releases")
+            if os.path.islink(releases_dir):
+                raise RuntimeError(
+                    f"Security boundary violation: {releases_dir} cannot be a symlink."
+                )
+            os.makedirs(releases_dir, mode=0o750, exist_ok=True)
+            safe_tag = re.sub(r"[^A-Za-z0-9._+-]", "-", tag).strip(".-") or "release"
+            if safe_tag in (".", "..") or ".." in safe_tag:
+                safe_tag = "release"
+
+            tmp_dir = tempfile.mkdtemp(prefix=".tmp-", dir=releases_dir)
+            os.chmod(tmp_dir, 0o700)
+            archive_name = release_target.get("assetName") or f"vpsagent-{safe_tag}.tar.gz"
+            safe_archive_name = (
+                re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(archive_name)).strip(".")
+                or f"vpsagent-{safe_tag}.tar.gz"
+            )
+            archive_path = os.path.join(tmp_dir, safe_archive_name)
+
+            # Step 1: Download release tarball while computing SHA-256
+            self._append_update_log(
+                f"Downloading release archive for {tag} from {release_repo}...",
+                phase="downloading",
+                message=f"Downloading VPSAgent {tag}...",
+            )
+            dl_status, _headers, _body, actual_sha256 = self._fetch_release_http(
+                release_target["downloadUrl"],
+                accept="application/octet-stream",
+                max_bytes=MAX_RELEASE_ARCHIVE_BYTES,
+                timeout=120.0,
+                stream_to_file=archive_path,
+            )
+            if dl_status < 200 or dl_status >= 300 or not actual_sha256:
+                raise RuntimeError(
+                    f"Release download failed with HTTP {dl_status}."
+                )
+            self._append_update_log(f"Downloaded archive (SHA-256: {actual_sha256[:16]}...).")
+
+            # Step 2: Verify SHA-256 checksum
+            self._append_update_log(
+                "Verifying release archive integrity...",
+                phase="verifying",
+                message="Verifying SHA-256 checksum...",
+            )
+            checksum_url = release_target.get("checksumUrl")
+            checksum_asset_name = release_target.get("checksumAssetName") or ""
+            asset_digest = release_target.get("assetDigestSha256")
+            parsed_checksum: str | None = None
+
+            if checksum_url:
+                try:
+                    cs_status, _cs_headers, cs_body, _ = self._fetch_release_http(
+                        checksum_url,
+                        accept="text/plain, application/octet-stream",
+                        max_bytes=MAX_CHECKSUM_FILE_BYTES,
+                        timeout=20.0,
+                    )
+                except Exception as cs_exc:
+                    checksum_status = "failed"
+                    raise RuntimeError(
+                        f"Could not download release checksum file: {cs_exc}"
+                    ) from cs_exc
+                if cs_status < 200 or cs_status >= 300 or cs_body is None:
+                    checksum_status = "failed"
+                    raise RuntimeError(
+                        f"Could not download release checksum file ({cs_status})."
+                    )
+                cs_text = cs_body.decode("utf-8", errors="replace")
+                allow_bare = checksum_asset_name.lower().endswith(
+                    (".sha256", ".sha256sum")
+                )
+                parsed_checksum = parse_sha256_checksum(
+                    cs_text, archive_name, allow_bare_hash=allow_bare
+                )
+                if not parsed_checksum:
+                    checksum_status = "failed"
+                    raise RuntimeError(
+                        f'Release checksum file "{checksum_asset_name or "SHA256SUMS"}" did not contain a valid SHA-256 entry for {archive_name}.'
+                    )
+
+            if parsed_checksum and asset_digest and not hmac.compare_digest(
+                parsed_checksum.lower(), str(asset_digest).lower()
+            ):
+                checksum_status = "failed"
+                raise RuntimeError(
+                    "Release checksum file disagrees with GitHub asset digest. Update aborted safely."
+                )
+
+            expected_sha256 = parsed_checksum or asset_digest
+            if expected_sha256:
+                if not hmac.compare_digest(
+                    actual_sha256.lower(), str(expected_sha256).lower()
+                ):
+                    checksum_status = "failed"
+                    raise RuntimeError(
+                        "Release checksum verification failed (SHA-256 mismatch). Update aborted safely."
+                    )
+                checksum_status = "verified"
+                self._append_update_log(
+                    f"Verified SHA-256 checksum ({actual_sha256[:16]}...)."
+                )
+            else:
+                checksum_status = "not_provided"
+                self._append_update_log(
+                    f"Archive SHA-256: {actual_sha256[:16]}... (no checksum asset published for this release)."
+                )
+
+            # Step 3: Safely extract into staging dir and validate structure
+            self._append_update_log(
+                f"Extracting VPSAgent {tag}...",
+                phase="extracting",
+                message=f"Extracting VPSAgent {tag}...",
+            )
+            staging_dir = tempfile.mkdtemp(prefix=f".staging-{safe_tag}-", dir=releases_dir)
+            os.chmod(staging_dir, 0o755)
+            extracted = safe_extract_release_tarball(archive_path, staging_dir)
+            resolved_ver = (
+                extracted.get("version")
+                or release_target.get("version")
+                or normalize_version_label(tag)
+                or tag
+            )
+            meta_payload = {
+                "tag": tag,
+                "version": resolved_ver,
+                "releaseRepo": release_repo,
+                "releaseUrl": release_target.get("htmlUrl"),
+                "sha256": actual_sha256,
+                "checksumStatus": checksum_status,
+                "installedAt": datetime.now(timezone.utc).isoformat(),
+            }
+            meta_path = os.path.join(staging_dir, ".vpsagent-release.json")
+            with open(meta_path, "w", encoding="utf-8") as mfh:
+                json.dump(meta_payload, mfh, indent=2)
+            os.chmod(meta_path, 0o644)
+
+            final_release_dir = os.path.join(releases_dir, safe_tag)
+            real_releases = os.path.realpath(releases_dir)
+            if not os.path.abspath(final_release_dir).startswith(real_releases + os.sep):
+                raise RuntimeError("Invalid release directory path.")
+            if os.path.lexists(final_release_dir):
+                backup_release_dir = os.path.join(
+                    releases_dir, f".prev-{safe_tag}-{os.getpid()}"
+                )
+                os.replace(final_release_dir, backup_release_dir)
+            os.replace(staging_dir, final_release_dir)
+            staging_dir = None
+            swapped_new_release = True
+            os.chmod(final_release_dir, 0o755)
+
+            # Step 4: Snapshot & sync Caddyfile + docker-compose.yml (never touches 00-default.caddy)
+            self._append_update_log(
+                "Syncing VPSAgent configuration files...",
+                phase="syncing",
+                message="Preparing updated server configuration...",
+            )
+            config_snapshots = self._sync_core_configs(final_release_dir)
+
+            # Step 5: Rebuild & restart vpsagent-core container
+            compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
+            if not os.path.isfile(compose_dst) or not os.path.isfile(env_file):
+                raise RuntimeError(
+                    f"Core stack files not found in {self.vpsagent_root} (expected docker-compose.yml and .env)."
+                )
+            self._append_update_log(
+                "Rebuilding and restarting VPSAgent core container...",
+                phase="building",
+                message="Rebuilding VPSAgent (this usually takes 1-2 minutes)...",
+            )
+            compose_env = {**os.environ, "VPSAGENT_REPO_DIR": final_release_dir}
+            compose_proc = subprocess.run(
+                [
+                    self.docker_bin,
+                    "compose",
+                    "--project-directory",
+                    self.vpsagent_root,
+                    "-f",
+                    compose_dst,
+                    "--env-file",
+                    env_file,
+                    "up",
+                    "-d",
+                    "--build",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+                env=compose_env,
+            )
+            combined_out = (
+                (compose_proc.stdout or "") + "\n" + (compose_proc.stderr or "")
+            ).splitlines()
+            for line in combined_out[-40:]:
+                if line.strip():
+                    self._append_update_log(line)
+            if compose_proc.returncode != 0:
+                raise RuntimeError(
+                    f"Docker rebuild failed (exit {compose_proc.returncode})."
+                )
+
+            # Step 6: Persist VPSAGENT_REPO_DIR cleanly in .env (preserves all secrets)
+            _upsert_env_file_var(env_file, "VPSAGENT_REPO_DIR", final_release_dir)
+            self.repo_dir = final_release_dir
+
+            # Step 7: Install updated runtime-bridge.py if changed
+            bridge_src = os.path.join(final_release_dir, "bootstrap", "runtime-bridge.py")
+            bridge_dst = os.path.join(self.vpsagent_root, "runtime-bridge.py")
+            if os.path.isfile(bridge_src) and os.path.isdir(self.vpsagent_root):
+                with open(bridge_src, "rb") as fh:
+                    new_bytes = fh.read()
+                old_bytes: bytes | None = None
+                if os.path.isfile(bridge_dst):
+                    with open(bridge_dst, "rb") as fh:
+                        old_bytes = fh.read()
+                if old_bytes != new_bytes:
+                    tmp_bridge = f"{bridge_dst}.tmp.{os.getpid()}"
+                    with open(tmp_bridge, "wb") as fh:
+                        fh.write(new_bytes)
+                    os.chmod(tmp_bridge, 0o750)
+                    os.replace(tmp_bridge, bridge_dst)
+                    bridge_changed = True
+                    self._append_update_log(
+                        "Updated host Runtime Bridge script; scheduling seamless restart...",
+                        phase="restarting",
+                        message="Finishing update and restarting background bridge...",
+                    )
+
+            if backup_release_dir and os.path.isdir(backup_release_dir):
+                shutil.rmtree(backup_release_dir, ignore_errors=True)
+                backup_release_dir = None
+            self._prune_old_releases(releases_dir, keep_dir=final_release_dir)
+
+            finished_iso = datetime.now(timezone.utc).isoformat()
+            done_msg = (
+                f"Updated VPSAgent to {tag} (SHA-256 verified)."
+                if checksum_status == "verified"
+                else f"Updated VPSAgent to {tag}."
+            )
+            with self._update_lock:
+                self._update_state = {
+                    **self._update_state,
+                    "state": "succeeded",
+                    "phase": "completed",
+                    "updateSource": "release",
+                    "releaseStatus": "up_to_date",
+                    "releaseNote": None,
+                    "checkedAt": finished_iso,
+                    "finishedAt": finished_iso,
+                    "latestVersion": resolved_ver,
+                    "latestReleaseTag": tag,
+                    "checksumStatus": checksum_status,
+                    "checksumSha256": actual_sha256,
+                    "commitsBehind": 0,
+                    "updateAvailable": False,
+                    "error": None,
+                    "message": done_msg,
+                    "logs": (list(self._update_state.get("logs") or []) + [done_msg])[
+                        -MAX_BUILD_LOG_LINES:
+                    ],
+                }
+                self._persist_update_state(self._update_state)
+
+            if bridge_changed:
+                time.sleep(0.25)
+                try:
+                    is_active = self._run_cmd(
+                        [self.systemctl_bin, "is-active", "vpsagent-runtime.service"],
+                        label="systemd",
+                        timeout=5,
+                        check=False,
+                    )
+                    if is_active.returncode == 0:
+                        self._run_cmd(
+                            [
+                                self.systemctl_bin,
+                                "restart",
+                                "--no-block",
+                                "vpsagent-runtime.service",
+                            ],
+                            label="systemd",
+                            timeout=10,
+                            check=False,
+                        )
+                except Exception:
+                    pass
+        except Exception as exc:
+            err_text = _scrub_secret_values(
+                str(exc),
+                [self.release_github_token] if self.release_github_token else None,
+            )
+            rollback_notes = self._restore_core_configs(config_snapshots)
+            if final_release_dir and (
+                swapped_new_release
+                or (backup_release_dir and os.path.isdir(backup_release_dir))
+            ):
+                try:
+                    if os.path.isdir(final_release_dir):
+                        shutil.rmtree(final_release_dir, ignore_errors=True)
+                    if backup_release_dir and os.path.isdir(backup_release_dir):
+                        os.replace(backup_release_dir, final_release_dir)
+                        backup_release_dir = None
+                        rollback_notes.append(
+                            f"Restored previous release directory {tag}."
+                        )
+                except OSError:
+                    pass
+            finished_iso = datetime.now(timezone.utc).isoformat()
+            with self._update_lock:
+                extra_logs = [f"ERROR: {err_text}", *rollback_notes]
+                self._update_state = {
+                    **self._update_state,
+                    "state": "failed",
+                    "phase": "failed",
+                    "checksumStatus": (
+                        "failed"
+                        if checksum_status == "failed"
+                        else self._update_state.get("checksumStatus", "none")
+                    ),
+                    "finishedAt": finished_iso,
+                    "error": err_text,
+                    "message": "VPSAgent update failed.",
+                    "logs": (
+                        list(self._update_state.get("logs") or []) + extra_logs
+                    )[-MAX_BUILD_LOG_LINES:],
+                }
+                self._persist_update_state(self._update_state)
+        finally:
+            if tmp_dir and os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            if staging_dir and os.path.exists(staging_dir):
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            if backup_release_dir and os.path.exists(backup_release_dir):
+                shutil.rmtree(backup_release_dir, ignore_errors=True)
 
     def _run_core_update_worker(self, repo_dir: str, branch: str) -> None:
         bridge_changed = False
@@ -5385,41 +7136,11 @@ class RuntimeService:
                 phase="syncing",
                 message="Preparing updated server configuration...",
             )
-            bootstrap_dir = os.path.join(repo_dir, "bootstrap")
-            compose_src = os.path.join(bootstrap_dir, "docker-compose.core.yml")
-            compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
-            caddyfile_src = os.path.join(bootstrap_dir, "Caddyfile")
-            caddyfile_dst = os.path.join(self.vpsagent_root, "Caddyfile")
-
-            for src_path, dst_path in (
-                (caddyfile_src, caddyfile_dst),
-                (compose_src, compose_dst),
-            ):
-                if os.path.isfile(src_path) and os.path.isdir(self.vpsagent_root):
-                    old_content: bytes | None = None
-                    if os.path.isfile(dst_path):
-                        with open(dst_path, "rb") as fh:
-                            old_content = fh.read()
-                    with open(src_path, "rb") as fh:
-                        written_content = fh.read()
-                    try:
-                        with open(dst_path, "wb") as fh:
-                            fh.write(written_content)
-                    except OSError:
-                        # Immediately restore original file if write/close failed after truncation
-                        try:
-                            if old_content is None:
-                                if os.path.isfile(dst_path):
-                                    os.unlink(dst_path)
-                            else:
-                                with open(dst_path, "wb") as rfh:
-                                    rfh.write(old_content)
-                        except OSError:
-                            pass
-                        raise
-                    config_snapshots.append((dst_path, old_content, written_content))
+            config_snapshots = self._sync_core_configs(repo_dir)
 
             # Step 3: Rebuild and restart vpsagent-core stack
+            bootstrap_dir = os.path.join(repo_dir, "bootstrap")
+            compose_dst = os.path.join(self.vpsagent_root, "docker-compose.yml")
             env_file = os.path.join(self.vpsagent_root, ".env")
             if not os.path.isfile(compose_dst) or not os.path.isfile(env_file):
                 raise RuntimeError(
@@ -5543,40 +7264,7 @@ class RuntimeService:
                     pass
         except Exception as exc:
             err_text = redact_secrets(str(exc))
-            rollback_notes: list[str] = []
-            # Restore snapshotted Compose & Caddy config files ONLY if they still match what we wrote
-            # (never overwrite edits the owner made to active server config during the build).
-            restored_files: list[str] = []
-            for dst_path, old_content, written_content in reversed(config_snapshots):
-                fname = os.path.basename(dst_path)
-                try:
-                    if not os.path.isfile(dst_path):
-                        rollback_notes.append(
-                            f"Preserved {fname} because it was modified during the build."
-                        )
-                        continue
-                    with open(dst_path, "r+b") as fh:
-                        current_content = fh.read()
-                        if current_content != written_content:
-                            rollback_notes.append(
-                                f"Preserved {fname} because it was modified during the build."
-                            )
-                            continue
-                        if old_content is not None:
-                            fh.seek(0)
-                            fh.write(old_content)
-                            fh.truncate()
-                    if old_content is None:
-                        os.unlink(dst_path)
-                    restored_files.append(fname)
-                except OSError as restore_exc:
-                    rollback_notes.append(
-                        f"Failed to restore {fname}: {redact_secrets(str(restore_exc))}"
-                    )
-            if restored_files:
-                rollback_notes.append(
-                    f"Restored previous configuration files: {', '.join(restored_files)}."
-                )
+            rollback_notes = self._restore_core_configs(config_snapshots)
 
             # Only roll back Git checkout if it is still clean and at the exact merged commit
             # (never discard local edits the owner made while Docker was building).
@@ -5873,6 +7561,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("VPSAGENT_REPO_DIR", ""),
     )
     parser.add_argument(
+        "--release-repo",
+        default=os.environ.get("VPSAGENT_RELEASE_REPO", ""),
+    )
+    parser.add_argument(
+        "--release-api-base",
+        default=os.environ.get("VPSAGENT_RELEASE_API_BASE", ""),
+    )
+    parser.add_argument(
+        "--check-update",
+        action="store_true",
+        help="Check GitHub Releases / Git repository for a newer VPSAgent version and exit.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON output when used with --check-update.",
+    )
+    parser.add_argument(
         "--runtime-token",
         default=os.environ.get("VPSAGENT_RUNTIME_TOKEN", ""),
     )
@@ -5902,6 +7608,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.check_update:
+        service = RuntimeService(
+            apps_root=args.apps_root,
+            caddy_apps_dir=args.caddy_apps_dir,
+            caddy_core_dir=args.caddy_core_dir or None,
+            caddy_container=args.caddy_container,
+            docker_bin=args.docker_bin,
+            git_bin=args.git_bin,
+            systemctl_bin=args.systemctl_bin,
+            vpsagent_root=args.vpsagent_root or None,
+            repo_dir=args.repo_dir or None,
+            release_repo=args.release_repo or None,
+            release_api_base=args.release_api_base or None,
+            allow_unauthenticated=True,
+            status_deadline_s=args.status_deadline,
+            health_interval_s=args.health_interval,
+        )
+        try:
+            status = service.core_update_status(check_remote=True)
+        except BridgeRequestError as exc:
+            if args.json:
+                sys.stdout.write(json.dumps({"ok": False, "error": str(exc)}) + "\n")
+            else:
+                sys.stderr.write(f"Update check failed: {exc}\n")
+            return 1
+        if args.json:
+            sys.stdout.write(json.dumps(status, indent=2) + "\n")
+        else:
+            installed = status.get("currentVersion") or "unknown"
+            latest = status.get("latestReleaseTag") or status.get("latestVersion") or "none"
+            sys.stdout.write(f"Installed version: {installed}\n")
+            sys.stdout.write(f"Latest release:    {latest} ({status.get('releaseStatus')})\n")
+            sys.stdout.write(f"Update source:     {status.get('updateSource')}\n")
+            sys.stdout.write(f"Checksum status:   {status.get('checksumStatus')}\n")
+            sys.stdout.write(f"Status:            {status.get('message') or 'Ready'}\n")
+            if status.get("releaseNote"):
+                sys.stdout.write(f"Note:              {status['releaseNote']}\n")
+        return 0
+
     token = (args.runtime_token or "").strip()
     if not args.allow_unauthenticated and (
         not token or token.startswith("replace-with-") or len(token) < 16
@@ -5921,6 +7666,8 @@ def main(argv: list[str] | None = None) -> int:
         systemctl_bin=args.systemctl_bin,
         vpsagent_root=args.vpsagent_root or None,
         repo_dir=args.repo_dir or None,
+        release_repo=args.release_repo or None,
+        release_api_base=args.release_api_base or None,
         runtime_token=token or None,
         allow_unauthenticated=bool(args.allow_unauthenticated),
         status_deadline_s=args.status_deadline,

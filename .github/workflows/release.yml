@@ -1,0 +1,61 @@
+name: Release VPSAgent
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to package (defaults to github.ref_name)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build release archive and SHA-256 checksums
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REF_NAME}"
+          ARCHIVE="vpsagent-${TAG}.tar.gz"
+          mkdir -p dist-release
+          git archive --format=tar.gz --prefix="vpsagent-${TAG}/" -o "dist-release/${ARCHIVE}" HEAD
+          (
+            cd dist-release
+            sha256sum "${ARCHIVE}" > SHA256SUMS
+            cat SHA256SUMS
+          )
+          IS_PRERELEASE="false"
+          if [[ "${TAG}" == *-* ]]; then
+            IS_PRERELEASE="true"
+          fi
+          {
+            echo "TAG=${TAG}"
+            echo "ARCHIVE=dist-release/${ARCHIVE}"
+            echo "CHECKSUMS=dist-release/SHA256SUMS"
+            echo "IS_PRERELEASE=${IS_PRERELEASE}"
+          } >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: "VPSAgent ${{ env.TAG }}"
+          prerelease: ${{ env.IS_PRERELEASE }}
+          generate_release_notes: true
+          files: |
+            ${{ env.ARCHIVE }}
+            ${{ env.CHECKSUMS }}

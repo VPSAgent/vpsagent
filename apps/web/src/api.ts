@@ -232,8 +232,30 @@ export interface SystemUpdateStatus {
   unavailableReason: string | null;
   repoDir: string | null;
   branch: string | null;
+  updateSource: "release" | "git" | "none";
+  releaseRepo: string | null;
+  releaseStatus:
+    | "unchecked"
+    | "available"
+    | "up_to_date"
+    | "no_releases"
+    | "unavailable";
+  releaseNote: string | null;
+  installedFrom: "release" | "git" | "unknown";
   currentVersion: string | null;
+  currentReleaseTag: string | null;
   currentCommit: string | null;
+  latestVersion: string | null;
+  latestReleaseTag: string | null;
+  latestReleaseName: string | null;
+  latestReleaseUrl: string | null;
+  latestReleaseNotes: string | null;
+  latestReleasePublishedAt: string | null;
+  latestReleasePrerelease: boolean;
+  latestReleaseAssetName: string | null;
+  checksumAvailable: boolean;
+  checksumStatus: "none" | "available" | "verified" | "not_provided" | "failed";
+  checksumSha256: string | null;
   latestCommit: string | null;
   latestCommitSubject: string | null;
   latestCommitDate: string | null;
@@ -569,9 +591,12 @@ export const api = {
     apiFetch<{ status: SystemUpdateStatus }>("/api/system/update/check", {
       method: "POST",
     }),
-  applySystemUpdate: () =>
+  applySystemUpdate: (source?: "auto" | "release" | "git") =>
     apiFetch<{ ok: boolean; started: boolean; status: SystemUpdateStatus }>(
       "/api/system/update/apply",
-      { method: "POST" },
+      {
+        method: "POST",
+        ...(source ? { body: JSON.stringify({ source }) } : {}),
+      },
     ),
 };

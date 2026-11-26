@@ -13,6 +13,7 @@ import {
 import {
   HttpRuntimeBridgeClient,
   RuntimeBridgeError,
+  RuntimeCoreUpdateStatusSchema,
   createRuntimeBridgeFromEnv,
   syncAppStatuses,
 } from "./runtime-bridge.js";
@@ -676,6 +677,95 @@ describe("RuntimeBridge Unix-socket client + bootstrap/runtime-bridge.py", () =>
       await daemon.close();
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));
       fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("parses legacy and release update status payloads and redacts secrets", async () => {
+    const minimalParsed = RuntimeCoreUpdateStatusSchema.parse({
+      state: "idle",
+      canUpdate: true,
+      currentVersion: "2.0.0-alpha.1",
+    });
+    expect(minimalParsed.updateSource).toBe("none");
+    expect(minimalParsed.releaseStatus).toBe("unchecked");
+    expect(minimalParsed.checksumStatus).toBe("none");
+    expect(minimalParsed.installedFrom).toBe("unknown");
+
+    let seenApplyBody: string | null = null;
+    const mockServer = http.createServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => chunks.push(c));
+      req.on("end", () => {
+        if (req.url === "/v1/core/update/status") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              state: "idle",
+              canUpdate: true,
+              updateSource: "release",
+              releaseRepo: "VPSAgent/vpsagent",
+              releaseStatus: "available",
+              releaseNote: "Bearer sk-secret1234567890abcd leaked",
+              installedFrom: "release",
+              currentVersion: "2.0.0-alpha.1",
+              latestVersion: "2.1.0",
+              latestReleaseTag: "v2.1.0",
+              latestReleaseName: "v2.1.0 token=vpsmcp_1234567890abcdef",
+              latestReleaseUrl:
+                "https://github.com/VPSAgent/vpsagent/releases/tag/v2.1.0",
+              latestReleaseNotes: "Fixes github_pat_1234567890abcdef",
+              checksumAvailable: true,
+              checksumStatus: "available",
+              updateAvailable: true,
+            }),
+          );
+          return;
+        }
+        if (req.url === "/v1/core/update/apply") {
+          seenApplyBody = Buffer.concat(chunks).toString("utf8");
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify({
+              ok: true,
+              started: true,
+              status: {
+                state: "updating",
+                phase: "downloading",
+                canUpdate: true,
+                updateSource: "release",
+                latestReleaseTag: "v2.1.0",
+              },
+            }),
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+
+    await new Promise<void>((resolve) =>
+      mockServer.listen(0, "127.0.0.1", () => resolve()),
+    );
+    const port = (mockServer.address() as AddressInfo).port;
+    try {
+      const client = new HttpRuntimeBridgeClient({
+        baseUrl: `http://127.0.0.1:${port}`,
+      });
+      const st = await client.getCoreUpdateStatus();
+      expect(st.updateSource).toBe("release");
+      expect(st.latestReleaseTag).toBe("v2.1.0");
+      expect(st.releaseNote).not.toContain("sk-secret1234567890abcd");
+      expect(st.latestReleaseName).not.toContain("vpsmcp_1234567890abcdef");
+      expect(st.latestReleaseNotes).not.toContain(
+        "github_pat_1234567890abcdef",
+      );
+
+      const applied = await client.applyCoreUpdate({ source: "release" });
+      expect(applied.started).toBe(true);
+      expect(seenApplyBody).toBe(JSON.stringify({ source: "release" }));
+    } finally {
+      await new Promise<void>((resolve) => mockServer.close(() => resolve()));
     }
   });
 });

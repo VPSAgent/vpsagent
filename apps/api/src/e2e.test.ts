@@ -206,6 +206,7 @@ async function startBridge(options: {
   gitBin: string;
   runtimeToken: string;
   socketPath: string;
+  releaseApiBase?: string | undefined;
 }): Promise<{ close: () => Promise<void> }> {
   const child = spawn(
     "python3",
@@ -225,6 +226,9 @@ async function startBridge(options: {
       options.gitBin,
       "--runtime-token",
       options.runtimeToken,
+      ...(options.releaseApiBase
+        ? ["--release-api-base", options.releaseApiBase]
+        : []),
     ],
     { stdio: ["ignore", "pipe", "pipe"] },
   );
@@ -293,6 +297,43 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
     );
     const livePort = (liveAppServer.address() as AddressInfo).port;
 
+    const mockReleaseServer = http.createServer((req, res) => {
+      if (req.url === "/repos/VPSAgent/vpsagent/releases/latest") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            tag_name: "v9.9.9",
+            name: "VPSAgent v9.9.9",
+            html_url:
+              "https://github.com/VPSAgent/vpsagent/releases/tag/v9.9.9",
+            body: "Release update notes",
+            published_at: "2026-11-26T12:00:00Z",
+            prerelease: false,
+            draft: false,
+            assets: [
+              {
+                name: "vpsagent-v9.9.9.tar.gz",
+                browser_download_url:
+                  "https://github.com/VPSAgent/vpsagent/releases/download/v9.9.9/vpsagent-v9.9.9.tar.gz",
+              },
+              {
+                name: "SHA256SUMS",
+                browser_download_url:
+                  "https://github.com/VPSAgent/vpsagent/releases/download/v9.9.9/SHA256SUMS",
+              },
+            ],
+          }),
+        );
+        return;
+      }
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ message: "Not Found" }));
+    });
+    await new Promise<void>((resolve) =>
+      mockReleaseServer.listen(0, "127.0.0.1", () => resolve()),
+    );
+    const mockReleasePort = (mockReleaseServer.address() as AddressInfo).port;
+
     const bridgeProc = await startBridge({
       appsRoot,
       caddyAppsDir,
@@ -301,6 +342,7 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       gitBin,
       runtimeToken,
       socketPath,
+      releaseApiBase: `http://127.0.0.1:${mockReleasePort}`,
     });
 
     const bridge = new HttpRuntimeBridgeClient({ socketPath, runtimeToken });
@@ -1508,7 +1550,7 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       expect(testConnBody.ok).toBe(true);
       expect(testConnBody.toolCount).toBe(toolsListBody.result.tools.length);
 
-      // 11b. System self-update endpoints require owner auth and return typed status
+      // 11b. System self-update endpoints require owner auth and return typed release/git status
       const unauthUpdateStatus = await app.request("/api/system/update/status", {
         headers: { host: "localhost:3002" },
       });
@@ -1519,10 +1561,51 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
       });
       expect(authUpdateStatus.status).toBe(200);
       const authUpdateBody = (await authUpdateStatus.json()) as {
-        status: { state: string; canUpdate: boolean };
+        status: {
+          state: string;
+          canUpdate: boolean;
+          currentVersion: string | null;
+          updateSource: string;
+          releaseStatus: string;
+          checksumStatus: string;
+        };
       };
       expect(authUpdateBody.status.state).toBe("idle");
       expect(typeof authUpdateBody.status.canUpdate).toBe("boolean");
+      expect(typeof authUpdateBody.status.currentVersion).toBe("string");
+      expect(["release", "git", "none"]).toContain(
+        authUpdateBody.status.updateSource,
+      );
+      expect(authUpdateBody.status.releaseStatus).toBe("unchecked");
+      expect(authUpdateBody.status.checksumStatus).toBe("none");
+
+      const authUpdateCheck = await app.request("/api/system/update/check", {
+        method: "POST",
+        headers: {
+          cookie: cookieHeader,
+          host: "localhost:3002",
+          origin: "http://localhost:3002",
+          "sec-fetch-site": "same-origin",
+          "content-type": "application/json",
+        },
+      });
+      expect(authUpdateCheck.status).toBe(200);
+      const authCheckBody = (await authUpdateCheck.json()) as {
+        status: {
+          updateSource: string;
+          releaseStatus: string;
+          latestReleaseTag: string | null;
+          latestVersion: string | null;
+          checksumAvailable: boolean;
+          updateAvailable: boolean;
+        };
+      };
+      expect(authCheckBody.status.updateSource).toBe("release");
+      expect(authCheckBody.status.releaseStatus).toBe("available");
+      expect(authCheckBody.status.latestReleaseTag).toBe("v9.9.9");
+      expect(authCheckBody.status.latestVersion).toBe("9.9.9");
+      expect(authCheckBody.status.checksumAvailable).toBe(true);
+      expect(authCheckBody.status.updateAvailable).toBe(true);
 
       // Sibling-site / cross-origin POST to /api/system/update/apply must be blocked (CSRF)
       const siblingApplyRes = await app.request("/api/system/update/apply", {
@@ -1558,6 +1641,9 @@ describe("VPSAgent v2 End-to-End Flow (HTTPS Caddy reload, Security Boundaries, 
     } finally {
       store.close();
       await bridgeProc.close();
+      await new Promise<void>((resolve) =>
+        mockReleaseServer.close(() => resolve()),
+      );
       await new Promise<void>((resolve) =>
         liveAppServer.close(() => resolve()),
       );
