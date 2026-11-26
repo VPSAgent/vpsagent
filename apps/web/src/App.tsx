@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Activity,
+  ArrowDownToLine,
   Box,
   KeyRound,
   LogOut,
@@ -18,6 +19,7 @@ import {
   type McpTokenRecord,
   type OverviewResponse,
   type SessionInfo,
+  type SystemUpdateStatus,
 } from "./api";
 import { applyInspectStatusToApps } from "./health-display";
 import { ApprovalsTab } from "./components/ApprovalsTab";
@@ -50,12 +52,21 @@ function isGithubKeysDeepLink(hash: string): boolean {
   return /^#?\/?keys\/github$/i.test(hash.trim());
 }
 
+function isUpdatesKeysDeepLink(hash: string): boolean {
+  return /^#?\/?keys\/updates$/i.test(hash.trim());
+}
+
 export function App() {
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [connectError, setConnectError] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>(() => {
     if (typeof window !== "undefined") {
-      if (isGithubKeysDeepLink(window.location.hash)) return "keys";
+      if (
+        isGithubKeysDeepLink(window.location.hash) ||
+        isUpdatesKeysDeepLink(window.location.hash)
+      ) {
+        return "keys";
+      }
       if (parseAppDeepLink(window.location.hash)) return "apps";
     }
     return "overview";
@@ -63,17 +74,24 @@ export function App() {
   const [deepLink, setDeepLink] = useState<AppDeepLink | null>(() =>
     typeof window !== "undefined" ? parseAppDeepLink(window.location.hash) : null,
   );
-  const [keysFocusSection, setKeysFocusSection] = useState<"github" | null>(() =>
-    typeof window !== "undefined" && isGithubKeysDeepLink(window.location.hash)
-      ? "github"
-      : null,
-  );
+  const [keysFocusSection, setKeysFocusSection] = useState<
+    "github" | "updates" | null
+  >(() => {
+    if (typeof window !== "undefined") {
+      if (isGithubKeysDeepLink(window.location.hash)) return "github";
+      if (isUpdatesKeysDeepLink(window.location.hash)) return "updates";
+    }
+    return null;
+  });
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
   const [tokens, setTokens] = useState<McpTokenRecord[]>([]);
   const [gitCredentials, setGitCredentials] = useState<GitCredentialRecord[]>([]);
   const [snippets, setSnippets] = useState<McpSnippets | null>(null);
+  const [systemUpdate, setSystemUpdate] = useState<SystemUpdateStatus | null>(
+    null,
+  );
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -87,6 +105,11 @@ export function App() {
       if (isGithubKeysDeepLink(window.location.hash)) {
         setTab("keys");
         setKeysFocusSection("github");
+        return;
+      }
+      if (isUpdatesKeysDeepLink(window.location.hash)) {
+        setTab("keys");
+        setKeysFocusSection("updates");
       }
     };
     syncFromHash();
@@ -101,13 +124,17 @@ export function App() {
       const sess = await api.getSession();
       setSession(sess);
       if (sess.claimed && sess.authenticated) {
-        const [ov, appr, aud, toks, snips, gitCreds] = await Promise.all([
+        const [ov, appr, aud, toks, snips, gitCreds, upd] = await Promise.all([
           api.getOverview(),
           api.listApprovals(),
           api.listAudit(auditQuery),
           api.listTokens(),
           api.getSnippets(),
           api.listGitCredentials(),
+          api
+            .getSystemUpdateStatus()
+            .then((res) => res.status)
+            .catch(() => null),
         ]);
         setOverview(ov);
         setApprovals(appr.approvals);
@@ -115,6 +142,9 @@ export function App() {
         setTokens(toks.tokens);
         setSnippets(snips);
         setGitCredentials(gitCreds.credentials);
+        if (upd) {
+          setSystemUpdate(upd);
+        }
       }
     } catch (err) {
       setConnectError(
@@ -177,12 +207,16 @@ export function App() {
   }
 
   const pendingCount = approvals.filter((a) => a.status === "pending").length;
+  const hasReadyUpdate = Boolean(
+    systemUpdate?.updateAvailable && systemUpdate.canUpdate,
+  );
 
   const tabs: Array<{
     id: TabId;
     label: string;
     icon: typeof Activity;
     badge?: number;
+    dot?: boolean;
   }> = [
     { id: "overview", label: "Overview", icon: Activity },
     { id: "apps", label: "Apps", icon: Box },
@@ -192,8 +226,18 @@ export function App() {
       icon: ShieldQuestion,
       badge: pendingCount > 0 ? pendingCount : undefined,
     },
-    { id: "keys", label: "AI Keys & Settings", icon: KeyRound },
+    {
+      id: "keys",
+      label: "AI Keys & Settings",
+      icon: KeyRound,
+      dot: hasReadyUpdate,
+    },
   ];
+
+  const openUpdatesSection = () => {
+    setKeysFocusSection("updates");
+    setTab("keys");
+  };
 
   return (
     <div className="min-h-screen bg-[#090A0C] text-[#F4F5F7]">
@@ -237,6 +281,12 @@ export function App() {
                       {item.badge}
                     </span>
                   )}
+                  {item.dot && (
+                    <span
+                      title="VPSAgent update available"
+                      className="h-2 w-2 rounded-full bg-emerald-400"
+                    />
+                  )}
                 </button>
               );
             })}
@@ -244,6 +294,20 @@ export function App() {
 
           {/* Right Utilities */}
           <div className="flex items-center gap-3 min-w-0 shrink-0">
+            {hasReadyUpdate && (
+              <button
+                type="button"
+                onClick={openUpdatesSection}
+                className="btn-press inline-flex items-center gap-1.5 rounded-full border border-emerald-500/35 bg-emerald-500/12 px-2.5 py-1 text-[11px] font-medium text-emerald-300 hover:bg-emerald-500/20 shrink-0 cursor-pointer"
+              >
+                <ArrowDownToLine className="h-3 w-3" />
+                <span>
+                  {systemUpdate?.latestReleaseTag
+                    ? `${systemUpdate.latestReleaseTag} ready`
+                    : "Update ready"}
+                </span>
+              </button>
+            )}
             {overview?.metrics.hostname && (
               <span
                 title={overview.metrics.hostname}
@@ -289,6 +353,12 @@ export function App() {
                   <span className="tabular-nums rounded-full bg-amber-400 px-1.5 py-0.5 text-[11px] leading-none font-bold text-[#1A1200]">
                     {item.badge}
                   </span>
+                )}
+                {item.dot && (
+                  <span
+                    title="VPSAgent update available"
+                    className="h-2 w-2 rounded-full bg-emerald-400"
+                  />
                 )}
               </button>
             );
@@ -362,6 +432,8 @@ export function App() {
             publicIp={session.publicIp}
             focusSection={keysFocusSection}
             onConsumeFocusSection={() => setKeysFocusSection(null)}
+            initialUpdateStatus={systemUpdate}
+            onUpdateStatusChange={setSystemUpdate}
             onRefresh={() => loadAll()}
           />
         )}

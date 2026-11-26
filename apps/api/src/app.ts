@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
@@ -119,6 +120,32 @@ const MIME_TYPES: Record<string, string> = {
   ".json": "application/json; charset=utf-8",
   ".woff2": "font/woff2",
 };
+
+function readInstalledPackageVersion(): string | null {
+  const dir = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.resolve(dir, "..", "..", "..", "package.json"),
+    path.resolve(dir, "..", "package.json"),
+  ];
+  for (const pkgPath of candidates) {
+    try {
+      if (!fs.existsSync(pkgPath)) continue;
+      const parsed = JSON.parse(fs.readFileSync(pkgPath, "utf8")) as {
+        version?: unknown;
+      };
+      if (typeof parsed.version === "string" && parsed.version.trim()) {
+        return parsed.version.trim();
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+const ApplySystemUpdateBodySchema = z.object({
+  source: z.enum(["auto", "release", "git"]).optional(),
+});
 
 function toStatusCode(code: number): ContentfulStatusCode {
   if (code >= 400 && code <= 599) {
@@ -1413,6 +1440,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   // VPSAgent Self-Update (Owner-only + strict same-origin CSRF guard)
   // ---------------------------------------------------------------------------
 
+  const installedVersion = readInstalledPackageVersion();
   const unavailableUpdateStatus = {
     state: "idle" as const,
     phase: null,
@@ -1421,8 +1449,25 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       "The host Runtime Bridge needs a one-time update before dashboard updates can run. Re-run the installer once on your server.",
     repoDir: null,
     branch: null,
-    currentVersion: null,
+    updateSource: "none" as const,
+    releaseRepo: null,
+    releaseStatus: "unchecked" as const,
+    releaseNote: null,
+    installedFrom: "unknown" as const,
+    currentVersion: installedVersion,
+    currentReleaseTag: null,
     currentCommit: null,
+    latestVersion: null,
+    latestReleaseTag: null,
+    latestReleaseName: null,
+    latestReleaseUrl: null,
+    latestReleaseNotes: null,
+    latestReleasePublishedAt: null,
+    latestReleasePrerelease: false,
+    latestReleaseAssetName: null,
+    checksumAvailable: false,
+    checksumStatus: "none" as const,
+    checksumSha256: null,
     latestCommit: null,
     latestCommitSubject: null,
     latestCommitDate: null,
@@ -1443,7 +1488,12 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         return c.json({ status: unavailableUpdateStatus });
       }
       const status = await bridge.getCoreUpdateStatus();
-      return c.json({ status });
+      return c.json({
+        status: {
+          ...status,
+          currentVersion: status.currentVersion ?? installedVersion,
+        },
+      });
     } catch (err) {
       if (err instanceof RuntimeBridgeError && err.statusCode === 404) {
         return c.json({ status: unavailableUpdateStatus });
@@ -1463,7 +1513,12 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         return c.json({ status: unavailableUpdateStatus });
       }
       const status = await bridge.checkCoreUpdate();
-      return c.json({ status });
+      return c.json({
+        status: {
+          ...status,
+          currentVersion: status.currentVersion ?? installedVersion,
+        },
+      });
     } catch (err) {
       if (err instanceof RuntimeBridgeError && err.statusCode === 404) {
         return c.json({ status: unavailableUpdateStatus });
@@ -1485,13 +1540,34 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
           501,
         );
       }
-      const result = await bridge.applyCoreUpdate();
+      let applyInput: { source?: "auto" | "release" | "git" | undefined } | undefined;
+      const rawBody = await c.req.text();
+      if (rawBody.trim()) {
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(rawBody);
+        } catch {
+          return c.json({ error: "Invalid JSON body." }, 400);
+        }
+        const parsedBody = ApplySystemUpdateBodySchema.parse(parsedJson);
+        if (parsedBody.source !== undefined) {
+          applyInput = { source: parsedBody.source };
+        }
+      }
+      const result = await bridge.applyCoreUpdate(applyInput);
+      const releaseSummary =
+        result.status.updateSource === "release" &&
+        result.status.latestReleaseTag
+          ? `Started VPSAgent self-update to release ${result.status.latestReleaseTag}`
+          : null;
       store.recordAudit({
         actor: "user",
         action: "system.update_started",
-        summary: result.status.branch
-          ? `Started VPSAgent self-update from branch ${result.status.branch}`
-          : "Started VPSAgent self-update",
+        summary:
+          releaseSummary ??
+          (result.status.branch
+            ? `Started VPSAgent self-update from branch ${result.status.branch}`
+            : "Started VPSAgent self-update"),
         riskLevel: "high",
       });
       return c.json(result, 202);

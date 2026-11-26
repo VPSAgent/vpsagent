@@ -305,6 +305,30 @@ EOF
   cp "${SCRIPT_DIR}/caddy/apps.d/00-default.caddy" "${VPSAGENT_ROOT}/caddy/apps.d/00-default.caddy"
   write_core_caddy_route
   install -m 0750 "${SCRIPT_DIR}/runtime-bridge.py" "${VPSAGENT_ROOT}/runtime-bridge.py"
+  ACTIVE_SOURCE_ROOT="${VPSAGENT_ROOT}" ACTIVE_SOURCE_REPO="${REPO_ROOT}" python3 - <<'PY'
+import datetime
+import json
+import os
+
+root = os.environ["ACTIVE_SOURCE_ROOT"]
+repo = os.path.abspath(os.environ["ACTIVE_SOURCE_REPO"])
+path = os.path.join(root, "active-source.json")
+if os.path.islink(path):
+    raise SystemExit(f"Refusing to overwrite symlink {path}")
+tmp_path = os.path.join(root, f".active-source.json.tmp.{os.getpid()}")
+with open(tmp_path, "w", encoding="utf-8") as fh:
+    json.dump(
+        {
+            "repoDir": repo,
+            "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        },
+        fh,
+        indent=2,
+    )
+    fh.write("\n")
+os.chmod(tmp_path, 0o644)
+os.replace(tmp_path, path)
+PY
 }
 
 configure_runtime_bridge_service() {
@@ -368,6 +392,7 @@ detect_tailscale_info() {
   TAILSCALE_HTTPS_CERTS="false"
   TAILSCALE_SERVE_URL=""
   TAILSCALE_SERVE_CONFLICT=""
+  TAILSCALE_FUNNEL_ACTIVE="false"
 
   if ! command -v tailscale >/dev/null 2>&1; then
     return
@@ -387,6 +412,65 @@ detect_tailscale_info() {
 import ipaddress
 import json
 import os
+import re
+from urllib.parse import urlsplit
+
+KNOWN_TOKEN_RE = re.compile(
+    r"\b(sk-ant-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{10,}|github_pat_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{20,}|vpsmcp_[A-Za-z0-9_-]{16,}|tskey-[a-z]+-[A-Za-z0-9_-]{8,})\b"
+)
+
+
+def sanitize_proxy_display(raw):
+    cleaned = raw.strip()
+    if not cleaned:
+        return ""
+    try:
+        parts = urlsplit(cleaned)
+    except ValueError:
+        parts = None
+    if parts is not None and parts.scheme and parts.netloc:
+        has_userinfo = (
+            parts.username is not None
+            or parts.password is not None
+            or "@" in parts.netloc
+        )
+        try:
+            hostname = parts.hostname
+            port = parts.port
+        except ValueError:
+            hostname = None
+            port = None
+        if hostname:
+            host_part = f"[{hostname}]" if ":" in hostname else hostname
+            host_port = f"{host_part}:{port}" if port is not None else host_part
+        else:
+            host_port = parts.netloc.rsplit("@", 1)[-1]
+        prefix = "[REDACTED]@" if has_userinfo else ""
+        sanitized = f"{parts.scheme}://{prefix}{host_port}{parts.path}"
+        return KNOWN_TOKEN_RE.sub("[REDACTED]", sanitized)
+    fallback = re.sub(
+        r"([A-Za-z][A-Za-z0-9+.-]*://)[^/@\s]+@",
+        r"\1[REDACTED]@",
+        cleaned,
+    )
+    fallback = re.split(r"[?#]", fallback, maxsplit=1)[0]
+    return KNOWN_TOKEN_RE.sub("[REDACTED]", fallback)
+
+
+def is_matching_root_target(val):
+    return val.strip().rstrip("/").lower() in (
+        "http://127.0.0.1:3001",
+        "http://localhost:3001",
+    )
+
+
+def is_matching_mcp_target(val):
+    # Tailscale strips explicit mount prefixes before forwarding, so /mcp needs an upstream /mcp path.
+    return val.strip().lower() in (
+        "http://127.0.0.1:3001/mcp",
+        "http://localhost:3001/mcp",
+    )
+
 
 try:
     st = json.loads(os.environ.get("TS_STATUS_JSON") or "{}")
@@ -426,6 +510,7 @@ https_certs = (
 
 serve_url = ""
 serve_conflict = ""
+funnel_active = False
 raw_serve = os.environ.get("TS_SERVE_JSON") or ""
 if raw_serve.strip():
     try:
@@ -433,13 +518,26 @@ if raw_serve.strip():
     except Exception:
         sv = {}
     web = sv.get("Web") if isinstance(sv, dict) else None
+    allow_funnel = sv.get("AllowFunnel") if isinstance(sv, dict) else None
+    candidate_keys = []
     if isinstance(web, dict):
-        candidate_keys = []
         if raw_dns and f"{raw_dns}:443" in web:
             candidate_keys.append(f"{raw_dns}:443")
         for k in web:
             if isinstance(k, str) and k.endswith(":443") and k not in candidate_keys:
                 candidate_keys.append(k)
+    if isinstance(allow_funnel, dict):
+        for fk, fv in allow_funnel.items():
+            if bool(fv) is True and isinstance(fk, str) and (
+                fk in candidate_keys or fk.endswith(":443")
+            ):
+                funnel_active = True
+                break
+    if isinstance(web, dict):
+        root_matched = False
+        other_proxy = ""
+        mcp_conflict = ""
+        any_handler_key = ""
         for k in candidate_keys:
             entry = web.get(k)
             if not isinstance(entry, dict):
@@ -447,35 +545,43 @@ if raw_serve.strip():
             handlers = entry.get("Handlers")
             if not isinstance(handlers, dict):
                 continue
+            if handlers and not any_handler_key:
+                any_handler_key = k
             root_h = handlers.get("/")
             if isinstance(root_h, dict):
                 proxy = root_h.get("Proxy")
                 if isinstance(proxy, str) and proxy.strip():
                     cleaned = proxy.strip()
-                    if cleaned.rstrip("/").lower() in (
-                        "http://127.0.0.1:3001",
-                        "http://localhost:3001",
-                    ):
-                        if raw_dns:
-                            serve_url = f"https://{raw_dns}"
-                    elif not serve_conflict:
-                        serve_conflict = cleaned
-                elif not serve_conflict:
-                    serve_conflict = f"existing handler on {k}"
+                    if is_matching_root_target(cleaned):
+                        root_matched = True
+                    elif not other_proxy:
+                        other_proxy = sanitize_proxy_display(cleaned)
+                elif not other_proxy:
+                    other_proxy = f"existing handler on {k}"
             mcp_h = handlers.get("/mcp")
             if isinstance(mcp_h, dict):
                 mcp_proxy = mcp_h.get("Proxy")
                 if isinstance(mcp_proxy, str) and mcp_proxy.strip():
                     cleaned_mcp = mcp_proxy.strip()
-                    if cleaned_mcp.rstrip("/").lower() not in (
-                        "http://127.0.0.1:3001",
-                        "http://localhost:3001",
-                    ):
-                        serve_conflict = f"/mcp -> {cleaned_mcp}"
-                        serve_url = ""
-                else:
-                    serve_conflict = f"/mcp on {k}"
-                    serve_url = ""
+                    if not is_matching_mcp_target(cleaned_mcp):
+                        mcp_conflict = f"/mcp -> {sanitize_proxy_display(cleaned_mcp)}"
+                elif not mcp_conflict:
+                    mcp_conflict = f"/mcp on {k}"
+
+        if mcp_conflict:
+            serve_conflict = mcp_conflict
+            serve_url = ""
+        elif root_matched:
+            if funnel_active:
+                serve_url = ""
+            elif raw_dns:
+                serve_url = f"https://{raw_dns}"
+        elif other_proxy:
+            serve_conflict = other_proxy
+            serve_url = ""
+        elif any_handler_key:
+            serve_conflict = f"existing handler on {any_handler_key}"
+            serve_url = ""
 
 print(backend)
 print(ts_ip)
@@ -483,6 +589,7 @@ print(raw_dns)
 print(https_certs)
 print(serve_url)
 print(serve_conflict)
+print("true" if funnel_active else "false")
 PY
   )"
 
@@ -494,6 +601,7 @@ PY
       IFS= read -r TAILSCALE_HTTPS_CERTS || true
       IFS= read -r TAILSCALE_SERVE_URL || true
       IFS= read -r TAILSCALE_SERVE_CONFLICT || true
+      IFS= read -r TAILSCALE_FUNNEL_ACTIVE || true
     } <<< "${parsed_lines}"
   fi
 }
@@ -522,15 +630,22 @@ configure_tailscale() {
       log "Warning: Tailscale Serve port 443 is already forwarding to ${TAILSCALE_SERVE_CONFLICT}. Keeping your existing route; open AI Keys & Settings -> Tailscale private access if you want to replace it."
       return
     fi
-    if [[ -n "${TAILSCALE_SERVE_URL}" ]]; then
+    if [[ -n "${TAILSCALE_SERVE_URL}" && "${TAILSCALE_FUNNEL_ACTIVE}" != "true" ]]; then
       log "Tailscale private HTTPS is already active at ${TAILSCALE_SERVE_URL}."
       return
     fi
-    log "Enabling Tailscale private HTTPS (tailscale serve) for ${TAILSCALE_DNS_NAME}..."
+    if [[ "${TAILSCALE_FUNNEL_ACTIVE}" == "true" ]]; then
+      log "Public Tailscale Funnel is active on port 443; switching to private tailnet-only HTTPS (tailscale serve) for ${TAILSCALE_DNS_NAME}..."
+    else
+      log "Enabling Tailscale private HTTPS (tailscale serve) for ${TAILSCALE_DNS_NAME}..."
+    fi
     if ! tailscale serve --bg --https=443 http://127.0.0.1:3001 >/dev/null 2>&1; then
       log "Note: Could not enable Tailscale Serve automatically. Enable MagicDNS and HTTPS Certificates at https://login.tailscale.com/admin/dns, then click Enable private HTTPS in the dashboard."
     fi
     detect_tailscale_info
+    if [[ "${TAILSCALE_FUNNEL_ACTIVE}" == "true" ]]; then
+      log "Warning: Public Tailscale Funnel is still active on port 443. Run 'tailscale funnel --https=443 off' and then 'tailscale serve --bg --https=443 http://127.0.0.1:3001' to restrict access to your private tailnet."
+    fi
   fi
 }
 

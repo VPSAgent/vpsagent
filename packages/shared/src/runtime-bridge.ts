@@ -336,6 +336,36 @@ export type RuntimeCoreUpdateState = z.infer<
   typeof RuntimeCoreUpdateStateSchema
 >;
 
+export const RuntimeCoreUpdateSourceSchema = z.enum(["release", "git", "none"]);
+export type RuntimeCoreUpdateSource = z.infer<
+  typeof RuntimeCoreUpdateSourceSchema
+>;
+
+export const RuntimeReleaseStatusSchema = z.enum([
+  "unchecked",
+  "available",
+  "up_to_date",
+  "no_releases",
+  "unavailable",
+]);
+export type RuntimeReleaseStatus = z.infer<typeof RuntimeReleaseStatusSchema>;
+
+export const RuntimeInstalledFromSchema = z.enum([
+  "release",
+  "git",
+  "unknown",
+]);
+export type RuntimeInstalledFrom = z.infer<typeof RuntimeInstalledFromSchema>;
+
+export const RuntimeChecksumStatusSchema = z.enum([
+  "none",
+  "available",
+  "verified",
+  "not_provided",
+  "failed",
+]);
+export type RuntimeChecksumStatus = z.infer<typeof RuntimeChecksumStatusSchema>;
+
 export const RuntimeCoreUpdateStatusSchema = z.object({
   state: RuntimeCoreUpdateStateSchema,
   phase: z.string().nullable().default(null),
@@ -343,8 +373,25 @@ export const RuntimeCoreUpdateStatusSchema = z.object({
   unavailableReason: z.string().nullable().default(null),
   repoDir: z.string().nullable().default(null),
   branch: z.string().nullable().default(null),
+  updateSource: RuntimeCoreUpdateSourceSchema.default("none"),
+  releaseRepo: z.string().nullable().default(null),
+  releaseStatus: RuntimeReleaseStatusSchema.default("unchecked"),
+  releaseNote: z.string().nullable().default(null),
+  installedFrom: RuntimeInstalledFromSchema.default("unknown"),
   currentVersion: z.string().nullable().default(null),
+  currentReleaseTag: z.string().nullable().default(null),
   currentCommit: z.string().nullable().default(null),
+  latestVersion: z.string().nullable().default(null),
+  latestReleaseTag: z.string().nullable().default(null),
+  latestReleaseName: z.string().nullable().default(null),
+  latestReleaseUrl: z.string().nullable().default(null),
+  latestReleaseNotes: z.string().nullable().default(null),
+  latestReleasePublishedAt: z.string().nullable().default(null),
+  latestReleasePrerelease: z.boolean().default(false),
+  latestReleaseAssetName: z.string().nullable().default(null),
+  checksumAvailable: z.boolean().default(false),
+  checksumStatus: RuntimeChecksumStatusSchema.default("none"),
+  checksumSha256: z.string().nullable().default(null),
   latestCommit: z.string().nullable().default(null),
   latestCommitSubject: z.string().nullable().default(null),
   latestCommitDate: z.string().nullable().default(null),
@@ -361,6 +408,10 @@ export const RuntimeCoreUpdateStatusSchema = z.object({
 export type RuntimeCoreUpdateStatus = z.infer<
   typeof RuntimeCoreUpdateStatusSchema
 >;
+
+export interface RuntimeCoreUpdateApplyInput {
+  source?: "auto" | "release" | "git" | undefined;
+}
 
 export const RuntimeCoreUpdateApplyResultSchema = z.object({
   ok: z.boolean(),
@@ -576,7 +627,9 @@ export interface RuntimeBridge {
   ): Promise<RuntimeDockerCleanupResult>;
   getCoreUpdateStatus?(): Promise<RuntimeCoreUpdateStatus>;
   checkCoreUpdate?(): Promise<RuntimeCoreUpdateStatus>;
-  applyCoreUpdate?(): Promise<RuntimeCoreUpdateApplyResult>;
+  applyCoreUpdate?(
+    input?: RuntimeCoreUpdateApplyInput,
+  ): Promise<RuntimeCoreUpdateApplyResult>;
   getTailscaleStatus?(): Promise<RuntimeTailscaleStatus>;
   setTailscaleServe?(
     input: RuntimeTailscaleServeInput,
@@ -1264,6 +1317,15 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       unavailableReason: parsed.unavailableReason
         ? redactSecrets(parsed.unavailableReason)
         : null,
+      releaseNote: parsed.releaseNote
+        ? redactSecrets(parsed.releaseNote)
+        : null,
+      latestReleaseName: parsed.latestReleaseName
+        ? redactSecrets(parsed.latestReleaseName)
+        : null,
+      latestReleaseNotes: parsed.latestReleaseNotes
+        ? redactSecrets(parsed.latestReleaseNotes)
+        : null,
       latestCommitSubject: parsed.latestCommitSubject
         ? redactSecrets(parsed.latestCommitSubject)
         : null,
@@ -1293,11 +1355,17 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
     return this.sanitizeUpdateStatus(RuntimeCoreUpdateStatusSchema.parse(raw));
   }
 
-  async applyCoreUpdate(): Promise<RuntimeCoreUpdateApplyResult> {
+  async applyCoreUpdate(
+    input?: RuntimeCoreUpdateApplyInput,
+  ): Promise<RuntimeCoreUpdateApplyResult> {
+    const source =
+      input?.source !== undefined
+        ? z.enum(["auto", "release", "git"]).parse(input.source)
+        : undefined;
     const raw = await this.requestJson(
       "POST",
       "/v1/core/update/apply",
-      {},
+      source !== undefined ? { source } : {},
       SHORT_TIMEOUT_MS,
     );
     const parsed = RuntimeCoreUpdateApplyResultSchema.parse(raw);
