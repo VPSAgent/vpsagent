@@ -70,6 +70,8 @@ describe("Dashboard env-utils", () => {
       'API_URL="https://example.test" # staging',
       "SINGLE='value # with hash' # trailing comment",
       "MAIL_FROM='O\\'Brien' # escaped apostrophe",
+      "ASSET_DIR='C:\\assets\\'",
+      "WIN_COMMENT='C:\\assets\\' # Windows path '",
       'ESCAPED="say \\"hello\\" # kept" # note',
     ].join("\n");
     const parsed = parseEnvBlock(raw);
@@ -80,6 +82,8 @@ describe("Dashboard env-utils", () => {
         ["API_URL", "https://example.test"],
         ["SINGLE", "value # with hash"],
         ["MAIL_FROM", "O'Brien"],
+        ["ASSET_DIR", "C:\\assets\\"],
+        ["WIN_COMMENT", "C:\\assets\\"],
         ["ESCAPED", 'say "hello" # kept'],
       ],
     );

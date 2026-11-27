@@ -103,9 +103,16 @@ function parseQuotedEnvValue(
     while (i < rawVal.length) {
       const ch = rawVal[i]!;
       if (ch === "\\" && i + 1 < rawVal.length && rawVal[i + 1] === "'") {
-        decoded += "'";
-        i += 2;
-        continue;
+        const afterQuote = rawVal.slice(i + 2);
+        const afterTrimmed = afterQuote.trim();
+        const isClosingQuote =
+          afterTrimmed.length === 0 ||
+          (/^\s+#/.test(afterQuote) && afterTrimmed.startsWith("#"));
+        if (!isClosingQuote) {
+          decoded += "'";
+          i += 2;
+          continue;
+        }
       }
       if (ch === "'") {
         const suffix = rawVal.slice(i + 1).trim();

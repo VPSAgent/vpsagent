@@ -479,6 +479,96 @@ describe("App env workflow & build-time public buildArgs", () => {
         },
       );
       expect(runtimeEditRes.status).toBe(200);
+
+      // Include in build rejects a secret-marked multiline NEXT_PUBLIC_* value with 400 and leaves flag unchanged
+      store.setAppEnvVars("saas-web", [
+        { key: "NEXT_PUBLIC_SECRET_MULTI", value: "row1\nrow2", isSecret: true },
+      ]);
+      const badVisRes = await app.request(
+        "http://127.0.0.1/api/apps/saas-web/env/NEXT_PUBLIC_SECRET_MULTI/visibility",
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({ isSecret: false }),
+        },
+      );
+      expect(badVisRes.status).toBe(400);
+      expect(
+        store
+          .listAppEnvVars("saas-web")
+          .find((e) => e.key === "NEXT_PUBLIC_SECRET_MULTI")?.isSecret,
+      ).toBe(true);
+
+      // Launching a Git app with >64 public build vars returns HTTP 400 (not 500)
+      const tooManyPublicEnv: Record<string, string> = {};
+      for (let i = 1; i <= 65; i += 1) {
+        tooManyPublicEnv[`VITE_SETTING_${i}`] = `val-${i}`;
+      }
+      const tooManyRes = await app.request(
+        "http://127.0.0.1/api/apps?async=true",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({
+            slug: "too-many-vars",
+            name: "Too Many Vars",
+            sourceType: "git",
+            gitRepoUrl: "https://github.com/acme/too-many-vars",
+            envVars: tooManyPublicEnv,
+          }),
+        },
+      );
+      expect(tooManyRes.status).toBe(400);
+      expect(store.getApp("too-many-vars")).toBeNull();
+
+      // Existing app with a legacy public-prefixed companion alias can still update settings/env/rebuild,
+      // while its companion DB URL is strictly excluded from Docker buildArgs!
+      store.upsertApp({
+        slug: "legacy-db-app",
+        name: "Legacy DB App",
+        sourceType: "git",
+        image: "vpsagent-app-legacy-db-app:latest",
+        gitRepoUrl: "https://github.com/acme/legacy-db-app",
+        gitBranch: "main",
+        dockerfilePath: "auto",
+        domain: null,
+        folderPath: path.join(appsRoot, "legacy-db-app"),
+        internalPort: 3000,
+        status: "running",
+        cpuLimit: "0.5",
+        memoryLimitMb: 512,
+        companions: [{ type: "postgres", envKey: "NEXT_PUBLIC_DB_URL" }],
+      });
+      store.setAppEnvVars("legacy-db-app", [
+        {
+          key: "NEXT_PUBLIC_DB_URL",
+          value: "postgresql://user:supersecret@postgres:5432/db",
+          isSecret: false,
+        },
+        { key: "NEXT_PUBLIC_SITE", value: "https://legacy.test", isSecret: false },
+      ]);
+      const legacySettingsRes = await app.request(
+        "http://127.0.0.1/api/apps/legacy-db-app",
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({ memoryLimitMb: 1024 }),
+        },
+      );
+      expect(legacySettingsRes.status).toBe(200);
+      const legacyRebuildRes = await app.request(
+        "http://127.0.0.1/api/apps/legacy-db-app/rebuild",
+        {
+          method: "POST",
+          headers: { cookie },
+        },
+      );
+      expect(legacyRebuildRes.status).toBe(200);
+      const legacyBuildCall = buildCalls.find((c) => c.slug === "legacy-db-app");
+      expect(legacyBuildCall?.buildArgs).toEqual({
+        NEXT_PUBLIC_SITE: "https://legacy.test",
+      });
+      expect(legacyBuildCall?.buildArgs).not.toHaveProperty("NEXT_PUBLIC_DB_URL");
     } finally {
       store.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });

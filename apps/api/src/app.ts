@@ -1591,20 +1591,11 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     try {
       const slug = c.req.param("slug");
       const key = c.req.param("key");
-      const appRecord = store.getApp(slug);
-      if (!appRecord) {
-        return c.json({ error: "App not found." }, 404);
-      }
       const { isSecret } = z
         .object({ isSecret: z.boolean() })
         .parse(await c.req.json());
-      const updated = store.setAppEnvVarSecretFlag(slug, key, isSecret);
-      if (!updated) {
-        return c.json({ error: `Setting "${key}" not found.` }, 404);
-      }
-      const isBuildTime = isBuildTimePublicEnvKey(key);
-      const changedBuildTimeKeys = isBuildTime ? [key] : [];
-      const needsRebuild = appRecord.sourceType === "git" && isBuildTime;
+      const { app: appRecord, needsRebuild, changedBuildTimeKeys } =
+        await executor.setAppEnvVisibility(slug, key, isSecret, "user");
       return c.json({
         app: appRecord,
         envVars: store.listAppEnvVars(slug),

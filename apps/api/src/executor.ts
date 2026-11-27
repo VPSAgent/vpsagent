@@ -5,6 +5,7 @@ import {
   type Actor,
   type AppRecord,
   AppSourceTypeSchema,
+  type CompanionService,
   CompanionServiceSchema,
   type DeploymentRecord,
   type GithubRepoSummary,
@@ -37,6 +38,65 @@ import {
 } from "@vpsagent/shared";
 import { listGithubReposForToken } from "./github.js";
 import type { NotificationService } from "./notifications.js";
+
+const BASE_COMPANION_CREDENTIAL_KEYS = [
+  "DATABASE_URL",
+  "REDIS_URL",
+  "POSTGRES_PASSWORD",
+  "REDIS_PASSWORD",
+] as const;
+
+function getCompanionCredentialKeys(companions: CompanionService[]): Set<string> {
+  const keys = new Set<string>(BASE_COMPANION_CREDENTIAL_KEYS);
+  for (const comp of companions) {
+    if (comp.envKey) {
+      keys.add(comp.envKey);
+    }
+  }
+  return keys;
+}
+
+function assertSafeNewCompanionEnvKeys(
+  nextCompanions: CompanionService[],
+  existingCompanions: CompanionService[],
+): void {
+  const existingByType = new Map(existingCompanions.map((c) => [c.type, c.envKey]));
+  for (const comp of nextCompanions) {
+    if (!comp.envKey) continue;
+    const prevKey = existingByType.get(comp.type);
+    if (prevKey === comp.envKey) {
+      // Allow unchanged legacy companion aliases so existing apps can still be maintained.
+      continue;
+    }
+    if (isBuildTimePublicEnvKey(comp.envKey)) {
+      throw new RuntimeBridgeError(
+        400,
+        `Companion envKey "${comp.envKey}" cannot use a public frontend prefix (database credentials must stay server-side).`,
+      );
+    }
+  }
+}
+
+function extractBuildArgsOr400(
+  envMap: Record<string, string>,
+  companions: CompanionService[],
+): Record<string, string> {
+  const blocked = getCompanionCredentialKeys(companions);
+  const filtered: Record<string, string> = {};
+  for (const [k, v] of Object.entries(envMap)) {
+    if (!blocked.has(k)) {
+      filtered[k] = v;
+    }
+  }
+  try {
+    return extractBuildTimePublicEnvVars(filtered);
+  } catch (err) {
+    throw new RuntimeBridgeError(
+      400,
+      err instanceof Error ? err.message : "Invalid build-time public variables.",
+    );
+  }
+}
 
 export const DeployAppInputSchema = z.object({
   slug: z.string().min(2).max(48),
@@ -724,6 +784,10 @@ export class AppExecutor {
       delete mergedUserEnv.APP_SLUG;
       delete mergedUserEnv.APP_PORT;
 
+      // Reject any newly configured or changed companion alias with a public frontend prefix
+      // while allowing unchanged legacy aliases to keep existing apps maintainable.
+      assertSafeNewCompanionEnvKeys(input.companions, existing?.companions ?? []);
+
       // Validate the full blueprint AND the 64 KiB .env size cap BEFORE mutating SQLite or disk!
       const blueprint = generateApartmentBlueprint({
         slug,
@@ -749,6 +813,13 @@ export class AppExecutor {
         },
       });
 
+      const existingSecretFlags = new Map<string, boolean>(
+        existing
+          ? this.store.listAppEnvVars(slug).map((e) => [e.key, e.isSecret])
+          : [],
+      );
+      const companionCredKeys = getCompanionCredentialKeys(blueprint.companions);
+
       // Validate prospective Git build-time public vars BEFORE writing blueprint or creating
       // the app/deployment so invalid multiline or oversized public vars fail synchronously
       // with HTTP 400 and the dashboard Launch form retains the user's draft.
@@ -759,7 +830,7 @@ export class AppExecutor {
               ...input.envVars,
             }
           : { ...input.envVars };
-        extractBuildTimePublicEnvVars(prospectivePublicBuildEnv);
+        extractBuildArgsOr400(prospectivePublicBuildEnv, blueprint.companions);
       }
 
       const appDir = resolveScopedAppDir(this.appsRoot, slug);
@@ -789,10 +860,24 @@ export class AppExecutor {
       });
 
       const envToStore = Object.entries(blueprint.envVars).map(
-        ([key, value]) => ({
-          key,
-          value,
-        }),
+        ([key, value]) => {
+          const isExplicitlyUpdated = Object.prototype.hasOwnProperty.call(
+            input.envVars,
+            key,
+          );
+          const preservedSecret =
+            !isExplicitlyUpdated && existingSecretFlags.has(key)
+              ? existingSecretFlags.get(key)
+              : undefined;
+          const isSecret = companionCredKeys.has(key)
+            ? true
+            : preservedSecret;
+          return {
+            key,
+            value,
+            ...(isSecret !== undefined ? { isSecret } : {}),
+          };
+        },
       );
       if (envToStore.length > 0) {
         this.store.setAppEnvVars(slug, envToStore);
@@ -834,8 +919,9 @@ export class AppExecutor {
                 ? "Cloning private GitHub repository and building image..."
                 : "Cloning GitHub repository and building image...",
             });
-            const buildArgs = extractBuildTimePublicEnvVars(
+            const buildArgs = extractBuildArgsOr400(
               this.store.getAppPublicEnvMapForBuild(slug),
+              blueprint.companions,
             );
             const { value: buildRes, usedCredentialId } =
               await this.runGitWithCandidates(
@@ -1202,8 +1288,9 @@ export class AppExecutor {
                 ? "Re-cloning private GitHub repository and rebuilding image..."
                 : "Re-cloning GitHub repository and rebuilding image...",
             });
-            const buildArgs = extractBuildTimePublicEnvVars(
+            const buildArgs = extractBuildArgsOr400(
               this.store.getAppPublicEnvMapForBuild(slug),
+              existing.companions,
             );
             const { value: buildRes, usedCredentialId } =
               await this.runGitWithCandidates(
@@ -1475,7 +1562,7 @@ export class AppExecutor {
             candidatePublicBuildEnv[item.key] = item.value;
           }
         }
-        extractBuildTimePublicEnvVars(candidatePublicBuildEnv);
+        extractBuildArgsOr400(candidatePublicBuildEnv, existing.companions);
       }
 
       const blueprint = generateApartmentBlueprint({
@@ -1568,6 +1655,68 @@ export class AppExecutor {
     });
   }
 
+  async setAppEnvVisibility(
+    slugRaw: string,
+    keyRaw: string,
+    isSecret: boolean,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<{
+    app: AppRecord;
+    needsRebuild: boolean;
+    changedBuildTimeKeys: string[];
+  }> {
+    const slug = validateAppSlug(slugRaw);
+    const key = validateEnvKey(keyRaw);
+    const existing = this.store.getApp(slug);
+    if (!existing) {
+      throw new RuntimeBridgeError(404, `App "${slug}" not found.`);
+    }
+
+    return this.withSlugLock(slug, async () => {
+      const current = this.store.getApp(slug);
+      if (!current) {
+        throw new RuntimeBridgeError(404, `App "${slug}" not found.`);
+      }
+      const runtimeEnv = this.store.getAppEnvMapForRuntime(slug);
+      if (!Object.prototype.hasOwnProperty.call(runtimeEnv, key)) {
+        throw new RuntimeBridgeError(404, `Setting "${key}" not found.`);
+      }
+
+      const isBuildTime = isBuildTimePublicEnvKey(key);
+      if (!isSecret && isBuildTime && current.sourceType === "git") {
+        const companionCredKeys = getCompanionCredentialKeys(current.companions);
+        if (companionCredKeys.has(key)) {
+          throw new RuntimeBridgeError(
+            400,
+            `Setting "${key}" holds companion database credentials and cannot be included in frontend builds.`,
+          );
+        }
+        const prospectivePublicBuildEnv: Record<string, string> = {
+          ...this.store.getAppPublicEnvMapForBuild(slug),
+          [key]: runtimeEnv[key]!,
+        };
+        extractBuildArgsOr400(prospectivePublicBuildEnv, current.companions);
+      }
+
+      const updated = this.store.setAppEnvVarSecretFlag(slug, key, isSecret);
+      if (!updated) {
+        throw new RuntimeBridgeError(404, `Setting "${key}" not found.`);
+      }
+      this.store.recordAudit({
+        actor,
+        actorTokenId: actorTokenId ?? null,
+        action: "update_env_visibility",
+        targetSlug: slug,
+        summary: `Marked environment setting "${key}" as ${isSecret ? "secret" : "public"} for "${slug}"`,
+        riskLevel: "low",
+      });
+      const changedBuildTimeKeys = isBuildTime ? [key] : [];
+      const needsRebuild = current.sourceType === "git" && isBuildTime;
+      return { app: current, needsRebuild, changedBuildTimeKeys };
+    });
+  }
+
   async updateAppSettings(
     slugRaw: string,
     rawInput: UpdateAppSettingsInput,
@@ -1645,6 +1794,7 @@ export class AppExecutor {
       }
 
       const nextCompanions = input.companions ?? current.companions;
+      assertSafeNewCompanionEnvKeys(nextCompanions, current.companions);
       const currentEnv = this.store.getAppEnvMapForRuntime(slug);
       const userEnv = { ...currentEnv };
       delete userEnv.APP_SLUG;

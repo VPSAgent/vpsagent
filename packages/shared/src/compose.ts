@@ -4,7 +4,6 @@ import path from "node:path";
 import { z } from "zod";
 import {
   formatEnvFile,
-  isBuildTimePublicEnvKey,
   isForbiddenAppEnvKey,
   resolveScopedAppDir,
   validateAppSlug,
@@ -226,11 +225,6 @@ export function generateApartmentBlueprint(
       if (isForbiddenAppEnvKey(safeEnvKey)) {
         throw new Error(
           `Companion envKey "${safeEnvKey}" is reserved and cannot be used.`,
-        );
-      }
-      if (isBuildTimePublicEnvKey(safeEnvKey)) {
-        throw new Error(
-          `Companion envKey "${safeEnvKey}" cannot use a public frontend prefix (database credentials must stay server-side).`,
         );
       }
     }
