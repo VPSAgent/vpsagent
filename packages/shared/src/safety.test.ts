@@ -234,7 +234,6 @@ describe("safety validators and secret redaction", () => {
       VITE_APP_NAME: "MyApp",
       SUPABASE_SERVICE_ROLE_KEY: "super-secret",
       DATABASE_URL: "postgres://secret",
-      NEXT_PUBLIC_MULTILINE: "line1\nline2",
     });
     expect(extracted).toEqual({
       NEXT_PUBLIC_SUPABASE_ANON_KEY: "anon-123",
@@ -242,11 +241,18 @@ describe("safety validators and secret redaction", () => {
       VITE_APP_NAME: "MyApp",
     });
 
+    expect(() =>
+      extractBuildTimePublicEnvVars({
+        NEXT_PUBLIC_MULTILINE: "line1\nline2",
+      }),
+    ).toThrow(/cannot contain newlines/);
+
     const parsed = parseEnvBlock(
       [
         "# Comment line",
-        'export NEXT_PUBLIC_URL="https://example.com?a=1&b=2"',
-        "POLAR_SECRET='tok_#123'",
+        'export NEXT_PUBLIC_URL="https://example.com?a=1&b=2" # staging',
+        "POLAR_SECRET='tok_#123' # keep hash inside quotes",
+        'ESCAPED="say \\"hi\\" # kept" # trailing comment',
         "INLINE=hello # trailing comment",
         "BAD_LINE",
       ].join("\n"),
@@ -254,9 +260,10 @@ describe("safety validators and secret redaction", () => {
     expect(parsed.vars).toEqual([
       { key: "NEXT_PUBLIC_URL", value: "https://example.com?a=1&b=2" },
       { key: "POLAR_SECRET", value: "tok_#123" },
+      { key: "ESCAPED", value: 'say "hi" # kept' },
       { key: "INLINE", value: "hello" },
     ]);
     expect(parsed.errors).toHaveLength(1);
-    expect(parsed.errors[0]?.line).toBe(5);
+    expect(parsed.errors[0]?.line).toBe(6);
   });
 });

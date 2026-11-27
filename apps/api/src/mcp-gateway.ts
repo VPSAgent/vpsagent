@@ -2225,6 +2225,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
               const needsRebuild =
                 app.sourceType === "git" && changedBuildTimeKeys.length > 0;
               return {
+                ...app,
                 app,
                 needsRebuild,
                 ...(changedBuildTimeKeys.length > 0
@@ -2260,6 +2261,15 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           const appRecord = store.getApp(slug);
           if (!appRecord) {
             callResult = toolErr(`App "${slug}" not found.`);
+            break;
+          }
+          if (
+            token.scope === "approval-required" &&
+            store.getAppEnvRequest(slug) !== null
+          ) {
+            callResult = toolErr(
+              `App "${slug}" already has a pending Variables checklist. Under approval-required scope, ask the owner to complete or dismiss the existing checklist in the dashboard before replacing it.`,
+            );
             break;
           }
           const parsedReq = z

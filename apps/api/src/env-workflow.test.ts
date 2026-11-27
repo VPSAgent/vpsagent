@@ -201,10 +201,14 @@ describe("App env workflow & build-time public buildArgs", () => {
         companions: [],
       });
 
-      // Create MCP tokens (read-only & safe-auto-deploy)
+      // Create MCP tokens (read-only, approval-required, & safe-auto-deploy)
       const roToken = store.createMcpToken({
         name: "Reader",
         scope: "read-only",
+      });
+      const approvalToken = store.createMcpToken({
+        name: "Careful Agent",
+        scope: "approval-required",
       });
       const deployToken = store.createMcpToken({
         name: "Claude Builder",
@@ -277,6 +281,37 @@ describe("App env workflow & build-time public buildArgs", () => {
       expect(reqRes.data.rebuildRecommended).toBe(true);
       expect(String(reqRes.data.envSettingsUrl)).toContain("/#apps/saas-web/env");
 
+      // An approval-required pass cannot overwrite an existing pending checklist
+      const overwriteRes = await callMcp(
+        approvalToken.rawToken,
+        "request_app_env",
+        {
+          slug: "saas-web",
+          keys: [{ key: "OTHER_KEY" }],
+        },
+      );
+      expect(overwriteRes.isError).toBe(true);
+      expect(overwriteRes.text).toMatch(/already has a pending Variables checklist/i);
+
+      // Multiline build-time public vars fail clearly on save instead of being silently omitted
+      const multilineRes = await app.request(
+        "http://127.0.0.1/api/apps/saas-web/env",
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({
+            vars: [
+              {
+                key: "NEXT_PUBLIC_BANNER",
+                value: "Hello\nWorld",
+              },
+            ],
+            deleteKeys: [],
+          }),
+        },
+      );
+      expect(multilineRes.status).toBe(400);
+
       // Dashboard GET /api/apps/saas-web/env returns the pending checklist
       const getEnvRes = await app.request(
         "http://127.0.0.1/api/apps/saas-web/env",
@@ -312,6 +347,11 @@ describe("App env workflow & build-time public buildArgs", () => {
                 value: "sb_anon_public_123",
               },
               {
+                key: "NEXT_PUBLIC_SECRET_MARKED",
+                value: "do-not-bake-into-docker",
+                isSecret: true,
+              },
+              {
                 key: "SUPABASE_SERVICE_ROLE_KEY",
                 value: "sb_service_secret_999",
               },
@@ -334,10 +374,21 @@ describe("App env workflow & build-time public buildArgs", () => {
       expect(putEnvBody.changedBuildTimeKeys).toEqual([
         "NEXT_PUBLIC_SUPABASE_URL",
         "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+        "NEXT_PUBLIC_SECRET_MARKED",
       ]);
       expect(putEnvBody.envRequest).toBeNull();
 
-      // Rebuilding the Git app passes ONLY public build-time vars as buildArgs (never secrets!)
+      // MCP update_app_env preserves top-level slug alongside needsRebuild
+      const mcpUpdateRes = await callMcp(deployToken.rawToken, "update_app_env", {
+        slug: "saas-web",
+        vars: [{ key: "NEXT_PUBLIC_APP_ENV", value: "production" }],
+      });
+      expect(mcpUpdateRes.isError).toBe(false);
+      const mcpUpdateResult = mcpUpdateRes.data.result as Record<string, unknown>;
+      expect(mcpUpdateResult.slug).toBe("saas-web");
+      expect(mcpUpdateResult.needsRebuild).toBe(true);
+
+      // Rebuilding the Git app passes ONLY non-secret public build-time vars as buildArgs (never secrets!)
       const rebuildRes = await app.request(
         "http://127.0.0.1/api/apps/saas-web/rebuild",
         {
@@ -348,9 +399,13 @@ describe("App env workflow & build-time public buildArgs", () => {
       expect(rebuildRes.status).toBe(200);
       expect(buildCalls).toHaveLength(1);
       expect(buildCalls[0]?.buildArgs).toEqual({
+        NEXT_PUBLIC_APP_ENV: "production",
         NEXT_PUBLIC_SUPABASE_URL: "https://demo.supabase.co",
         NEXT_PUBLIC_SUPABASE_ANON_KEY: "sb_anon_public_123",
       });
+      expect(buildCalls[0]?.buildArgs).not.toHaveProperty(
+        "NEXT_PUBLIC_SECRET_MARKED",
+      );
       expect(buildCalls[0]?.buildArgs).not.toHaveProperty(
         "SUPABASE_SERVICE_ROLE_KEY",
       );

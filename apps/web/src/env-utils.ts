@@ -54,10 +54,77 @@ export interface ParsedEnvError {
   message: string;
 }
 
+function parseQuotedEnvValue(
+  rawVal: string,
+  lineNo: number,
+  key: string,
+): { value: string } | { error: string } {
+  const quote = rawVal[0];
+  if (quote === '"') {
+    let decoded = "";
+    let i = 1;
+    while (i < rawVal.length) {
+      const ch = rawVal[i]!;
+      if (ch === "\\") {
+        if (i + 1 >= rawVal.length) {
+          return {
+            error: `Line ${lineNo}: unterminated double-quoted value for "${key}".`,
+          };
+        }
+        const next = rawVal[i + 1]!;
+        if (next === "n") decoded += "\n";
+        else if (next === "r") decoded += "\r";
+        else if (next === "t") decoded += "\t";
+        else if (next === '"') decoded += '"';
+        else if (next === "\\") decoded += "\\";
+        else decoded += `\\${next}`;
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        const suffix = rawVal.slice(i + 1).trim();
+        if (suffix.length > 0 && !suffix.startsWith("#")) {
+          return {
+            error: `Line ${lineNo}: unexpected characters after closing quote for "${key}".`,
+          };
+        }
+        return { value: decoded };
+      }
+      decoded += ch;
+      i += 1;
+    }
+    return {
+      error: `Line ${lineNo}: unterminated double-quoted value for "${key}".`,
+    };
+  }
+  if (quote === "'") {
+    const closeIdx = rawVal.indexOf("'", 1);
+    if (closeIdx === -1) {
+      return {
+        error: `Line ${lineNo}: unterminated single-quoted value for "${key}".`,
+      };
+    }
+    const suffix = rawVal.slice(closeIdx + 1).trim();
+    if (suffix.length > 0 && !suffix.startsWith("#")) {
+      return {
+        error: `Line ${lineNo}: unexpected characters after closing quote for "${key}".`,
+      };
+    }
+    return { value: rawVal.slice(1, closeIdx) };
+  }
+  let unquoted = rawVal;
+  const commentIdx = unquoted.search(/\s+#/);
+  if (commentIdx >= 0) {
+    unquoted = unquoted.slice(0, commentIdx).trimEnd();
+  }
+  return { value: unquoted };
+}
+
 /**
  * Parses a multi-line `.env` block pasted by the user (or loaded from a `.env` file).
- * Supports comments (`#`), blank lines, optional `export ` prefix, single/double quotes,
- * and inline `#` comments on unquoted values. Later lines override earlier duplicates.
+ * Supports comments (`#`), blank lines, optional `export ` prefix, single/double quotes
+ * (including trailing `#` comments after the closing quote), and inline `#` comments on
+ * unquoted values. Later lines override earlier duplicates.
  */
 export function parseEnvBlock(rawText: string): {
   vars: ParsedEnvEntry[];
@@ -99,29 +166,13 @@ export function parseEnvBlock(rawText: string): {
       });
       continue;
     }
-    let rawVal = trimmed.slice(eqIdx + 1).trim();
-    let value: string;
-    if (rawVal.length >= 2 && rawVal.startsWith('"') && rawVal.endsWith('"')) {
-      value = rawVal
-        .slice(1, -1)
-        .replace(/\\n/g, "\n")
-        .replace(/\\r/g, "\r")
-        .replace(/\\t/g, "\t")
-        .replace(/\\"/g, '"')
-        .replace(/\\\\/g, "\\");
-    } else if (
-      rawVal.length >= 2 &&
-      rawVal.startsWith("'") &&
-      rawVal.endsWith("'")
-    ) {
-      value = rawVal.slice(1, -1);
-    } else {
-      const commentIdx = rawVal.search(/\s+#/);
-      if (commentIdx >= 0) {
-        rawVal = rawVal.slice(0, commentIdx).trimEnd();
-      }
-      value = rawVal;
+    const rawVal = trimmed.slice(eqIdx + 1).trim();
+    const parsedVal = parseQuotedEnvValue(rawVal, lineNo, key);
+    if ("error" in parsedVal) {
+      errors.push({ line: lineNo, message: parsedVal.error });
+      continue;
     }
+    const { value } = parsedVal;
     if (value.includes("\0")) {
       errors.push({
         line: lineNo,
@@ -141,4 +192,25 @@ export function parseEnvBlock(rawText: string): {
     })),
     errors,
   };
+}
+
+/**
+ * Appends `KEY=` template lines for missing keys that are NOT already present in the
+ * current bulk draft, preserving any values the user has already pasted.
+ */
+export function appendMissingKeysToEnvDraft(
+  currentDraft: string,
+  missingKeys: string[],
+): string {
+  const existingKeys = new Set(
+    parseEnvBlock(currentDraft).vars.map((entry) => entry.key),
+  );
+  const toAppend = missingKeys.filter((k) => !existingKeys.has(k));
+  if (toAppend.length === 0) {
+    return currentDraft;
+  }
+  const template = toAppend.map((k) => `${k}=`).join("\n");
+  return currentDraft.trim()
+    ? `${currentDraft.trimEnd()}\n${template}`
+    : template;
 }

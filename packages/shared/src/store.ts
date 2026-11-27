@@ -1156,6 +1156,23 @@ export class RegistryStore {
   }
 
   /**
+   * Internal build helper: returns ONLY non-secret (`is_secret = 0`) env vars so
+   * any variable explicitly marked as secret is never forwarded as a Docker `--build-arg`.
+   */
+  getAppPublicEnvMapForBuild(slug: string): Record<string, string> {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM app_env_vars WHERE app_slug = ? AND is_secret = 0 ORDER BY key ASC",
+      )
+      .all(slug) as unknown as AppEnvRow[];
+    const out: Record<string, string> = {};
+    for (const row of rows) {
+      out[row.key] = decryptValue(row.value_enc, this.encryptionKey);
+    }
+    return out;
+  }
+
+  /**
    * Stores a pending environment variable checklist requested by an AI agent so the
    * server owner can enter values (especially secrets) directly in the dashboard
    * without ever pasting secret values into chat.

@@ -175,6 +175,7 @@ export function AppsTab({
   const [changedBuildTimeKeys, setChangedBuildTimeKeys] = useState<string[]>(
     [],
   );
+  const [envSaving, setEnvSaving] = useState(false);
   const [inspectData, setInspectData] = useState<InspectResult | null>(null);
   const [editDomain, setEditDomain] = useState("");
   const [drawerLoading, setDrawerLoading] = useState(false);
@@ -755,9 +756,9 @@ export function AppsTab({
   const handleSaveEnvVars = async (
     vars: Array<{ key: string; value: string; isSecret?: boolean }>,
     options?: { rebuild?: boolean },
-  ) => {
-    if (!selectedSlug || vars.length === 0) return;
-    setDrawerLoading(true);
+  ): Promise<boolean> => {
+    if (!selectedSlug || vars.length === 0) return false;
+    setEnvSaving(true);
     setError(null);
     try {
       const res = await api.updateAppEnv(selectedSlug, vars);
@@ -782,16 +783,18 @@ export function AppsTab({
             : `Saved ${vars.length} settings for ${selectedSlug}.`,
         );
       }
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save settings.");
+      return false;
     } finally {
-      setDrawerLoading(false);
+      setEnvSaving(false);
     }
   };
 
   const handleDeleteEnv = async (key: string) => {
     if (!selectedSlug) return;
-    setDrawerLoading(true);
+    setEnvSaving(true);
     try {
       const res = await api.deleteAppEnv(selectedSlug, key);
       setEnvVars(res.envVars);
@@ -804,13 +807,13 @@ export function AppsTab({
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete setting.");
     } finally {
-      setDrawerLoading(false);
+      setEnvSaving(false);
     }
   };
 
   const handleDismissEnvRequest = async () => {
     if (!selectedSlug) return;
-    setDrawerLoading(true);
+    setEnvSaving(true);
     try {
       await api.dismissAppEnvRequest(selectedSlug);
       setEnvRequest(null);
@@ -819,7 +822,7 @@ export function AppsTab({
         err instanceof Error ? err.message : "Failed to dismiss checklist.",
       );
     } finally {
-      setDrawerLoading(false);
+      setEnvSaving(false);
     }
   };
 
@@ -1741,7 +1744,7 @@ export function AppsTab({
                         envVars={envVars}
                         missingEnvKeys={missingEnvKeys}
                         envRequest={envRequest}
-                        busy={drawerLoading || isBusy}
+                        busy={drawerLoading || envSaving || isBusy}
                         envNeedsRebuild={envNeedsRebuild}
                         changedBuildTimeKeys={changedBuildTimeKeys}
                         onSaveVars={handleSaveEnvVars}

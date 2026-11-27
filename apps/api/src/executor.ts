@@ -820,7 +820,9 @@ export class AppExecutor {
                 ? "Cloning private GitHub repository and building image..."
                 : "Cloning GitHub repository and building image...",
             });
-            const buildArgs = extractBuildTimePublicEnvVars(mergedUserEnv);
+            const buildArgs = extractBuildTimePublicEnvVars(
+              this.store.getAppPublicEnvMapForBuild(slug),
+            );
             const { value: buildRes, usedCredentialId } =
               await this.runGitWithCandidates(
                 validatedGitUrl,
@@ -1186,7 +1188,9 @@ export class AppExecutor {
                 ? "Re-cloning private GitHub repository and rebuilding image..."
                 : "Re-cloning GitHub repository and rebuilding image...",
             });
-            const buildArgs = extractBuildTimePublicEnvVars(userEnv);
+            const buildArgs = extractBuildTimePublicEnvVars(
+              this.store.getAppPublicEnvMapForBuild(slug),
+            );
             const { value: buildRes, usedCredentialId } =
               await this.runGitWithCandidates(
                 safeRepo,
@@ -1436,6 +1440,25 @@ export class AppExecutor {
       const userEnv = { ...candidateEnv };
       delete userEnv.APP_SLUG;
       delete userEnv.APP_PORT;
+
+      if (existing.sourceType === "git") {
+        // Validate non-secret public build-time env vars up front so multiline or oversized
+        // values fail clearly on save instead of breaking or being dropped during rebuild.
+        const candidatePublicBuildEnv: Record<string, string> = {
+          ...this.store.getAppPublicEnvMapForBuild(slug),
+        };
+        for (const delKey of validatedDeleteKeys) {
+          delete candidatePublicBuildEnv[delKey];
+        }
+        for (const item of validatedVars) {
+          if (item.isSecret === true) {
+            delete candidatePublicBuildEnv[item.key];
+          } else {
+            candidatePublicBuildEnv[item.key] = item.value;
+          }
+        }
+        extractBuildTimePublicEnvVars(candidatePublicBuildEnv);
+      }
 
       const blueprint = generateApartmentBlueprint({
         slug,

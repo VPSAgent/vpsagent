@@ -179,7 +179,8 @@ export function isBuildTimePublicEnvKey(key: string): boolean {
 /**
  * Extracts only safe, public build-time environment variables (e.g. `NEXT_PUBLIC_*`,
  * `VITE_*`) from an app's env map for forwarding as Docker `--build-arg`s.
- * Excludes any values containing null bytes or newlines and enforces count/size caps.
+ * Throws a clear error if a build-time public variable contains null bytes/newlines
+ * or if the total count/byte budget is exceeded, rather than silently omitting values.
  */
 export function extractBuildTimePublicEnvVars(
   envMap: Record<string, string>,
@@ -192,17 +193,24 @@ export function extractBuildTimePublicEnvVars(
       continue;
     }
     const value = envMap[key];
-    if (
-      typeof value !== "string" ||
-      value.includes("\0") ||
-      value.includes("\n") ||
-      value.includes("\r")
-    ) {
+    if (typeof value !== "string") {
       continue;
     }
+    if (value.includes("\0") || value.includes("\n") || value.includes("\r")) {
+      throw new Error(
+        `Build-time public variable "${key}" cannot contain newlines or null bytes.`,
+      );
+    }
     const entryBytes = Buffer.byteLength(`${key}=${value}\n`, "utf8");
-    if (count >= MAX_BUILD_ARGS || totalBytes + entryBytes > MAX_BUILD_ARGS_BYTES) {
-      break;
+    if (count >= MAX_BUILD_ARGS) {
+      throw new Error(
+        `Too many build-time public variables (max ${MAX_BUILD_ARGS}).`,
+      );
+    }
+    if (totalBytes + entryBytes > MAX_BUILD_ARGS_BYTES) {
+      throw new Error(
+        `Total size of build-time public variables exceeds ${MAX_BUILD_ARGS_BYTES} bytes (at "${key}").`,
+      );
     }
     out[key] = value;
     count += 1;
@@ -221,10 +229,77 @@ export interface ParsedEnvError {
   message: string;
 }
 
+function parseQuotedEnvValue(
+  rawVal: string,
+  lineNo: number,
+  key: string,
+): { value: string } | { error: string } {
+  const quote = rawVal[0];
+  if (quote === '"') {
+    let decoded = "";
+    let i = 1;
+    while (i < rawVal.length) {
+      const ch = rawVal[i]!;
+      if (ch === "\\") {
+        if (i + 1 >= rawVal.length) {
+          return {
+            error: `Line ${lineNo}: unterminated double-quoted value for "${key}".`,
+          };
+        }
+        const next = rawVal[i + 1]!;
+        if (next === "n") decoded += "\n";
+        else if (next === "r") decoded += "\r";
+        else if (next === "t") decoded += "\t";
+        else if (next === '"') decoded += '"';
+        else if (next === "\\") decoded += "\\";
+        else decoded += `\\${next}`;
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        const suffix = rawVal.slice(i + 1).trim();
+        if (suffix.length > 0 && !suffix.startsWith("#")) {
+          return {
+            error: `Line ${lineNo}: unexpected characters after closing quote for "${key}".`,
+          };
+        }
+        return { value: decoded };
+      }
+      decoded += ch;
+      i += 1;
+    }
+    return {
+      error: `Line ${lineNo}: unterminated double-quoted value for "${key}".`,
+    };
+  }
+  if (quote === "'") {
+    const closeIdx = rawVal.indexOf("'", 1);
+    if (closeIdx === -1) {
+      return {
+        error: `Line ${lineNo}: unterminated single-quoted value for "${key}".`,
+      };
+    }
+    const suffix = rawVal.slice(closeIdx + 1).trim();
+    if (suffix.length > 0 && !suffix.startsWith("#")) {
+      return {
+        error: `Line ${lineNo}: unexpected characters after closing quote for "${key}".`,
+      };
+    }
+    return { value: rawVal.slice(1, closeIdx) };
+  }
+  let unquoted = rawVal;
+  const commentIdx = unquoted.search(/\s+#/);
+  if (commentIdx >= 0) {
+    unquoted = unquoted.slice(0, commentIdx).trimEnd();
+  }
+  return { value: unquoted };
+}
+
 /**
  * Parses a multi-line `.env` text block into validated key/value pairs.
- * Supports `#` comments, blank lines, optional `export ` prefixes, single/double quotes,
- * and inline `#` comments on unquoted values. Later lines win on duplicate keys.
+ * Supports `#` comments, blank lines, optional `export ` prefixes, single/double quotes
+ * (including trailing `#` comments after the closing quote), and inline `#` comments on
+ * unquoted values. Later lines win on duplicate keys.
  */
 export function parseEnvBlock(rawText: string): {
   vars: ParsedEnvEntry[];
@@ -266,33 +341,13 @@ export function parseEnvBlock(rawText: string): {
       });
       continue;
     }
-    let rawVal = trimmed.slice(eqIdx + 1).trim();
-    let value: string;
-    if (
-      rawVal.length >= 2 &&
-      rawVal.startsWith('"') &&
-      rawVal.endsWith('"')
-    ) {
-      value = rawVal
-        .slice(1, -1)
-        .replace(/\\n/g, "\n")
-        .replace(/\\r/g, "\r")
-        .replace(/\\t/g, "\t")
-        .replace(/\\"/g, '"')
-        .replace(/\\\\/g, "\\");
-    } else if (
-      rawVal.length >= 2 &&
-      rawVal.startsWith("'") &&
-      rawVal.endsWith("'")
-    ) {
-      value = rawVal.slice(1, -1);
-    } else {
-      const commentIdx = rawVal.search(/\s+#/);
-      if (commentIdx >= 0) {
-        rawVal = rawVal.slice(0, commentIdx).trimEnd();
-      }
-      value = rawVal;
+    const rawVal = trimmed.slice(eqIdx + 1).trim();
+    const parsedVal = parseQuotedEnvValue(rawVal, lineNo, key);
+    if ("error" in parsedVal) {
+      errors.push({ line: lineNo, message: parsedVal.error });
+      continue;
     }
+    const { value } = parsedVal;
     if (value.includes("\0")) {
       errors.push({
         line: lineNo,

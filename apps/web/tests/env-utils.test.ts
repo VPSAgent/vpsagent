@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  appendMissingKeysToEnvDraft,
   isBuildTimePublicEnvKey,
   isLikelySecretEnvKey,
   parseEnvBlock,
@@ -60,6 +61,42 @@ describe("Dashboard env-utils", () => {
         ["SUPABASE_SERVICE_ROLE_KEY", "secret-with-#-and-spaces", false, true],
         ["POLAR_ACCESS_TOKEN", "polar_oat_12345", false, true],
         ["DUP_KEY", "second", false, true],
+      ],
+    );
+  });
+
+  it("preserves hashes inside quoted values and strips trailing comments after closing quotes", () => {
+    const raw = [
+      'API_URL="https://example.test" # staging',
+      "SINGLE='value # with hash' # trailing comment",
+      'ESCAPED="say \\"hello\\" # kept" # note',
+    ].join("\n");
+    const parsed = parseEnvBlock(raw);
+    assert.equal(parsed.errors.length, 0);
+    assert.deepEqual(
+      parsed.vars.map((v) => [v.key, v.value]),
+      [
+        ["API_URL", "https://example.test"],
+        ["SINGLE", "value # with hash"],
+        ["ESCAPED", 'say "hello" # kept'],
+      ],
+    );
+  });
+
+  it("appends only missing keys not already present in the bulk draft", () => {
+    const draft = "API_URL=https://example.test\n";
+    const next = appendMissingKeysToEnvDraft(draft, [
+      "API_URL",
+      "POLAR_ACCESS_TOKEN",
+      "SUPABASE_SERVICE_ROLE_KEY",
+    ]);
+    const parsed = parseEnvBlock(next);
+    assert.deepEqual(
+      parsed.vars.map((v) => [v.key, v.value]),
+      [
+        ["API_URL", "https://example.test"],
+        ["POLAR_ACCESS_TOKEN", ""],
+        ["SUPABASE_SERVICE_ROLE_KEY", ""],
       ],
     );
   });

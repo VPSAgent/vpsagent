@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Eye, EyeOff, FileUp, Layers, Plus, ShieldCheck, X } from "lucide-react";
 import type { AppEnvEntry, AppEnvRequest, AppRecord } from "../api";
 import {
+  appendMissingKeysToEnvDraft,
   isBuildTimePublicEnvKey,
   isLikelySecretEnvKey,
   parseEnvBlock,
@@ -18,7 +19,7 @@ interface AppEnvPanelProps {
   onSaveVars: (
     vars: Array<{ key: string; value: string; isSecret?: boolean }>,
     options?: { rebuild?: boolean },
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   onDeleteVar: (key: string) => Promise<void>;
   onDismissRequest: () => Promise<void>;
   onRebuild: () => Promise<void>;
@@ -130,7 +131,7 @@ export function AppEnvPanel({
 
   const handleBulkSave = async (rebuild: boolean) => {
     if (bulkParsed.vars.length === 0 || bulkParsed.errors.length > 0) return;
-    await onSaveVars(
+    const saved = await onSaveVars(
       bulkParsed.vars.map((v) => ({
         key: v.key,
         value: v.value,
@@ -138,14 +139,16 @@ export function AppEnvPanel({
       })),
       { rebuild },
     );
-    setBulkText("");
+    if (saved) {
+      setBulkText("");
+    }
   };
 
   const handleSingleSave = async (e: React.FormEvent, rebuild = false) => {
     e.preventDefault();
     const key = singleKey.trim();
     if (!key) return;
-    await onSaveVars(
+    const saved = await onSaveVars(
       [
         {
           key,
@@ -155,9 +158,11 @@ export function AppEnvPanel({
       ],
       { rebuild },
     );
-    setSingleKey("");
-    setSingleVal("");
-    setShowSingleVal(false);
+    if (saved) {
+      setSingleKey("");
+      setSingleVal("");
+      setShowSingleVal(false);
+    }
   };
 
   const handleChecklistAutoFill = () => {
@@ -190,14 +195,15 @@ export function AppEnvPanel({
 
   const handleChecklistSave = async (rebuild: boolean) => {
     if (filledChecklistEntries.length === 0) return;
-    await onSaveVars(filledChecklistEntries, { rebuild });
-    setChecklistValues({});
-    setChecklistPasteNote(null);
+    const saved = await onSaveVars(filledChecklistEntries, { rebuild });
+    if (saved) {
+      setChecklistValues({});
+      setChecklistPasteNote(null);
+    }
   };
 
   const handleFillMissingInBulk = () => {
-    const template = visibleMissingKeys.map((k) => `${k}=`).join("\n");
-    setBulkText((prev) => (prev.trim() ? `${prev.trimEnd()}\n${template}` : template));
+    setBulkText((prev) => appendMissingKeysToEnvDraft(prev, visibleMissingKeys));
     setEntryMode("bulk");
   };
 

@@ -3993,6 +3993,25 @@ class RuntimeService:
                     if line.strip()
                 ][-MAX_BUILD_LOG_LINES:]
 
+                if build_args and not used_auto_dockerfile:
+                    try:
+                        with open(real_dockerfile, "r", encoding="utf-8", errors="ignore") as dffh:
+                            custom_df_text = dffh.read(MAX_INSPECT_FILE_BYTES)
+                    except OSError:
+                        custom_df_text = ""
+                    missing_df_args = [
+                        k
+                        for k in sorted(build_args)
+                        if not re.search(rf"(?m)^\s*ARG\s+{re.escape(k)}(?:\s|=|$)", custom_df_text)
+                    ]
+                    if missing_df_args:
+                        log_tail = (
+                            log_tail
+                            + [
+                                f"[vpsagent] Note: custom Dockerfile does not declare ARG for {', '.join(missing_df_args)}. Add ARG lines to your build stage if your frontend needs them at build time."
+                            ]
+                        )[-MAX_BUILD_LOG_LINES:]
+
                 if build_proc.returncode != 0:
                     err_excerpt = log_tail[-1] if log_tail else "unknown Docker build error"
                     raise BridgeRequestError(
