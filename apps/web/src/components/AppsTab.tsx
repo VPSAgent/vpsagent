@@ -811,6 +811,33 @@ export function AppsTab({
     }
   };
 
+  const handleSetEnvVisibility = async (key: string, isSecret: boolean) => {
+    if (!selectedSlug) return;
+    setEnvSaving(true);
+    setError(null);
+    try {
+      const res = await api.setAppEnvVisibility(selectedSlug, key, isSecret);
+      setEnvVars(res.envVars);
+      setMissingEnvKeys(res.missingEnvKeys ?? []);
+      setEnvRequest(res.envRequest ?? null);
+      if (res.needsRebuild) {
+        setEnvNeedsRebuild(true);
+        setChangedBuildTimeKeys(res.changedBuildTimeKeys ?? [key]);
+      }
+      setNotice(
+        isSecret
+          ? `Marked ${key} as secret (excluded from builds).`
+          : `Enabled build-time forwarding for ${key}. Rebuild to bake it into your frontend.`,
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to update visibility.",
+      );
+    } finally {
+      setEnvSaving(false);
+    }
+  };
+
   const handleDismissEnvRequest = async () => {
     if (!selectedSlug) return;
     setEnvSaving(true);
@@ -1749,6 +1776,7 @@ export function AppsTab({
                         changedBuildTimeKeys={changedBuildTimeKeys}
                         onSaveVars={handleSaveEnvVars}
                         onDeleteVar={handleDeleteEnv}
+                        onSetVarVisibility={handleSetEnvVisibility}
                         onDismissRequest={handleDismissEnvRequest}
                         onRebuild={() => handleAction(app.slug, "rebuild")}
                         onClearRebuildBanner={() => {

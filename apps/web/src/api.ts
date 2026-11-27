@@ -818,6 +818,21 @@ export const api = {
     }>(`/api/apps/${encodeURIComponent(slug)}/env/${encodeURIComponent(key)}`, {
       method: "DELETE",
     }),
+  setAppEnvVisibility: (slug: string, key: string, isSecret: boolean) =>
+    apiFetch<{
+      app: AppRecord;
+      envVars: AppEnvEntry[];
+      missingEnvKeys: string[];
+      envRequest?: AppEnvRequest | null;
+      needsRebuild?: boolean;
+      changedBuildTimeKeys?: string[];
+    }>(
+      `/api/apps/${encodeURIComponent(slug)}/env/${encodeURIComponent(key)}/visibility`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ isSecret }),
+      },
+    ),
   dismissAppEnvRequest: (slug: string) =>
     apiFetch<{ ok: true; envRequest: null }>(
       `/api/apps/${encodeURIComponent(slug)}/env-request`,

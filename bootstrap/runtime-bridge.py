@@ -3993,6 +3993,10 @@ class RuntimeService:
                     if line.strip()
                 ][-MAX_BUILD_LOG_LINES:]
 
+                err_excerpt = (
+                    log_tail[-1] if log_tail else "unknown Docker build error"
+                )
+
                 if build_args and not used_auto_dockerfile:
                     try:
                         with open(real_dockerfile, "r", encoding="utf-8", errors="ignore") as dffh:
@@ -4013,7 +4017,6 @@ class RuntimeService:
                         )[-MAX_BUILD_LOG_LINES:]
 
                 if build_proc.returncode != 0:
-                    err_excerpt = log_tail[-1] if log_tail else "unknown Docker build error"
                     raise BridgeRequestError(
                         502,
                         _scrub_secret_values(

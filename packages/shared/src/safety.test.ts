@@ -252,6 +252,7 @@ describe("safety validators and secret redaction", () => {
         "# Comment line",
         'export NEXT_PUBLIC_URL="https://example.com?a=1&b=2" # staging',
         "POLAR_SECRET='tok_#123' # keep hash inside quotes",
+        "MAIL_FROM='O\\'Brien' # escaped apostrophe",
         'ESCAPED="say \\"hi\\" # kept" # trailing comment',
         "INLINE=hello # trailing comment",
         "BAD_LINE",
@@ -260,10 +261,11 @@ describe("safety validators and secret redaction", () => {
     expect(parsed.vars).toEqual([
       { key: "NEXT_PUBLIC_URL", value: "https://example.com?a=1&b=2" },
       { key: "POLAR_SECRET", value: "tok_#123" },
+      { key: "MAIL_FROM", value: "O'Brien" },
       { key: "ESCAPED", value: 'say "hi" # kept' },
       { key: "INLINE", value: "hello" },
     ]);
     expect(parsed.errors).toHaveLength(1);
-    expect(parsed.errors[0]?.line).toBe(6);
+    expect(parsed.errors[0]?.line).toBe(7);
   });
 });

@@ -410,6 +410,75 @@ describe("App env workflow & build-time public buildArgs", () => {
         "SUPABASE_SERVICE_ROLE_KEY",
       );
       expect(buildCalls[0]?.buildArgs).not.toHaveProperty("POLAR_ACCESS_TOKEN");
+
+      // Owner can explicitly opt a secret-marked NEXT_PUBLIC_* key into build-time forwarding
+      const visRes = await app.request(
+        "http://127.0.0.1/api/apps/saas-web/env/NEXT_PUBLIC_SECRET_MARKED/visibility",
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({ isSecret: false }),
+        },
+      );
+      expect(visRes.status).toBe(200);
+      const visBody = (await visRes.json()) as { needsRebuild: boolean };
+      expect(visBody.needsRebuild).toBe(true);
+      expect(store.getAppPublicEnvMapForBuild("saas-web")).toHaveProperty(
+        "NEXT_PUBLIC_SECRET_MARKED",
+      );
+
+      // Launching a new Git app with a multiline NEXT_PUBLIC_* var rejects synchronously with 400
+      const badLaunchRes = await app.request(
+        "http://127.0.0.1/api/apps?async=true",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({
+            slug: "bad-launch",
+            name: "Bad Launch",
+            sourceType: "git",
+            gitRepoUrl: "https://github.com/acme/bad-launch",
+            envVars: { NEXT_PUBLIC_BANNER: "Hello\nWorld" },
+          }),
+        },
+      );
+      expect(badLaunchRes.status).toBe(400);
+      expect(store.getApp("bad-launch")).toBeNull();
+
+      // Companion envKey with public frontend prefix is rejected to prevent leaking DB credentials
+      const badCompRes = await app.request(
+        "http://127.0.0.1/api/apps?async=true",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({
+            slug: "bad-comp",
+            name: "Bad Comp",
+            sourceType: "git",
+            gitRepoUrl: "https://github.com/acme/bad-comp",
+            companions: [{ type: "postgres", envKey: "NEXT_PUBLIC_DB_URL" }],
+          }),
+        },
+      );
+      expect(badCompRes.status).toBe(400);
+      expect(store.getApp("bad-comp")).toBeNull();
+
+      // Unrelated runtime env edits succeed even if a legacy multiline public var exists in DB
+      store.setAppEnvVars("saas-web", [
+        { key: "NEXT_PUBLIC_LEGACY_MULTI", value: "line1\nline2", isSecret: false },
+      ]);
+      const runtimeEditRes = await app.request(
+        "http://127.0.0.1/api/apps/saas-web/env",
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({
+            vars: [{ key: "LOG_LEVEL", value: "debug" }],
+            deleteKeys: [],
+          }),
+        },
+      );
+      expect(runtimeEditRes.status).toBe(200);
     } finally {
       store.close();
       fs.rmSync(tmpDir, { recursive: true, force: true });

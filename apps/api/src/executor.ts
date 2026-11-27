@@ -21,6 +21,7 @@ import {
   type RuntimeWriteFileResult,
   extractBuildTimePublicEnvVars,
   generateApartmentBlueprint,
+  isBuildTimePublicEnvKey,
   isGithubHttpsRepoUrl,
   parseGithubRepoOwnerAndName,
   redactSecrets,
@@ -748,6 +749,19 @@ export class AppExecutor {
         },
       });
 
+      // Validate prospective Git build-time public vars BEFORE writing blueprint or creating
+      // the app/deployment so invalid multiline or oversized public vars fail synchronously
+      // with HTTP 400 and the dashboard Launch form retains the user's draft.
+      if (input.sourceType === "git") {
+        const prospectivePublicBuildEnv: Record<string, string> = existing
+          ? {
+              ...this.store.getAppPublicEnvMapForBuild(slug),
+              ...input.envVars,
+            }
+          : { ...input.envVars };
+        extractBuildTimePublicEnvVars(prospectivePublicBuildEnv);
+      }
+
       const appDir = resolveScopedAppDir(this.appsRoot, slug);
       writeApartmentBlueprint(this.appsRoot, blueprint);
 
@@ -1441,9 +1455,13 @@ export class AppExecutor {
       delete userEnv.APP_SLUG;
       delete userEnv.APP_PORT;
 
-      if (existing.sourceType === "git") {
-        // Validate non-secret public build-time env vars up front so multiline or oversized
-        // values fail clearly on save instead of breaking or being dropped during rebuild.
+      const touchesPublicBuildVars = validatedVars.some(
+        (v) => isBuildTimePublicEnvKey(v.key) && v.isSecret !== true,
+      );
+      if (existing.sourceType === "git" && touchesPublicBuildVars) {
+        // Validate non-secret public build-time env vars when this edit modifies them so
+        // multiline/oversized public values fail clearly on save without blocking unrelated
+        // runtime-only edits on upgraded apps.
         const candidatePublicBuildEnv: Record<string, string> = {
           ...this.store.getAppPublicEnvMapForBuild(slug),
         };

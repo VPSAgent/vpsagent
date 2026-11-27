@@ -273,19 +273,30 @@ function parseQuotedEnvValue(
     };
   }
   if (quote === "'") {
-    const closeIdx = rawVal.indexOf("'", 1);
-    if (closeIdx === -1) {
-      return {
-        error: `Line ${lineNo}: unterminated single-quoted value for "${key}".`,
-      };
+    let decoded = "";
+    let i = 1;
+    while (i < rawVal.length) {
+      const ch = rawVal[i]!;
+      if (ch === "\\" && i + 1 < rawVal.length && rawVal[i + 1] === "'") {
+        decoded += "'";
+        i += 2;
+        continue;
+      }
+      if (ch === "'") {
+        const suffix = rawVal.slice(i + 1).trim();
+        if (suffix.length > 0 && !suffix.startsWith("#")) {
+          return {
+            error: `Line ${lineNo}: unexpected characters after closing quote for "${key}".`,
+          };
+        }
+        return { value: decoded };
+      }
+      decoded += ch;
+      i += 1;
     }
-    const suffix = rawVal.slice(closeIdx + 1).trim();
-    if (suffix.length > 0 && !suffix.startsWith("#")) {
-      return {
-        error: `Line ${lineNo}: unexpected characters after closing quote for "${key}".`,
-      };
-    }
-    return { value: rawVal.slice(1, closeIdx) };
+    return {
+      error: `Line ${lineNo}: unterminated single-quoted value for "${key}".`,
+    };
   }
   let unquoted = rawVal;
   const commentIdx = unquoted.search(/\s+#/);

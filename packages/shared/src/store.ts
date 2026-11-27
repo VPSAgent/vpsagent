@@ -1122,6 +1122,26 @@ export class RegistryStore {
     return Number(res.changes) > 0;
   }
 
+  /**
+   * Updates only the `is_secret` flag of an existing saved env var without exposing
+   * or altering its encrypted value (used e.g. to opt an upgraded `NEXT_PUBLIC_*`
+   * key into build-time forwarding with explicit owner consent).
+   */
+  setAppEnvVarSecretFlag(
+    slug: string,
+    key: string,
+    isSecret: boolean,
+  ): boolean {
+    const safeKey = validateEnvKey(key);
+    const now = new Date().toISOString();
+    const res = this.db
+      .prepare(
+        "UPDATE app_env_vars SET is_secret = ?, updated_at = ? WHERE app_slug = ? AND key = ?",
+      )
+      .run(isSecret ? 1 : 0, now, slug, safeKey);
+    return Number(res.changes) > 0;
+  }
+
   /** Returns masked env metadata safe for Dashboard and MCP responses (never plaintext). */
   listAppEnvVars(slug: string): AppEnvEntry[] {
     const rows = this.db

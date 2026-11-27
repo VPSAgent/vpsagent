@@ -69,6 +69,7 @@ describe("Dashboard env-utils", () => {
     const raw = [
       'API_URL="https://example.test" # staging',
       "SINGLE='value # with hash' # trailing comment",
+      "MAIL_FROM='O\\'Brien' # escaped apostrophe",
       'ESCAPED="say \\"hello\\" # kept" # note',
     ].join("\n");
     const parsed = parseEnvBlock(raw);
@@ -78,6 +79,7 @@ describe("Dashboard env-utils", () => {
       [
         ["API_URL", "https://example.test"],
         ["SINGLE", "value # with hash"],
+        ["MAIL_FROM", "O'Brien"],
         ["ESCAPED", 'say "hello" # kept'],
       ],
     );

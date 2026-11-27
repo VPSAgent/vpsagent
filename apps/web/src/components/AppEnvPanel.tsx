@@ -21,6 +21,7 @@ interface AppEnvPanelProps {
     options?: { rebuild?: boolean },
   ) => Promise<boolean>;
   onDeleteVar: (key: string) => Promise<void>;
+  onSetVarVisibility: (key: string, isSecret: boolean) => Promise<void>;
   onDismissRequest: () => Promise<void>;
   onRebuild: () => Promise<void>;
   onClearRebuildBanner: () => void;
@@ -36,6 +37,7 @@ export function AppEnvPanel({
   changedBuildTimeKeys,
   onSaveVars,
   onDeleteVar,
+  onSetVarVisibility,
   onDismissRequest,
   onRebuild,
   onClearRebuildBanner,
@@ -705,12 +707,26 @@ export function AppEnvPanel({
         )}
       </div>
 
+      {isGitApp &&
+        envVars.some(
+          (e) => isBuildTimePublicEnvKey(e.key) && e.isSecret,
+        ) && (
+          <div className="rounded-lg border border-warn-line bg-warn-soft px-3.5 py-2.5 text-xs text-warn">
+            Some saved <code>NEXT_PUBLIC_*</code> / <code>VITE_*</code>{" "}
+            variables are currently marked as <strong>Secret</strong> and are
+            skipped during frontend builds. Click{" "}
+            <strong>Include in build</strong> next to any public key below to
+            pass it into future rebuilds.
+          </div>
+        )}
+
       <div className="divide-y divide-line rounded-lg border border-line bg-canvas">
         {envVars.length === 0 ? (
           <p className="p-3.5 text-xs text-subtle">No saved settings yet.</p>
         ) : (
           envVars.map((entry) => {
             const isBuildTime = isBuildTimePublicEnvKey(entry.key);
+            const skippedSecretBuildVar = isGitApp && isBuildTime && entry.isSecret;
             return (
               <div
                 key={entry.key}
@@ -718,9 +734,14 @@ export function AppEnvPanel({
               >
                 <div className="min-w-0 [overflow-wrap:anywhere] flex flex-wrap items-center gap-2">
                   <span className="font-mono text-fg">{entry.key}</span>
-                  {isBuildTime && (
+                  {isBuildTime && !entry.isSecret && (
                     <span className="rounded bg-warn-soft px-1.5 py-0.5 text-[10px] font-medium text-warn">
                       Build-time
+                    </span>
+                  )}
+                  {skippedSecretBuildVar && (
+                    <span className="rounded border border-warn-line bg-warn-soft px-1.5 py-0.5 text-[10px] font-medium text-warn">
+                      Secret (skipped in build)
                     </span>
                   )}
                   <span className="font-mono text-subtle">
@@ -728,6 +749,16 @@ export function AppEnvPanel({
                   </span>
                 </div>
                 <div className="flex items-center gap-3 shrink-0">
+                  {skippedSecretBuildVar && (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void onSetVarVisibility(entry.key, false)}
+                      className="btn-press text-warn hover:underline cursor-pointer disabled:opacity-50"
+                    >
+                      Include in build
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => {
