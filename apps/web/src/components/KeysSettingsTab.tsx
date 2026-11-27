@@ -42,6 +42,7 @@ interface KeysSettingsTabProps {
   onResourceDisplayChange: (mode: ResourceDisplayMode) => void;
   focusSection?:
     | "general"
+    | "access"
     | "github"
     | "updates"
     | "alerts"
@@ -955,15 +956,11 @@ export function KeysSettingsTab({
                 </p>
               </div>
 
-              <div className="space-y-2">
-                <span className="block text-xs font-medium text-fg-2">
+              <fieldset className="space-y-2">
+                <legend className="block text-xs font-medium text-fg-2">
                   Resource usage style
-                </span>
-                <div
-                  role="radiogroup"
-                  aria-label="Resource usage style"
-                  className="grid grid-cols-1 sm:grid-cols-2 gap-3"
-                >
+                </legend>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {(
                     [
                       {
@@ -980,18 +977,22 @@ export function KeysSettingsTab({
                   ).map((option) => {
                     const selected = resourceDisplay === option.id;
                     return (
-                      <button
+                      <label
                         key={option.id}
-                        type="button"
-                        role="radio"
-                        aria-checked={selected}
-                        onClick={() => onResourceDisplayChange(option.id)}
-                        className={`btn-press rounded-lg border px-4 py-3 text-left cursor-pointer ${
+                        className={`btn-press block rounded-lg border px-4 py-3 text-left cursor-pointer has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-fg-2 has-[:focus-visible]:outline-offset-2 ${
                           selected
                             ? "border-fg bg-surface-2 text-fg"
                             : "border-line bg-well text-muted hover:text-fg hover:border-line-strong"
                         }`}
                       >
+                        <input
+                          type="radio"
+                          name="resource-display"
+                          value={option.id}
+                          checked={selected}
+                          onChange={() => onResourceDisplayChange(option.id)}
+                          className="sr-only"
+                        />
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-sm font-medium text-fg">
                             {option.title}
@@ -1003,11 +1004,11 @@ export function KeysSettingsTab({
                           />
                         </div>
                         <p className="mt-1 text-xs text-muted">{option.desc}</p>
-                      </button>
+                      </label>
                     );
                   })}
                 </div>
-              </div>
+              </fieldset>
             </section>
           )}
           {pane === "access" && (

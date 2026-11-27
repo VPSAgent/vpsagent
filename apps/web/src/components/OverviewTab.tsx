@@ -16,6 +16,7 @@ interface OverviewTabProps {
   resourceHistory?: ResourceSample[];
   onRefresh: () => void;
   onNavigateTab: (tab: "overview" | "apps" | "approvals" | "keys") => void;
+  onOpenAccessSettings?: () => void;
   onOpenApp?: (slug: string) => void;
 }
 
@@ -195,6 +196,7 @@ export function OverviewTab({
   resourceHistory = [],
   onRefresh,
   onNavigateTab,
+  onOpenAccessSettings,
   onOpenApp,
 }: OverviewTabProps) {
   if (!data) {
@@ -342,7 +344,11 @@ export function OverviewTab({
             action={
               <button
                 type="button"
-                onClick={() => onNavigateTab("keys")}
+                onClick={() =>
+                  onOpenAccessSettings
+                    ? onOpenAccessSettings()
+                    : onNavigateTab("keys")
+                }
                 className="btn-press text-xs text-muted hover:text-fg cursor-pointer"
               >
                 Manage access

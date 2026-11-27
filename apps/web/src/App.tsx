@@ -37,6 +37,7 @@ type AppDrawerSection =
   | "settings";
 type KeysFocusSection =
   | "general"
+  | "access"
   | "github"
   | "updates"
   | "alerts"
@@ -63,7 +64,7 @@ function parseAppDeepLink(hash: string): AppDeepLink | null {
 function parseKeysDeepLink(hash: string): KeysFocusSection | null {
   const match = hash
     .trim()
-    .match(/^#?\/?keys\/(general|github|updates|alerts|backups|account)$/i);
+    .match(/^#?\/?keys\/(general|access|github|updates|alerts|backups|account)$/i);
   return match ? (match[1]!.toLowerCase() as KeysFocusSection) : null;
 }
 
@@ -441,6 +442,10 @@ export function App() {
             resourceHistory={resourceHistory}
             onRefresh={() => void loadAll()}
             onNavigateTab={setTab}
+            onOpenAccessSettings={() => {
+              setKeysFocusSection("access");
+              setTab("keys");
+            }}
             onOpenApp={(slug) => {
               setDeepLink({ slug, section: "deployments" });
               setTab("apps");
