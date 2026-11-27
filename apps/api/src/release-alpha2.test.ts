@@ -1326,6 +1326,53 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
         bridge.getStatuses = origGetStatuses;
       }
 
+      // 8i-b. Older pending approvals stay counted & listed even after >100 newer resolved approvals
+      const olderPending = store.createApproval({
+        action: "deploy_app",
+        targetSlug: "older-pending-app",
+        summary: "Older pending deploy awaiting review",
+        payload: { slug: "older-pending-app" },
+        requestedBy: "TestAgent",
+        tokenScope: "approval-required",
+      });
+      await new Promise((r) => setTimeout(r, 5));
+      for (let i = 0; i < 105; i++) {
+        const newer = store.createApproval({
+          action: "rebuild_app",
+          targetSlug: "my-git-app",
+          summary: `Resolved approval #${i}`,
+          payload: { slug: "my-git-app" },
+          requestedBy: "TestAgent",
+          tokenScope: "approval-required",
+        });
+        store.decideApproval(newer.id, "rejected", "owner", "Resolved in test");
+      }
+      const metricsPendingRes = await app.request(
+        "https://vps.example.com/api/metrics",
+        { headers: httpsHeaders() },
+      );
+      expect(metricsPendingRes.status).toBe(200);
+      const metricsPendingJson = (await metricsPendingRes.json()) as {
+        pendingApprovals: number;
+        approvals: Array<{ id: string }>;
+      };
+      expect(metricsPendingJson.pendingApprovals).toBeGreaterThanOrEqual(1);
+      expect(
+        metricsPendingJson.approvals.some((a) => a.id === olderPending.id),
+      ).toBe(true);
+
+      const approvalsRes = await app.request(
+        "https://vps.example.com/api/approvals",
+        { headers: httpsHeaders() },
+      );
+      expect(approvalsRes.status).toBe(200);
+      const approvalsJson = (await approvalsRes.json()) as {
+        approvals: Array<{ id: string }>;
+      };
+      expect(approvalsJson.approvals.some((a) => a.id === olderPending.id)).toBe(
+        true,
+      );
+
       // 8j. Settings edits must NOT restart a deliberately stopped app whose container exited with 137 ("error")
       const stopRbImg = await app.request(
         "https://vps.example.com/api/apps/rb-img/stop",
@@ -1350,9 +1397,28 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
       expect(renameStopped137.status).toBe(200);
       const renamed137Json = (await renameStopped137.json()) as {
         app: { name: string; status: string };
+        needsStart: boolean;
       };
       expect(renamed137Json.app.name).toBe("Stopped 137 App");
       expect(renamed137Json.app.status).toBe("error");
+      expect(renamed137Json.needsStart).toBe(false);
+
+      const runtimeEdit137 = await app.request(
+        "https://vps.example.com/api/apps/rb-img",
+        {
+          method: "PATCH",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ memoryLimitMb: 256 }),
+        },
+      );
+      expect(runtimeEdit137.status).toBe(200);
+      const runtimeEdit137Json = (await runtimeEdit137.json()) as {
+        app: { memoryLimitMb: number; status: string };
+        needsStart: boolean;
+      };
+      expect(runtimeEdit137Json.app.memoryLimitMb).toBe(256);
+      expect(runtimeEdit137Json.app.status).toBe("error");
+      expect(runtimeEdit137Json.needsStart).toBe(true);
       const stAfter137 = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
         projects: Record<string, string>;
       };

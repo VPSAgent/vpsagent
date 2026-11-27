@@ -562,9 +562,13 @@ export function AppsTab({
       populateEditForm(res.app);
       setNeedsRebuildBanner(res.needsRebuild);
       setNotice(
-        res.needsRebuild
-          ? `Saved settings for "${res.app.name}". Click Rebuild to apply your new Git branch or Dockerfile.`
-          : `Saved settings for "${res.app.name}".`,
+        res.needsRebuild && res.needsStart
+          ? `Saved settings for "${res.app.name}". Click Rebuild to apply your new Git branch or Dockerfile, or Start to launch with the updated settings.`
+          : res.needsRebuild
+            ? `Saved settings for "${res.app.name}". Click Rebuild to apply your new Git branch or Dockerfile.`
+            : res.needsStart
+              ? `Saved settings for "${res.app.name}". Your app is currently not running — click Start to apply the updated settings.`
+              : `Saved settings for "${res.app.name}".`,
       );
       await onRefresh();
     } catch (err) {

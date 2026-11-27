@@ -684,7 +684,7 @@ export const api = {
       companions?: CompanionService[];
     },
   ) =>
-    apiFetch<{ app: AppRecord; needsRebuild: boolean }>(
+    apiFetch<{ app: AppRecord; needsRebuild: boolean; needsStart?: boolean }>(
       `/api/apps/${encodeURIComponent(slug)}`,
       {
         method: "PATCH",

@@ -1523,7 +1523,7 @@ export class AppExecutor {
     rawInput: UpdateAppSettingsInput,
     actor: Actor,
     actorTokenId?: string | null,
-  ): Promise<{ app: AppRecord; needsRebuild: boolean }> {
+  ): Promise<{ app: AppRecord; needsRebuild: boolean; needsStart: boolean }> {
     const slug = validateAppSlug(slugRaw);
     const input = UpdateAppSettingsInputSchema.parse(rawInput);
     const existing = this.store.getApp(slug);
@@ -1775,6 +1775,8 @@ export class AppExecutor {
         (nextGitBranch !== current.gitBranch ||
           nextDockerfilePath !== current.dockerfilePath ||
           nextGitCredentialId !== current.gitCredentialId);
+      const needsStart =
+        !hasRunningContainer && (runtimeSpecChanged || probeChanged);
 
       this.store.recordAudit({
         actor,
@@ -1785,7 +1787,7 @@ export class AppExecutor {
         riskLevel: "medium",
       });
 
-      return { app: this.store.getApp(slug)!, needsRebuild };
+      return { app: this.store.getApp(slug)!, needsRebuild, needsStart };
     });
   }
 

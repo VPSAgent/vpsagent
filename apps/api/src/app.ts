@@ -6,6 +6,7 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import {
+  type ApprovalRequest,
   CreateMcpTokenInputSchema,
   type HostLookupFn,
   NotificationChannelSchema,
@@ -231,6 +232,22 @@ function toStatusCode(code: number): ContentfulStatusCode {
     return code as ContentfulStatusCode;
   }
   return 500;
+}
+
+function listApprovalsWithPending(store: RegistryStore): {
+  approvals: ApprovalRequest[];
+  pendingApprovals: number;
+} {
+  const pendingList = store.listApprovals({ status: "pending", limit: 50 });
+  const recentApprovals = store.listApprovals({ limit: 100 });
+  const seenIds = new Set(recentApprovals.map((a) => a.id));
+  return {
+    approvals: [
+      ...pendingList.filter((a) => !seenIds.has(a.id)),
+      ...recentApprovals,
+    ],
+    pendingApprovals: pendingList.length,
+  };
 }
 
 function handleError(err: unknown): {
@@ -1193,10 +1210,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     try {
       const hostStats = await bridge.getHostStats();
       const apps = store.listApps();
-      const approvals = store.listApprovals({ limit: 100 });
-      const pendingApprovals = approvals.filter(
-        (a) => a.status === "pending",
-      ).length;
+      const { approvals, pendingApprovals } = listApprovalsWithPending(store);
       return c.json({
         ...hostStats,
         apps,
@@ -1567,9 +1581,9 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
             | "executed"
             | "failed")
         : undefined;
-    const approvals = store.listApprovals(
-      status ? { status, limit: 100 } : { limit: 100 },
-    );
+    const approvals = status
+      ? store.listApprovals({ status, limit: 100 })
+      : listApprovalsWithPending(store).approvals;
     return c.json({ approvals });
   });
 
