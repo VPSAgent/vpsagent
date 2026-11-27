@@ -19,6 +19,13 @@ import { OverviewTab } from "./components/OverviewTab";
 import { SetupAndAuth } from "./components/SetupAndAuth";
 import { Boxes, Inbox, LayoutGrid, LogOut, Settings2, type LucideIcon } from "lucide-react";
 import { Logo } from "./brand/Logo";
+import {
+  appendResourceSample,
+  loadResourceDisplayMode,
+  saveResourceDisplayMode,
+  type ResourceDisplayMode,
+  type ResourceSample,
+} from "./resource-display";
 
 type TabId = "overview" | "apps" | "approvals" | "keys";
 type AppDrawerSection =
@@ -28,7 +35,13 @@ type AppDrawerSection =
   | "env"
   | "security"
   | "settings";
-type KeysFocusSection = "github" | "updates" | "alerts" | "backups" | "account";
+type KeysFocusSection =
+  | "general"
+  | "github"
+  | "updates"
+  | "alerts"
+  | "backups"
+  | "account";
 
 interface AppDeepLink {
   slug: string;
@@ -50,7 +63,7 @@ function parseAppDeepLink(hash: string): AppDeepLink | null {
 function parseKeysDeepLink(hash: string): KeysFocusSection | null {
   const match = hash
     .trim()
-    .match(/^#?\/?keys\/(github|updates|alerts|backups|account)$/i);
+    .match(/^#?\/?keys\/(general|github|updates|alerts|backups|account)$/i);
   return match ? (match[1]!.toLowerCase() as KeysFocusSection) : null;
 }
 
@@ -91,7 +104,36 @@ export function App() {
   const [systemUpdate, setSystemUpdate] = useState<SystemUpdateStatus | null>(
     null,
   );
+  const [resourceDisplay, setResourceDisplay] = useState<ResourceDisplayMode>(
+    () => loadResourceDisplayMode(),
+  );
+  const [resourceHistory, setResourceHistory] = useState<ResourceSample[]>([]);
   const [loading, setLoading] = useState(true);
+
+  const handleResourceDisplayChange = useCallback(
+    (mode: ResourceDisplayMode) => {
+      setResourceDisplay(mode);
+      saveResourceDisplayMode(mode);
+    },
+    [],
+  );
+
+  const recordOverviewSample = useCallback((ov: OverviewResponse) => {
+    const cpuPercent = Math.min(
+      100,
+      Math.round(
+        (ov.metrics.loadAverage1m / Math.max(1, ov.metrics.cpuCount)) * 100,
+      ),
+    );
+    setResourceHistory((prev) =>
+      appendResourceSample(prev, {
+        timestamp: ov.metrics.collectedAt,
+        cpu: cpuPercent,
+        memory: ov.metrics.memoryUsagePercent,
+        disk: ov.disk.usedPercent,
+      }),
+    );
+  }, []);
 
   useEffect(() => {
     const syncFromHash = () => {
@@ -136,6 +178,7 @@ export function App() {
             .catch(() => null),
         ]);
         setOverview(ov);
+        recordOverviewSample(ov);
         setApprovals(appr.approvals);
         setAuditEvents(aud.events);
         setTokens(toks.tokens);
@@ -152,11 +195,40 @@ export function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [recordOverviewSample]);
 
   useEffect(() => {
     void loadAll();
   }, [loadAll]);
+
+  useEffect(() => {
+    if (
+      !session?.claimed ||
+      !session?.authenticated ||
+      tab !== "overview" ||
+      resourceDisplay !== "chart"
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void api
+        .getOverview()
+        .then((ov) => {
+          setOverview(ov);
+          recordOverviewSample(ov);
+        })
+        .catch(() => {
+          // Ignore background poll errors; manual refresh surfaces connectivity issues.
+        });
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [
+    session?.claimed,
+    session?.authenticated,
+    tab,
+    resourceDisplay,
+    recordOverviewSample,
+  ]);
 
   const handleInspectSync = useCallback((inspect: InspectResult) => {
     setOverview((prev) =>
@@ -365,6 +437,8 @@ export function App() {
           <OverviewTab
             data={overview}
             loading={loading}
+            resourceDisplay={resourceDisplay}
+            resourceHistory={resourceHistory}
             onRefresh={() => void loadAll()}
             onNavigateTab={setTab}
             onOpenApp={(slug) => {
@@ -407,6 +481,8 @@ export function App() {
             snippets={snippets}
             setup={session.setup}
             publicIp={session.publicIp}
+            resourceDisplay={resourceDisplay}
+            onResourceDisplayChange={handleResourceDisplayChange}
             focusSection={keysFocusSection}
             onConsumeFocusSection={() => setKeysFocusSection(null)}
             initialUpdateStatus={systemUpdate}

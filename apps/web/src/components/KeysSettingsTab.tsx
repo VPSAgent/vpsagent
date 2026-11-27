@@ -24,6 +24,7 @@ import {
   type SystemUpdateStatus,
   type TailscaleStatus,
 } from "../api";
+import type { ResourceDisplayMode } from "../resource-display";
 import { describeTailscaleConflict } from "../tailscale-conflict";
 import { PageHeader, buttonPrimary, buttonSecondary } from "./PageHeader";
 
@@ -37,7 +38,16 @@ interface KeysSettingsTabProps {
   snippets: McpSnippets | null;
   setup: SetupState;
   publicIp: string | null;
-  focusSection?: "github" | "updates" | "alerts" | "backups" | "account" | null;
+  resourceDisplay: ResourceDisplayMode;
+  onResourceDisplayChange: (mode: ResourceDisplayMode) => void;
+  focusSection?:
+    | "general"
+    | "github"
+    | "updates"
+    | "alerts"
+    | "backups"
+    | "account"
+    | null;
   onConsumeFocusSection?: () => void;
   initialUpdateStatus?: SystemUpdateStatus | null;
   onUpdateStatusChange?: (status: SystemUpdateStatus) => void;
@@ -90,6 +100,7 @@ function isSafeHttpsUrl(raw: string | null | undefined): raw is string {
 }
 
 type SettingsPane =
+  | "general"
   | "access"
   | "network"
   | "github"
@@ -99,6 +110,7 @@ type SettingsPane =
   | "updates";
 
 const SETTINGS_PANES: Array<{ id: SettingsPane; label: string }> = [
+  { id: "general", label: "General" },
   { id: "access", label: "AI access" },
   { id: "network", label: "Domains & network" },
   { id: "github", label: "GitHub" },
@@ -154,6 +166,8 @@ export function KeysSettingsTab({
   snippets,
   setup,
   publicIp,
+  resourceDisplay,
+  onResourceDisplayChange,
   focusSection,
   onConsumeFocusSection,
   initialUpdateStatus = null,
@@ -204,7 +218,7 @@ export function KeysSettingsTab({
   } | null>(null);
 
   const [pane, setPane] = useState<SettingsPane>(() =>
-    focusSection ? focusSection : "access",
+    focusSection ? focusSection : "general",
   );
   const githubSectionRef = useRef<HTMLElement | null>(null);
   const updatesSectionRef = useRef<HTMLElement | null>(null);
@@ -777,7 +791,7 @@ export function KeysSettingsTab({
     setNotice(null);
     try {
       const res = await api.testNotification();
-      applyLoadedAlerts(res.settings);
+      setAlertSettings(res.settings);
       if (res.ok) {
         setNotice("Test alert sent! Check your Discord, Slack, Telegram, or webhook receiver.");
       } else {
@@ -892,7 +906,7 @@ export function KeysSettingsTab({
     <div className="space-y-6">
       <PageHeader
         title="Settings"
-        description="Access for your AI tools, domains, GitHub and updates."
+        description="General preferences, AI access, domains, GitHub and updates."
       />
 
       {error && (
@@ -929,6 +943,73 @@ export function KeysSettingsTab({
         </nav>
 
         <div className="min-w-0 space-y-6">
+          {pane === "general" && (
+            <section className="surface-panel rounded-xl p-6 space-y-5">
+              <div>
+                <h2 className="text-base font-medium text-fg">
+                  Overview display
+                </h2>
+                <p className="mt-1 text-xs text-muted">
+                  Choose how server CPU, memory, and disk usage appear on the
+                  Overview page.
+                </p>
+              </div>
+
+              <div className="space-y-2">
+                <span className="block text-xs font-medium text-fg-2">
+                  Resource usage style
+                </span>
+                <div
+                  role="radiogroup"
+                  aria-label="Resource usage style"
+                  className="grid grid-cols-1 sm:grid-cols-2 gap-3"
+                >
+                  {(
+                    [
+                      {
+                        id: "bar",
+                        title: "Bar",
+                        desc: "Compact progress bar showing current usage.",
+                      },
+                      {
+                        id: "chart",
+                        title: "Chart",
+                        desc: "Live area chart tracking usage over time.",
+                      },
+                    ] as const
+                  ).map((option) => {
+                    const selected = resourceDisplay === option.id;
+                    return (
+                      <button
+                        key={option.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => onResourceDisplayChange(option.id)}
+                        className={`btn-press rounded-lg border px-4 py-3 text-left cursor-pointer ${
+                          selected
+                            ? "border-fg bg-surface-2 text-fg"
+                            : "border-line bg-well text-muted hover:text-fg hover:border-line-strong"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-medium text-fg">
+                            {option.title}
+                          </span>
+                          <span
+                            className={`h-2 w-2 rounded-full ${
+                              selected ? "bg-fg" : "bg-line-strong"
+                            }`}
+                          />
+                        </div>
+                        <p className="mt-1 text-xs text-muted">{option.desc}</p>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
+          )}
           {pane === "access" && (
             <>
             {snippets && (
@@ -2094,7 +2175,27 @@ export function KeysSettingsTab({
               )}
             </section>
           )}
-          {pane === "alerts" && (
+          {pane === "alerts" && (() => {
+            const hasUnsavedAlertChanges = Boolean(
+              alertSettings &&
+                (alertEnabled !== alertSettings.enabled ||
+                  alertChannel !== alertSettings.channel ||
+                  notifyOnApproval !== alertSettings.notifyOnApproval ||
+                  notifyOnAppDown !== alertSettings.notifyOnAppDown ||
+                  notifyOnDeployFailure !== alertSettings.notifyOnDeployFailure ||
+                  (alertChannel === "telegram" &&
+                    (alertTelegramChatId.trim() !==
+                      (alertSettings.telegramChatId ?? "").trim() ||
+                      alertTelegramToken.trim().length > 0)) ||
+                  (alertChannel !== "telegram" &&
+                    alertChannel !== "none" &&
+                    alertWebhookUrl.trim().length > 0)),
+            );
+            const savedTargetMatchesChannel = Boolean(
+              alertSettings?.hasTargetSecret &&
+                alertSettings.channel === alertChannel,
+            );
+            return (
             <form
               onSubmit={(e) => void handleSaveAlerts(e)}
               className="surface-panel rounded-xl p-6 space-y-5"
@@ -2144,7 +2245,7 @@ export function KeysSettingsTab({
                   </select>
                 </div>
 
-                {alertSettings?.hasTargetSecret && alertSettings.targetHint && (
+                {savedTargetMatchesChannel && alertSettings?.targetHint && (
                   <div className="surface-well rounded-lg px-3.5 py-2.5 flex items-center justify-between text-xs">
                     <span className="text-muted">Saved target:</span>
                     <code className="font-mono text-fg">
@@ -2273,18 +2374,27 @@ export function KeysSettingsTab({
               )}
 
               <div className="flex flex-wrap items-center justify-end gap-2.5 pt-1">
-                {alertSettings?.hasTargetSecret && alertChannel !== "none" && (
-                  <button
-                    type="button"
-                    disabled={alertTesting || alertBusy}
-                    onClick={() => void handleTestAlert()}
-                    className={buttonSecondary}
-                  >
-                    {alertTesting ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : null}
-                    {alertTesting ? "Sending..." : "Send test alert"}
-                  </button>
+                {savedTargetMatchesChannel && alertChannel !== "none" && (
+                  <>
+                    {hasUnsavedAlertChanges && (
+                      <span className="text-xs text-muted mr-auto">
+                        Save changes first to test this destination.
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      disabled={
+                        alertTesting || alertBusy || hasUnsavedAlertChanges
+                      }
+                      onClick={() => void handleTestAlert()}
+                      className={buttonSecondary}
+                    >
+                      {alertTesting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : null}
+                      {alertTesting ? "Sending..." : "Send test alert"}
+                    </button>
+                  </>
                 )}
                 <button
                   type="submit"
@@ -2298,7 +2408,8 @@ export function KeysSettingsTab({
                 </button>
               </div>
             </form>
-          )}
+            );
+          })()}
           {pane === "backups" && (
             <section className="surface-panel rounded-xl p-6 space-y-5">
               <div>
