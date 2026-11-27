@@ -81,7 +81,7 @@ function startServerFromEnv(): void {
   }
 
   // 1. Primary Caddy-fronted server (strictly requires HTTPS via X-Forwarded-Proto)
-  const { app, generatedClaimToken, notifier, healthAlerter } = createVpsAgentApp({
+  const { app, generatedClaimToken, executor, notifier, healthAlerter } = createVpsAgentApp({
     store,
     bridge,
     appsRoot,
@@ -119,6 +119,7 @@ function startServerFromEnv(): void {
       publicIp: process.env.VPSAGENT_PUBLIC_IP,
       trustProxy: false,
       isLocalListener: true,
+      executor,
       notifier,
       healthAlerter,
     });

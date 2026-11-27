@@ -4595,6 +4595,9 @@ class RuntimeService:
                             proc: subprocess.Popen[bytes] | None = None
                             timed_out = False
                             timer: threading.Timer | None = None
+                            stderr_thread: threading.Thread | None = None
+                            stderr_chunks: list[bytes] = []
+                            stderr_kept = 0
                             try:
                                 proc = subprocess.Popen(
                                     [
@@ -4622,9 +4625,29 @@ class RuntimeService:
                                         except OSError:
                                             pass
 
+                                def _drain_stderr() -> None:
+                                    nonlocal stderr_kept
+                                    assert proc is not None and proc.stderr is not None
+                                    try:
+                                        while True:
+                                            err_chunk = proc.stderr.read(4096)
+                                            if not err_chunk:
+                                                break
+                                            if stderr_kept < 4096:
+                                                take = err_chunk[: 4096 - stderr_kept]
+                                                stderr_chunks.append(take)
+                                                stderr_kept += len(take)
+                                    except OSError:
+                                        pass
+
                                 timer = threading.Timer(90.0, _kill_on_timeout)
                                 timer.daemon = True
                                 timer.start()
+
+                                stderr_thread = threading.Thread(
+                                    target=_drain_stderr, daemon=True
+                                )
+                                stderr_thread.start()
 
                                 written = 0
                                 assert proc.stdout is not None
@@ -4642,12 +4665,9 @@ class RuntimeService:
                                         dfh.write(chunk)
                                         written += len(chunk)
 
-                                stderr_bytes = (
-                                    proc.stderr.read(4096)
-                                    if proc.stderr is not None
-                                    else b""
-                                )
                                 rc = proc.wait(timeout=10)
+                                stderr_thread.join(timeout=2)
+                                stderr_bytes = b"".join(stderr_chunks)
                                 if timed_out or rc != 0:
                                     err_detail = redact_secrets(
                                         stderr_bytes.decode(
@@ -4693,6 +4713,8 @@ class RuntimeService:
                                         proc.stdout.close()
                                     if proc.stderr is not None:
                                         proc.stderr.close()
+                                if stderr_thread is not None:
+                                    stderr_thread.join(timeout=1)
                         elif pg_state == "unknown":
                             raise BridgeRequestError(
                                 502,

@@ -538,7 +538,11 @@ export const api = {
 
   getOverview: () => apiFetch<OverviewResponse>("/api/overview"),
   getMetrics: () =>
-    apiFetch<Pick<OverviewResponse, "metrics" | "disk">>("/api/metrics"),
+    apiFetch<
+      Pick<OverviewResponse, "metrics" | "disk" | "apps" | "pendingApprovals"> & {
+        approvals: ApprovalRequest[];
+      }
+    >("/api/metrics"),
   listApps: () => apiFetch<{ apps: AppRecord[] }>("/api/apps"),
   inspectGitRepo: (
     gitRepoUrl: string,

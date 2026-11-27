@@ -105,8 +105,11 @@ if args[:1] == ["compose"]:
         sys.exit(0)
     if "ps" in args:
         status = st["projects"].get(proj, "stopped")
+        svc = args[-1] if args[-1] in ("postgres", "redis", "app") else "app"
         if status == "running":
-            print(json.dumps({"Name": proj, "State": "running", "Health": "healthy", "ExitCode": 0}))
+            print(json.dumps({"Name": proj, "Service": svc, "State": "running", "Health": "healthy", "ExitCode": 0}))
+        elif status == "exited_137" and svc == "app":
+            print(json.dumps({"Name": proj, "Service": "app", "State": "exited", "Health": "", "ExitCode": 137}))
         sys.exit(0)
     if "exec" in args:
         sys.stdout.write("-- Postgres backup\\nSELECT 42;\\n")
@@ -138,7 +141,7 @@ if args[:1] == ["inspect"]:
         "State": {
             "Status": "running" if is_running else "exited",
             "Running": is_running,
-            "ExitCode": 0 if is_running else 1,
+            "ExitCode": 0 if is_running else (137 if status == "exited_137" else 1),
             "StartedAt": "2026-11-27T01:00:00Z",
             "Health": {"Status": "healthy" if is_running else "unhealthy"},
         },
@@ -368,7 +371,7 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
     });
 
     const claimToken = "alpha2-claim-token";
-    const { app, notifier, healthAlerter } = createVpsAgentApp({
+    const { app, executor, notifier, healthAlerter } = createVpsAgentApp({
       store,
       bridge,
       appsRoot,
@@ -1208,6 +1211,7 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
         trustProxy: false,
         isLocalListener: true,
         defaultPeerIp: "127.0.0.1",
+        executor,
         notifier,
         healthAlerter,
       });
@@ -1271,7 +1275,7 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
       expect(switchedJson.settings.hasTargetSecret).toBe(false);
       expect(switchedJson.settings.targetHint).toBeNull();
 
-      // 8i. GET /api/metrics requires owner session and returns host metrics without inspecting workloads
+      // 8i. GET /api/metrics requires owner session and returns host metrics + store apps/approvals without inspecting workloads
       const unauthMetrics = await app.request(
         "https://vps.example.com/api/metrics",
         {
@@ -1284,10 +1288,16 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
       expect(unauthMetrics.status).toBe(401);
 
       const origInspectWorkload = bridge.inspectWorkload.bind(bridge);
+      const origGetStatuses = bridge.getStatuses.bind(bridge);
       let inspectCalls = 0;
+      let statusCalls = 0;
       bridge.inspectWorkload = async (...args) => {
         inspectCalls += 1;
         return origInspectWorkload(...args);
+      };
+      bridge.getStatuses = async (...args) => {
+        statusCalls += 1;
+        return origGetStatuses(...args);
       };
       try {
         const metricsRes = await app.request(
@@ -1300,13 +1310,218 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
         const metricsJson = (await metricsRes.json()) as {
           metrics: { hostname: string; cpuCount: number };
           disk: { totalGb: number };
+          apps: Array<{ slug: string; status: string }>;
+          approvals: Array<{ id: string; status: string }>;
+          pendingApprovals: number;
         };
         expect(metricsJson.metrics.cpuCount).toBeGreaterThanOrEqual(1);
         expect(metricsJson.disk.totalGb).toBeGreaterThan(0);
+        expect(metricsJson.apps.some((a) => a.slug === "my-git-app")).toBe(true);
+        expect(Array.isArray(metricsJson.approvals)).toBe(true);
+        expect(typeof metricsJson.pendingApprovals).toBe("number");
         expect(inspectCalls).toBe(0);
+        expect(statusCalls).toBe(0);
       } finally {
         bridge.inspectWorkload = origInspectWorkload;
+        bridge.getStatuses = origGetStatuses;
       }
+
+      // 8j. Settings edits must NOT restart a deliberately stopped app whose container exited with 137 ("error")
+      const stopRbImg = await app.request(
+        "https://vps.example.com/api/apps/rb-img/stop",
+        { method: "POST", headers: httpsHeaders() },
+      );
+      expect(stopRbImg.status).toBe(200);
+      const st137 = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+        projects: Record<string, string>;
+      };
+      st137.projects["vpsagent-rb-img"] = "exited_137";
+      fs.writeFileSync(stateFile, JSON.stringify(st137), "utf8");
+      store.updateAppStatus("rb-img", "error");
+
+      const renameStopped137 = await app.request(
+        "https://vps.example.com/api/apps/rb-img",
+        {
+          method: "PATCH",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ name: "Stopped 137 App" }),
+        },
+      );
+      expect(renameStopped137.status).toBe(200);
+      const renamed137Json = (await renameStopped137.json()) as {
+        app: { name: string; status: string };
+      };
+      expect(renamed137Json.app.name).toBe("Stopped 137 App");
+      expect(renamed137Json.app.status).toBe("error");
+      const stAfter137 = JSON.parse(fs.readFileSync(stateFile, "utf8")) as {
+        projects: Record<string, string>;
+      };
+      expect(stAfter137.projects["vpsagent-rb-img"]).toBe("exited_137");
+
+      // 8k. Shared AppExecutor queues public GitHub pushes arriving while an SSH-tunneled rebuild runs
+      const enableCrossHook = await app.request(
+        "https://vps.example.com/api/apps/my-git-app/webhook",
+        {
+          method: "POST",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: "{}",
+        },
+      );
+      expect(enableCrossHook.status).toBe(200);
+      const crossHookInfo = (await enableCrossHook.json()) as {
+        rawSecret: string;
+      };
+      const signCross = (payload: string) =>
+        `sha256=${crypto.createHmac("sha256", crossHookInfo.rawSecret).update(payload, "utf8").digest("hex")}`;
+
+      const stCross = JSON.parse(fs.readFileSync(stateFile, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      stCross.buildDelayMs = 450;
+      fs.writeFileSync(stateFile, JSON.stringify(stCross), "utf8");
+      fs.writeFileSync(
+        commitFile,
+        "6666666666666666666666666666666666666666",
+        "utf8",
+      );
+      const sshRebuild = await localApp.request(
+        "http://127.0.0.1:3002/api/apps/my-git-app/rebuild?async=true",
+        {
+          method: "POST",
+          headers: {
+            cookie: localCookie,
+            host: "127.0.0.1:3002",
+            origin: "http://127.0.0.1:3002",
+            "sec-fetch-site": "same-origin",
+          },
+        },
+      );
+      expect(sshRebuild.status).toBe(202);
+
+      fs.writeFileSync(
+        commitFile,
+        "7777777777777777777777777777777777777777",
+        "utf8",
+      );
+      const crossPushBody = JSON.stringify({ ref: "refs/heads/main" });
+      const crossPush = await app.request(
+        "https://vps.example.com/api/webhooks/github/my-git-app",
+        {
+          method: "POST",
+          headers: {
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+            "x-github-event": "push",
+            "x-hub-signature-256": signCross(crossPushBody),
+            "content-type": "application/json",
+          },
+          body: crossPushBody,
+        },
+      );
+      expect(crossPush.status).toBe(202);
+      const crossPushJson = (await crossPush.json()) as {
+        triggered: boolean;
+        queued: boolean;
+      };
+      expect(crossPushJson.triggered).toBe(false);
+      expect(crossPushJson.queued).toBe(true);
+
+      stCross.buildDelayMs = 0;
+      fs.writeFileSync(stateFile, JSON.stringify(stCross), "utf8");
+      for (let i = 0; i < 60; i++) {
+        const cur = store.getApp("my-git-app");
+        if (
+          cur?.lastCommitSha === "7777777777777777777777777777777777777777" &&
+          cur.status === "running"
+        ) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 75));
+      }
+      expect(store.getApp("my-git-app")?.lastCommitSha).toBe(
+        "7777777777777777777777777777777777777777",
+      );
+
+      // 8l. Rotating or disabling a webhook secret while a request stream is in flight rejects old secret / disabled webhook
+      const makePausedWebhookRequest = (payloadStr: string, sig: string) => {
+        const payloadBuf = Buffer.from(payloadStr, "utf8");
+        let stage = 0;
+        let onFirstPulled!: () => void;
+        let releaseSecond!: () => void;
+        const firstPulled = new Promise<void>((resolve) => {
+          onFirstPulled = resolve;
+        });
+        const secondGate = new Promise<void>((resolve) => {
+          releaseSecond = resolve;
+        });
+        const stream = new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (stage === 0) {
+              stage = 1;
+              controller.enqueue(payloadBuf.subarray(0, 8));
+              onFirstPulled();
+            } else {
+              await secondGate;
+              controller.enqueue(payloadBuf.subarray(8));
+              controller.close();
+            }
+          },
+        });
+        const responsePromise = app.request(
+          new Request("https://vps.example.com/api/webhooks/github/my-git-app", {
+            method: "POST",
+            headers: {
+              host: "vps.example.com",
+              "x-forwarded-proto": "https",
+              "x-github-event": "push",
+              "x-hub-signature-256": sig,
+              "content-type": "application/json",
+            },
+            body: stream,
+            duplex: "half",
+          } as RequestInit),
+        );
+        return { firstPulled, releaseSecond, responsePromise };
+      };
+
+      const rotateInFlightBody = JSON.stringify({ ref: "refs/heads/main" });
+      const rotatedAttempt = makePausedWebhookRequest(
+        rotateInFlightBody,
+        signCross(rotateInFlightBody),
+      );
+      await rotatedAttempt.firstPulled;
+      const rotateRes = await app.request(
+        "https://vps.example.com/api/apps/my-git-app/webhook",
+        {
+          method: "POST",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: "{}",
+        },
+      );
+      expect(rotateRes.status).toBe(200);
+      const rotatedHookInfo = (await rotateRes.json()) as {
+        rawSecret: string;
+      };
+      expect(rotatedHookInfo.rawSecret).not.toBe(crossHookInfo.rawSecret);
+      rotatedAttempt.releaseSecond();
+      const staleSecretRes = await rotatedAttempt.responsePromise;
+      expect(staleSecretRes.status).toBe(401);
+
+      const newSig = `sha256=${crypto.createHmac("sha256", rotatedHookInfo.rawSecret).update(rotateInFlightBody, "utf8").digest("hex")}`;
+      const disabledAttempt = makePausedWebhookRequest(
+        rotateInFlightBody,
+        newSig,
+      );
+      await disabledAttempt.firstPulled;
+      const disableRes = await app.request(
+        "https://vps.example.com/api/apps/my-git-app/webhook",
+        { method: "DELETE", headers: httpsHeaders() },
+      );
+      expect(disableRes.status).toBe(200);
+      disabledAttempt.releaseSecond();
+      const disabledInFlightRes = await disabledAttempt.responsePromise;
+      expect(disabledInFlightRes.status).toBe(404);
     } finally {
       healthAlerter.stop();
       store.close();

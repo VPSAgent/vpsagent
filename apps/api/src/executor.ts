@@ -1644,14 +1644,51 @@ export class AppExecutor {
         ? fs.readFileSync(probeConfigPath, "utf8")
         : null;
 
+      let hasRunningContainer = false;
+      if (current.status === "running" || current.status === "error") {
+        try {
+          const live = await this.bridge.inspectWorkload(slug, {
+            probeHttp: false,
+          });
+          const expectedAppContainerName = `vpsagent-app-${slug}`;
+          const appContainer = live.containers.find(
+            (ct) => ct.name === expectedAppContainerName,
+          );
+          hasRunningContainer = appContainer
+            ? appContainer.running ||
+              appContainer.state.trim().toLowerCase() === "running"
+            : live.containers.some(
+                (ct) =>
+                  ct.running || ct.state.trim().toLowerCase() === "running",
+              );
+        } catch {
+          hasRunningContainer = current.status === "running";
+        }
+      }
+
+      const runtimeSpecChanged =
+        nextImage !== current.image ||
+        nextInternalPort !== current.internalPort ||
+        nextCpuLimit !== current.cpuLimit ||
+        nextMemoryLimitMb !== current.memoryLimitMb ||
+        JSON.stringify(nextCompanions) !== JSON.stringify(current.companions);
+      const probeChanged =
+        nextProbeHttp !== current.probeHttp ||
+        nextProbePath !== current.probePath;
+
       let lifecycleApplied = false;
       let nextStatus = current.status;
       try {
         writeApartmentBlueprint(this.appsRoot, blueprint);
-        if (current.status === "running" || current.status === "error") {
-          const lifeRes = await this.bridge.lifecycle(slug, "start");
-          lifecycleApplied = true;
-          nextStatus = lifeRes.status;
+        if (hasRunningContainer) {
+          if (runtimeSpecChanged || (nextProbeHttp && probeChanged)) {
+            const lifeRes = await this.bridge.lifecycle(slug, "start");
+            lifecycleApplied = true;
+            nextStatus = lifeRes.status;
+          } else {
+            const statusRes = await this.bridge.lifecycle(slug, "status");
+            nextStatus = statusRes.status;
+          }
         }
         if (current.domain && nextInternalPort !== current.internalPort) {
           await this.bridge.routeCaddy({

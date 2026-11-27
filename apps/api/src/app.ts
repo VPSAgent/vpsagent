@@ -71,6 +71,7 @@ export interface VpsAgentAppOptions {
   telegramApiBaseUrl?: string | undefined;
   notifier?: NotificationService | undefined;
   healthAlerter?: AppHealthAlerter | undefined;
+  executor?: AppExecutor | undefined;
 }
 
 const ClaimInputSchema = z.object({
@@ -293,25 +294,25 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       telegramApiBaseUrl: options.telegramApiBaseUrl,
     });
 
-  let healthAlerter: AppHealthAlerter;
-
-  const executor = new AppExecutor({
-    store,
-    bridge,
-    appsRoot: options.appsRoot,
-    lookupFn: options.lookupFn,
-    readinessTimeoutSeconds: options.readinessTimeoutSeconds,
-    readinessPollIntervalMs: options.readinessPollIntervalMs,
-    buildTimeoutSeconds: options.buildTimeoutSeconds,
-    githubApiBaseUrl: options.githubApiBaseUrl,
-    githubFetchFn: options.githubFetchFn,
-    notifier,
-    onIntentionalStop: (slug) => healthAlerter.markIntentionalStop(slug),
-    onAppStarted: (slug) => healthAlerter.clearIntentionalStop(slug),
-  });
-
-  healthAlerter =
+  const healthAlerter =
     options.healthAlerter ?? new AppHealthAlerter({ store, bridge, notifier });
+
+  const executor =
+    options.executor ??
+    new AppExecutor({
+      store,
+      bridge,
+      appsRoot: options.appsRoot,
+      lookupFn: options.lookupFn,
+      readinessTimeoutSeconds: options.readinessTimeoutSeconds,
+      readinessPollIntervalMs: options.readinessPollIntervalMs,
+      buildTimeoutSeconds: options.buildTimeoutSeconds,
+      githubApiBaseUrl: options.githubApiBaseUrl,
+      githubFetchFn: options.githubFetchFn,
+      notifier,
+      onIntentionalStop: (slug) => healthAlerter.markIntentionalStop(slug),
+      onAppStarted: (slug) => healthAlerter.clearIntentionalStop(slug),
+    });
   const webhookHitsBySlug = new Map<string, number[]>();
 
   const app = new Hono();
@@ -643,9 +644,25 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       return c.json({ error: "Webhook payload too large." }, 413);
     }
 
+    const freshApp = store.getApp(slug);
+    const freshWebhookSecret = freshApp
+      ? store.getAppWebhookSecretForRuntime(slug)
+      : null;
+    if (
+      !freshApp ||
+      freshApp.sourceType !== "git" ||
+      !freshApp.webhookEnabled ||
+      !freshWebhookSecret
+    ) {
+      return c.json(
+        { error: "GitHub push webhook is not enabled for this app." },
+        404,
+      );
+    }
+
     const sigHeader = (c.req.header("x-hub-signature-256") ?? "").trim().toLowerCase();
     const expectedSig = `sha256=${crypto
-      .createHmac("sha256", webhookSecret)
+      .createHmac("sha256", freshWebhookSecret)
       .update(rawBuffer)
       .digest("hex")}`;
     const sigBuf = Buffer.from(sigHeader, "utf8");
@@ -721,7 +738,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       typeof repoObj?.default_branch === "string" && repoObj.default_branch.trim()
         ? repoObj.default_branch.trim()
         : "main";
-    const targetBranch = appRecord.gitBranch || defaultBranch;
+    const targetBranch = freshApp.gitBranch || defaultBranch;
 
     if (pushedBranch !== targetBranch) {
       return c.json({
@@ -1175,7 +1192,17 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   app.get("/api/metrics", async (c) => {
     try {
       const hostStats = await bridge.getHostStats();
-      return c.json(hostStats);
+      const apps = store.listApps();
+      const approvals = store.listApprovals({ limit: 100 });
+      const pendingApprovals = approvals.filter(
+        (a) => a.status === "pending",
+      ).length;
+      return c.json({
+        ...hostStats,
+        apps,
+        approvals,
+        pendingApprovals,
+      });
     } catch (err) {
       const { status, error } = handleError(err);
       return c.json({ error }, status);

@@ -4640,6 +4640,10 @@ if args[:1] == ["compose"]:
             except BrokenPipeError:
                 pass
             sys.exit(0)
+        if st.get("noisyPgDumpStderr"):
+            # >128 KiB of stderr exceeds typical 64 KiB OS pipe buffer; must not deadlock stdout
+            sys.stderr.write("NOTICE: verbose pg_dump trace\\n" * 6000)
+            sys.stderr.flush()
         sys.stdout.write("-- PostgreSQL database dump\\nSELECT 1;\\n")
         sys.exit(0)
 
@@ -4962,6 +4966,25 @@ sys.exit(0)
         with self.assertRaises(rb.BridgeRequestError) as cm_dump_big:
             self.svc.create_app_backup({"slug": "pg-app"})
         self.assertEqual(cm_dump_big.exception.status_code, 413)
+
+        # Heavy stderr output (>128 KiB) must drain concurrently without deadlocking pg_dump
+        st_pg["oversizedPgDump"] = False
+        st_pg["noisyPgDumpStderr"] = True
+        Path(self.state_file).write_text(json.dumps(st_pg), encoding="utf-8")
+        noisy_tar, _ = self.svc.create_app_backup({"slug": "pg-app"})
+        try:
+            with tarfile.open(noisy_tar, "r:gz") as tf:
+                noisy_names = tf.getnames()
+                manifest_raw = tf.extractfile(
+                    next(n for n in noisy_names if n.endswith("/manifest.json"))
+                )
+                assert manifest_raw is not None
+                noisy_manifest = json.loads(manifest_raw.read().decode("utf-8"))
+            self.assertEqual(noisy_manifest["postgresDump"], "pg_dump")
+            self.assertTrue(any(n.endswith("/postgres.sql") for n in noisy_names))
+        finally:
+            if os.path.exists(noisy_tar):
+                os.unlink(noisy_tar)
 
     def test_disabling_probe_http_clears_cached_unhealthy_status(self) -> None:
         self._write_minimal_app("probe-off")

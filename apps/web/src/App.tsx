@@ -222,9 +222,16 @@ export function App() {
         .then((sample) => {
           setOverview((prev) =>
             prev
-              ? { ...prev, metrics: sample.metrics, disk: sample.disk }
+              ? {
+                  ...prev,
+                  metrics: sample.metrics,
+                  disk: sample.disk,
+                  apps: sample.apps,
+                  pendingApprovals: sample.pendingApprovals,
+                }
               : prev,
           );
+          setApprovals(sample.approvals);
           recordOverviewSample(sample);
         })
         .catch(() => {
