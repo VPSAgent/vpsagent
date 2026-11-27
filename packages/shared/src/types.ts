@@ -144,6 +144,24 @@ export const AppEnvEntrySchema = z.object({
 });
 export type AppEnvEntry = z.infer<typeof AppEnvEntrySchema>;
 
+export const RequestedEnvKeySchema = z.object({
+  key: z.string().min(1).max(128),
+  description: z.string().max(240).optional(),
+  isSecret: z.boolean().default(true),
+  required: z.boolean().default(true),
+});
+export type RequestedEnvKey = z.infer<typeof RequestedEnvKeySchema>;
+
+export const AppEnvRequestSchema = z.object({
+  slug: z.string().min(2).max(48),
+  note: z.string().max(400).nullable().default(null),
+  keys: z.array(RequestedEnvKeySchema).max(60),
+  rebuildAfterSave: z.boolean().default(false),
+  requestedBy: z.string().min(1).max(80),
+  updatedAt: z.string(),
+});
+export type AppEnvRequest = z.infer<typeof AppEnvRequestSchema>;
+
 export const ActorSchema = z.enum(["user", "agent", "system"]);
 export type Actor = z.infer<typeof ActorSchema>;
 

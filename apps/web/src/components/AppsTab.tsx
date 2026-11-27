@@ -10,6 +10,7 @@ import {
 import {
   api,
   type AppEnvEntry,
+  type AppEnvRequest,
   type AppRecord,
   type CompanionService,
   type DeploymentRecord,
@@ -18,8 +19,10 @@ import {
   type GithubRepoSummary,
   type InspectResult,
 } from "../api";
+import { parseEnvBlock } from "../env-utils";
 import { formatSafetyCheckHealth, type HealthBadge } from "../health-display";
 import { AppCard, AppStatus } from "./AppCard";
+import { AppEnvPanel } from "./AppEnvPanel";
 import { PageHeader, buttonPrimary, buttonSecondary } from "./PageHeader";
 
 function healthToneClass(tone: HealthBadge["tone"]): string {
@@ -167,9 +170,12 @@ export function AppsTab({
   const [logs, setLogs] = useState<string[]>([]);
   const [envVars, setEnvVars] = useState<AppEnvEntry[]>([]);
   const [missingEnvKeys, setMissingEnvKeys] = useState<string[]>([]);
+  const [envRequest, setEnvRequest] = useState<AppEnvRequest | null>(null);
+  const [envNeedsRebuild, setEnvNeedsRebuild] = useState(false);
+  const [changedBuildTimeKeys, setChangedBuildTimeKeys] = useState<string[]>(
+    [],
+  );
   const [inspectData, setInspectData] = useState<InspectResult | null>(null);
-  const [newEnvKey, setNewEnvKey] = useState("");
-  const [newEnvVal, setNewEnvVal] = useState("");
   const [editDomain, setEditDomain] = useState("");
   const [drawerLoading, setDrawerLoading] = useState(false);
 
@@ -224,6 +230,10 @@ export function AppsTab({
       setSection(sec);
       setEditDomain(currentDomain ?? "");
       setNeedsRebuildBanner(false);
+      if (targetSlug !== selectedSlug) {
+        setEnvNeedsRebuild(false);
+        setChangedBuildTimeKeys([]);
+      }
       if (sec === "settings") {
         const match = apps.find((a) => a.slug === targetSlug);
         if (match) populateEditForm(match);
@@ -241,6 +251,7 @@ export function AppsTab({
           const res = await api.getAppEnv(targetSlug);
           setEnvVars(res.envVars);
           setMissingEnvKeys(res.missingEnvKeys ?? []);
+          setEnvRequest(res.envRequest ?? null);
         } else if (sec === "security") {
           const res = await api.inspectApp(targetSlug);
           setInspectData(res.inspect);
@@ -663,14 +674,13 @@ export function AppsTab({
       if (withPostgres) companions.push({ type: "postgres" });
       if (withRedis) companions.push({ type: "redis" });
 
+      const parsedEnvBlock = parseEnvBlock(envText);
+      if (parsedEnvBlock.errors.length > 0) {
+        throw new Error(parsedEnvBlock.errors[0]!.message);
+      }
       const parsedEnv: Record<string, string> = {};
-      for (const line of envText.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const idx = trimmed.indexOf("=");
-        if (idx > 0) {
-          parsedEnv[trimmed.slice(0, idx).trim()] = trimmed.slice(idx + 1).trim();
-        }
+      for (const entry of parsedEnvBlock.vars) {
+        parsedEnv[entry.key] = entry.value;
       }
 
       const parsedPort = internalPort.trim()
@@ -742,22 +752,38 @@ export function AppsTab({
     }
   };
 
-  const handleSaveEnv = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedSlug || !newEnvKey.trim()) return;
+  const handleSaveEnvVars = async (
+    vars: Array<{ key: string; value: string; isSecret?: boolean }>,
+    options?: { rebuild?: boolean },
+  ) => {
+    if (!selectedSlug || vars.length === 0) return;
     setDrawerLoading(true);
     setError(null);
     try {
-      const res = await api.updateAppEnv(selectedSlug, [
-        { key: newEnvKey.trim(), value: newEnvVal },
-      ]);
+      const res = await api.updateAppEnv(selectedSlug, vars);
       setEnvVars(res.envVars);
       setMissingEnvKeys(res.missingEnvKeys ?? []);
-      setNewEnvKey("");
-      setNewEnvVal("");
-      setNotice(`Saved hidden setting ${newEnvKey.trim()}.`);
+      setEnvRequest(res.envRequest ?? null);
+      if (options?.rebuild) {
+        setEnvNeedsRebuild(false);
+        setChangedBuildTimeKeys([]);
+        setNotice(
+          `Saved ${vars.length} setting${vars.length === 1 ? "" : "s"} and started rebuild for ${selectedSlug}.`,
+        );
+        await handleAction(selectedSlug, "rebuild");
+      } else {
+        if (res.needsRebuild) {
+          setEnvNeedsRebuild(true);
+          setChangedBuildTimeKeys(res.changedBuildTimeKeys ?? []);
+        }
+        setNotice(
+          vars.length === 1
+            ? `Saved setting ${vars[0]!.key}.`
+            : `Saved ${vars.length} settings for ${selectedSlug}.`,
+        );
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to save setting.");
+      setError(err instanceof Error ? err.message : "Failed to save settings.");
     } finally {
       setDrawerLoading(false);
     }
@@ -770,8 +796,28 @@ export function AppsTab({
       const res = await api.deleteAppEnv(selectedSlug, key);
       setEnvVars(res.envVars);
       setMissingEnvKeys(res.missingEnvKeys ?? []);
+      setEnvRequest(res.envRequest ?? null);
+      if (res.needsRebuild) {
+        setEnvNeedsRebuild(true);
+        setChangedBuildTimeKeys(res.changedBuildTimeKeys ?? [key]);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete setting.");
+    } finally {
+      setDrawerLoading(false);
+    }
+  };
+
+  const handleDismissEnvRequest = async () => {
+    if (!selectedSlug) return;
+    setDrawerLoading(true);
+    try {
+      await api.dismissAppEnvRequest(selectedSlug);
+      setEnvRequest(null);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to dismiss checklist.",
+      );
     } finally {
       setDrawerLoading(false);
     }
@@ -1690,86 +1736,23 @@ export function AppsTab({
                         )}
                       </div>
                     ) : section === "env" ? (
-                      <div className="space-y-4">
-                        {missingEnvKeys.length > 0 && (
-                          <div className="rounded-lg border border-warn-line bg-warn-soft p-3.5 space-y-2">
-                            <p className="text-xs font-medium text-warn">
-                              Suggested settings from this repo&rsquo;s{" "}
-                              <code>.env.example</code> (click one to fill it
-                              safely here):
-                            </p>
-                            <div className="flex flex-wrap gap-1.5">
-                              {missingEnvKeys.map((key) => (
-                                <button
-                                  key={key}
-                                  type="button"
-                                  onClick={() => setNewEnvKey(key)}
-                                  className="btn-press rounded-md border border-warn-line bg-canvas px-2.5 py-1 text-xs font-mono text-warn hover:bg-warn-soft cursor-pointer"
-                                >
-                                  + {key}
-                                </button>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                        <form
-                          onSubmit={handleSaveEnv}
-                          className="flex flex-wrap gap-2"
-                        >
-                          <input
-                            type="text"
-                            value={newEnvKey}
-                            onChange={(e) => setNewEnvKey(e.target.value)}
-                            placeholder="SETTING_NAME"
-                            required
-                            className="field-input rounded-lg px-3 py-2 text-xs font-mono"
-                          />
-                          <input
-                            type="password"
-                            value={newEnvVal}
-                            onChange={(e) => setNewEnvVal(e.target.value)}
-                            placeholder="Value (encrypted at rest)"
-                            required
-                            className="field-input flex-1 min-w-[200px] rounded-lg px-3 py-2 text-xs font-mono"
-                          />
-                          <button
-                            type="submit"
-                            className="btn-press rounded-lg bg-primary px-4 py-2 text-xs font-medium text-on-primary hover:bg-primary-hover cursor-pointer"
-                          >
-                            Save setting
-                          </button>
-                        </form>
-                        <div className="divide-y divide-line rounded-lg border border-line bg-canvas">
-                          {envVars.length === 0 ? (
-                            <p className="p-3.5 text-xs text-subtle">
-                              No saved settings yet.
-                            </p>
-                          ) : (
-                            envVars.map((entry) => (
-                              <div
-                                key={entry.key}
-                                className="flex items-center justify-between px-3.5 py-2.5 text-xs"
-                              >
-                                <div className="min-w-0 [overflow-wrap:anywhere]">
-                                  <span className="font-mono text-fg">
-                                    {entry.key}
-                                  </span>
-                                  <span className="ml-3 font-mono text-subtle">
-                                    {entry.maskedValue}
-                                  </span>
-                                </div>
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteEnv(entry.key)}
-                                  className="btn-press text-bad hover:text-bad cursor-pointer shrink-0 ml-3"
-                                >
-                                  Remove
-                                </button>
-                              </div>
-                            ))
-                          )}
-                        </div>
-                      </div>
+                      <AppEnvPanel
+                        app={app}
+                        envVars={envVars}
+                        missingEnvKeys={missingEnvKeys}
+                        envRequest={envRequest}
+                        busy={drawerLoading || isBusy}
+                        envNeedsRebuild={envNeedsRebuild}
+                        changedBuildTimeKeys={changedBuildTimeKeys}
+                        onSaveVars={handleSaveEnvVars}
+                        onDeleteVar={handleDeleteEnv}
+                        onDismissRequest={handleDismissEnvRequest}
+                        onRebuild={() => handleAction(app.slug, "rebuild")}
+                        onClearRebuildBanner={() => {
+                          setEnvNeedsRebuild(false);
+                          setChangedBuildTimeKeys([]);
+                        }}
+                      />
                     ) : section === "security" ? (
                       <div className="space-y-3 text-xs">
                         {inspectData ? (

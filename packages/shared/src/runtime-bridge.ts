@@ -2,6 +2,8 @@ import http from "node:http";
 import https from "node:https";
 import { z } from "zod";
 import {
+  extractBuildTimePublicEnvVars,
+  isBuildTimePublicEnvKey,
   isGithubHttpsRepoUrl,
   redactSecrets,
   scrubTokenFromText,
@@ -573,6 +575,7 @@ export interface RuntimeBuildGitInput {
   allowAutoDetect?: boolean | undefined;
   timeoutSeconds?: number | undefined;
   previousMode?: "save" | "preserve" | "clear" | undefined;
+  buildArgs?: Record<string, string> | undefined;
 }
 
 export interface RuntimeInspectGitInput {
@@ -817,6 +820,19 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       ? Math.max(SHORT_TIMEOUT_MS, (safeTimeoutSeconds + 30) * 1000)
       : Math.max(this.defaultTimeoutMs, BUILD_TIMEOUT_MS);
 
+    const safeBuildArgs = input.buildArgs
+      ? (() => {
+          for (const key of Object.keys(input.buildArgs)) {
+            if (!isBuildTimePublicEnvKey(key)) {
+              throw new Error(
+                `Build argument "${key}" is not an allowed public build-time variable.`,
+              );
+            }
+          }
+          return extractBuildTimePublicEnvVars(input.buildArgs);
+        })()
+      : undefined;
+
     let raw: unknown;
     try {
       raw = await this.requestJson(
@@ -835,6 +851,9 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
             ? { timeoutSeconds: safeTimeoutSeconds }
             : {}),
           ...(input.previousMode ? { previousMode: input.previousMode } : {}),
+          ...(safeBuildArgs && Object.keys(safeBuildArgs).length > 0
+            ? { buildArgs: safeBuildArgs }
+            : {}),
         },
         httpTimeoutMs,
       );

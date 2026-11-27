@@ -151,6 +151,164 @@ export function validateEnvKey(key: string): string {
   return key;
 }
 
+export const BUILD_TIME_PUBLIC_ENV_PREFIXES = [
+  "NEXT_PUBLIC_",
+  "VITE_",
+  "PUBLIC_",
+  "NUXT_PUBLIC_",
+  "REACT_APP_",
+  "EXPO_PUBLIC_",
+  "GATSBY_",
+] as const;
+
+export const MAX_BUILD_ARGS = 64;
+export const MAX_BUILD_ARGS_BYTES = 16 * 1024;
+
+/**
+ * Returns true when an environment variable key is a client-side public build-time
+ * variable (e.g. `NEXT_PUBLIC_*`, `VITE_*`) that frontend bundlers inline at build time.
+ * Server secrets are never matched and must never be passed as Docker `--build-arg`s.
+ */
+export function isBuildTimePublicEnvKey(key: string): boolean {
+  if (!ENV_KEY_PATTERN.test(key) || isForbiddenAppEnvKey(key)) {
+    return false;
+  }
+  return BUILD_TIME_PUBLIC_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+/**
+ * Extracts only safe, public build-time environment variables (e.g. `NEXT_PUBLIC_*`,
+ * `VITE_*`) from an app's env map for forwarding as Docker `--build-arg`s.
+ * Excludes any values containing null bytes or newlines and enforces count/size caps.
+ */
+export function extractBuildTimePublicEnvVars(
+  envMap: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  let count = 0;
+  let totalBytes = 0;
+  for (const key of Object.keys(envMap).sort()) {
+    if (!isBuildTimePublicEnvKey(key)) {
+      continue;
+    }
+    const value = envMap[key];
+    if (
+      typeof value !== "string" ||
+      value.includes("\0") ||
+      value.includes("\n") ||
+      value.includes("\r")
+    ) {
+      continue;
+    }
+    const entryBytes = Buffer.byteLength(`${key}=${value}\n`, "utf8");
+    if (count >= MAX_BUILD_ARGS || totalBytes + entryBytes > MAX_BUILD_ARGS_BYTES) {
+      break;
+    }
+    out[key] = value;
+    count += 1;
+    totalBytes += entryBytes;
+  }
+  return out;
+}
+
+export interface ParsedEnvEntry {
+  key: string;
+  value: string;
+}
+
+export interface ParsedEnvError {
+  line: number;
+  message: string;
+}
+
+/**
+ * Parses a multi-line `.env` text block into validated key/value pairs.
+ * Supports `#` comments, blank lines, optional `export ` prefixes, single/double quotes,
+ * and inline `#` comments on unquoted values. Later lines win on duplicate keys.
+ */
+export function parseEnvBlock(rawText: string): {
+  vars: ParsedEnvEntry[];
+  errors: ParsedEnvError[];
+} {
+  const byKey = new Map<string, string>();
+  const errors: ParsedEnvError[] = [];
+  const lines = rawText.split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const lineNo = i + 1;
+    let trimmed = lines[i]!.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    if (trimmed.startsWith("export ")) {
+      trimmed = trimmed.slice("export ".length).trim();
+    }
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx <= 0) {
+      errors.push({
+        line: lineNo,
+        message: `Line ${lineNo}: expected KEY=VALUE format.`,
+      });
+      continue;
+    }
+    const key = trimmed.slice(0, eqIdx).trim();
+    if (!ENV_KEY_PATTERN.test(key)) {
+      errors.push({
+        line: lineNo,
+        message: `Line ${lineNo}: invalid key "${key}" (use letters, numbers, and underscores).`,
+      });
+      continue;
+    }
+    if (isForbiddenAppEnvKey(key)) {
+      errors.push({
+        line: lineNo,
+        message: `Line ${lineNo}: "${key}" is reserved and cannot be set.`,
+      });
+      continue;
+    }
+    let rawVal = trimmed.slice(eqIdx + 1).trim();
+    let value: string;
+    if (
+      rawVal.length >= 2 &&
+      rawVal.startsWith('"') &&
+      rawVal.endsWith('"')
+    ) {
+      value = rawVal
+        .slice(1, -1)
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\r")
+        .replace(/\\t/g, "\t")
+        .replace(/\\"/g, '"')
+        .replace(/\\\\/g, "\\");
+    } else if (
+      rawVal.length >= 2 &&
+      rawVal.startsWith("'") &&
+      rawVal.endsWith("'")
+    ) {
+      value = rawVal.slice(1, -1);
+    } else {
+      const commentIdx = rawVal.search(/\s+#/);
+      if (commentIdx >= 0) {
+        rawVal = rawVal.slice(0, commentIdx).trimEnd();
+      }
+      value = rawVal;
+    }
+    if (value.includes("\0")) {
+      errors.push({
+        line: lineNo,
+        message: `Line ${lineNo}: value for "${key}" cannot contain null bytes.`,
+      });
+      continue;
+    }
+    byKey.set(key, value);
+  }
+
+  return {
+    vars: Array.from(byKey.entries()).map(([key, value]) => ({ key, value })),
+    errors,
+  };
+}
+
 /**
  * Returns true if an environment variable key is reserved/forbidden inside user apps
  * (such as host control-plane prefixes or dynamic linker variables).

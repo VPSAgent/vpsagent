@@ -9,6 +9,7 @@ import {
   type RuntimeBridge,
   RuntimeBridgeError,
   canScopeMutate,
+  isBuildTimePublicEnvKey,
   isSlugAllowedForToken,
   redactSecrets,
   redactStructuredValue,
@@ -55,7 +56,7 @@ export const MCP_SERVER_INSTRUCTIONS = [
   "3. Call inspect_git_repo first to preview the repo's detected runtime (Dockerfile, Next.js, Vite, Node.js, Python, or static HTML), suggested port, database companion hints, and .env.example key names.",
   "4. Call deploy_app (sourceType: 'git'). If no Dockerfile exists, VPSAgent auto-generates a safe non-root build recipe and detects the internal port automatically. If an appsBaseDomain is configured and you omit domain, VPSAgent assigns https://<slug>.<appsBaseDomain> automatically (pass noDomain: true or domain: null for a private app).",
   "5. Long builds continue safely in the background and return status 'deploying' with a deploymentId so your tool call never times out. Poll get_deployment(deploymentId) until status is 'succeeded' or 'failed' and inspect buildLogs if anything fails.",
-  "6. Security rule for secrets: NEVER ask the user to paste secret API keys, database passwords, or GitHub tokens into chat when envSettingsUrl or githubSettingsUrl is provided. Share those encrypted dashboard links instead.",
+  "6. Security rule for secrets: NEVER ask the user to paste secret API keys, database passwords, or GitHub tokens into chat. Call request_app_env to pre-populate a secure Variables checklist in the dashboard and share the returned envSettingsUrl (or share githubSettingsUrl for GitHub tokens). Note: NEXT_PUBLIC_*, VITE_*, PUBLIC_*, NUXT_PUBLIC_*, REACT_APP_*, EXPO_PUBLIC_*, and GATSBY_* variables are baked into frontend builds as Docker --build-args, so rebuild_app is required after changing them.",
 ].join("\n");
 
 const JsonRpcRequestSchema = z.object({
@@ -195,6 +196,13 @@ const TOOL_ANNOTATIONS: Record<string, McpToolAnnotations> = {
   },
   update_app_env: {
     title: "Update App Environment",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  request_app_env: {
+    title: "Request App Environment Variables",
     readOnlyHint: false,
     destructiveHint: false,
     idempotentHint: true,
@@ -570,7 +578,7 @@ const RAW_MCP_TOOLS: McpToolDefinition[] = [
   {
     name: "update_app_env",
     description:
-      "Set or remove encrypted environment variables for an app and re-apply its .env file.",
+      "Set or remove encrypted environment variables for an app and re-apply its .env file. For sensitive secrets (API keys, webhook secrets, passwords), prefer request_app_env so the owner enters them directly in the dashboard instead of pasting secrets into chat. Changing build-time public vars (NEXT_PUBLIC_*, VITE_*, etc.) on a Git app requires rebuild_app.",
     inputSchema: {
       type: "object",
       properties: {
@@ -590,6 +598,45 @@ const RAW_MCP_TOOLS: McpToolDefinition[] = [
         deleteKeys: { type: "array", items: { type: "string" } },
       },
       required: ["slug"],
+    },
+  },
+  {
+    name: "request_app_env",
+    description:
+      "Pre-populate a secure Variables checklist in the VPSAgent dashboard so the server owner can paste or enter multiple environment variables (including secrets) directly without ever exposing secret values in chat. Returns a direct dashboard link to the app's Variables form.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        slug: { type: "string", description: "Target app slug" },
+        note: {
+          type: "string",
+          description:
+            "Short plain-English note explaining what these variables enable (e.g., 'Needed for Supabase auth and Polar billing').",
+        },
+        keys: {
+          type: "array",
+          description: "List of environment variable keys to request (names and hints only — never include secret values).",
+          items: {
+            type: "object",
+            properties: {
+              key: { type: "string", description: "Environment variable name (e.g. NEXT_PUBLIC_SUPABASE_URL)" },
+              description: { type: "string", description: "Optional short hint on where to find this value" },
+              isSecret: {
+                type: "boolean",
+                description: "True for passwords/tokens/private keys; false for public URLs or NEXT_PUBLIC_*/VITE_* keys.",
+              },
+              required: { type: "boolean", description: "Whether this setting is required (default true)." },
+            },
+            required: ["key"],
+          },
+        },
+        rebuildAfterSave: {
+          type: "boolean",
+          description:
+            "Recommend Save & Rebuild in the dashboard (automatically true if any NEXT_PUBLIC_*, VITE_*, or other build-time public var is included).",
+        },
+      },
+      required: ["slug", "keys"],
     },
   },
   {
@@ -1959,14 +2006,18 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
           });
           const envVars = store.listAppEnvVars(slug);
           const missingEnvKeys = executor.getMissingEnvKeys(slug);
+          const envRequest = store.getAppEnvRequest(slug);
           callResult = toolOk({
             app,
             inspect,
             envVars,
             liveUrl: app?.domain ? `https://${app.domain}` : null,
             missingEnvKeys,
+            envRequest,
             envSettingsUrl:
-              missingEnvKeys.length > 0 ? buildEnvSettingsUrl(store, slug) : null,
+              missingEnvKeys.length > 0 || envRequest !== null
+                ? buildEnvSettingsUrl(store, slug)
+                : null,
             recentDeployments: store.listDeployments({ slug, limit: 5 }),
           });
           break;
@@ -2151,13 +2202,115 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
         case "update_app_env": {
           const slug = validateAppSlug(String(args.slug ?? ""));
           const envInput = UpdateAppEnvInputSchema.parse(args);
+          const changedBuildTimeKeys = Array.from(
+            new Set(
+              [...envInput.vars.map((v) => v.key), ...envInput.deleteKeys].filter(
+                (k) => isBuildTimePublicEnvKey(k),
+              ),
+            ),
+          );
           callResult = await handleMutation(token, {
             action: "update_env",
             targetSlug: slug,
             summary: `Update environment variables for "${slug}" (${envInput.vars.map((v) => v.key).join(", ") || "delete only"})`,
             payload: { slug, ...envInput },
             riskLevel: "medium",
-            run: () => executor.updateAppEnv(slug, envInput, "agent", token.id),
+            run: async () => {
+              const app = await executor.updateAppEnv(
+                slug,
+                envInput,
+                "agent",
+                token.id,
+              );
+              const needsRebuild =
+                app.sourceType === "git" && changedBuildTimeKeys.length > 0;
+              return {
+                app,
+                needsRebuild,
+                ...(changedBuildTimeKeys.length > 0
+                  ? {
+                      buildTimeKeys: changedBuildTimeKeys,
+                      ...(needsRebuild
+                        ? {
+                            message: `Updated environment variables for "${slug}". Build-time public vars (${changedBuildTimeKeys.join(", ")}) changed — call rebuild_app("${slug}") to bake them into the frontend build.`,
+                          }
+                        : {}),
+                    }
+                  : {}),
+              };
+            },
+          });
+          break;
+        }
+
+        case "request_app_env": {
+          if (!canScopeMutate(token.scope)) {
+            callResult = toolErr(
+              "Read-only AI passes cannot create environment variable checklists.",
+            );
+            break;
+          }
+          const slug = validateAppSlug(String(args.slug ?? ""));
+          if (!isSlugAllowedForToken(token, slug)) {
+            callResult = toolErr(
+              `This AI pass is not allowed to access app "${slug}".`,
+            );
+            break;
+          }
+          const appRecord = store.getApp(slug);
+          if (!appRecord) {
+            callResult = toolErr(`App "${slug}" not found.`);
+            break;
+          }
+          const parsedReq = z
+            .object({
+              note: z.string().max(400).optional(),
+              keys: z
+                .array(
+                  z.object({
+                    key: z.string().min(1).max(128),
+                    description: z.string().max(240).optional(),
+                    isSecret: z.boolean().optional(),
+                    required: z.boolean().optional(),
+                  }),
+                )
+                .min(1)
+                .max(60),
+              rebuildAfterSave: z.boolean().optional(),
+            })
+            .parse(args);
+
+          const savedRequest = store.upsertAppEnvRequest({
+            slug,
+            note: parsedReq.note,
+            keys: parsedReq.keys,
+            rebuildAfterSave: parsedReq.rebuildAfterSave,
+            requestedBy: token.name,
+          });
+          const existingKeys = new Set(
+            store.listAppEnvVars(slug).map((entry) => entry.key),
+          );
+          const alreadySetKeys = savedRequest.keys
+            .map((k) => k.key)
+            .filter((k) => existingKeys.has(k));
+          const envSettingsUrl = buildEnvSettingsUrl(store, slug);
+          store.recordAudit({
+            actor: "agent",
+            actorTokenId: token.id,
+            action: "app.env_requested",
+            targetSlug: slug,
+            summary: `Requested ${savedRequest.keys.length} environment variable(s) for "${slug}" via dashboard checklist`,
+            riskLevel: "low",
+          });
+          callResult = toolOk({
+            status: "awaiting_user_input",
+            slug,
+            envRequest: savedRequest,
+            alreadySetKeys,
+            rebuildRecommended:
+              appRecord.sourceType === "git" && savedRequest.rebuildAfterSave,
+            envSettingsUrl,
+            message: `Prepared a secure Variables checklist for "${slug}" (${savedRequest.keys.length} setting${savedRequest.keys.length === 1 ? "" : "s"}). Share this dashboard link with the owner so they can paste a .env block or fill in values directly without putting secrets in chat: ${envSettingsUrl}`,
           });
           break;
         }

@@ -5100,6 +5100,89 @@ sys.exit(0)
         self.assertIsNotNone(audit_row)
         self.assertEqual(json.loads(ver_row[0])["version"], 2)
 
+    def test_validate_build_args_and_auto_dockerfile_arg_injection(self) -> None:
+        # Allowed public build-time vars pass validation
+        validated = rb.validate_build_args(
+            {
+                "NEXT_PUBLIC_SUPABASE_URL": "https://demo.supabase.co",
+                "NEXT_PUBLIC_SUPABASE_ANON_KEY": "anon-key-123",
+                "VITE_API_URL": "https://api.example.com",
+            }
+        )
+        self.assertEqual(
+            validated,
+            {
+                "NEXT_PUBLIC_SUPABASE_URL": "https://demo.supabase.co",
+                "NEXT_PUBLIC_SUPABASE_ANON_KEY": "anon-key-123",
+                "VITE_API_URL": "https://api.example.com",
+            },
+        )
+
+        # Server secrets and forbidden keys are strictly rejected
+        for bad_args in (
+            {"SUPABASE_SERVICE_ROLE_KEY": "secret"},
+            {"DATABASE_URL": "postgres://secret"},
+            {"VPSAGENT_TOKEN": "secret"},
+            {"NEXT_PUBLIC_BAD": "line1\nline2"},
+        ):
+            with self.assertRaises(rb.BridgeRequestError):
+                rb.validate_build_args(bad_args)
+
+        # Auto-detected Next.js and Vite Dockerfiles declare ARG lines before RUN build
+        with tempfile.TemporaryDirectory() as tmp:
+            next_dir = os.path.join(tmp, "next-app")
+            os.makedirs(next_dir)
+            with open(os.path.join(next_dir, "package.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "name": "next-app",
+                        "dependencies": {"next": "15.0.0", "react": "19.0.0"},
+                        "scripts": {"build": "next build"},
+                    },
+                    fh,
+                )
+            next_info = rb._inspect_cloned_repo(
+                next_dir,
+                "https://github.com/acme/next-app",
+                "main",
+                "abc123",
+                "auto",
+                build_arg_keys=["NEXT_PUBLIC_SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_ANON_KEY"],
+            )
+            df = next_info["generatedDockerfile"]
+            self.assertIn("ARG NEXT_PUBLIC_SUPABASE_ANON_KEY\n", df)
+            self.assertIn("ARG NEXT_PUBLIC_SUPABASE_URL\n", df)
+            self.assertLess(
+                df.index("ARG NEXT_PUBLIC_SUPABASE_URL"),
+                df.index("RUN npm run build"),
+            )
+
+            vite_dir = os.path.join(tmp, "vite-app")
+            os.makedirs(vite_dir)
+            with open(os.path.join(vite_dir, "package.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {
+                        "name": "vite-app",
+                        "devDependencies": {"vite": "6.0.0"},
+                        "scripts": {"build": "vite build"},
+                    },
+                    fh,
+                )
+            vite_info = rb._inspect_cloned_repo(
+                vite_dir,
+                "https://github.com/acme/vite-app",
+                "main",
+                "def456",
+                "auto",
+                build_arg_keys=["VITE_API_URL"],
+            )
+            vite_df = vite_info["generatedDockerfile"]
+            self.assertIn("ARG VITE_API_URL\n", vite_df)
+            self.assertLess(
+                vite_df.index("ARG VITE_API_URL"),
+                vite_df.index("RUN npm run build"),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

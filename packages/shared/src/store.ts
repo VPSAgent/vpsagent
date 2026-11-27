@@ -12,6 +12,8 @@ import {
 } from "./mcp.js";
 import {
   formatGitTokenHint,
+  isBuildTimePublicEnvKey,
+  isForbiddenAppEnvKey,
   redactSecrets,
   redactStructuredValue,
   validateAppSlug,
@@ -22,6 +24,8 @@ import {
 import {
   type Actor,
   type AppEnvEntry,
+  type AppEnvRequest,
+  AppEnvRequestSchema,
   type AppRecord,
   AppRecordSchema,
   type AppStatus,
@@ -44,6 +48,7 @@ import {
   type NotificationRuntimeConfig,
   type NotificationSettings,
   NotificationSettingsSchema,
+  type RequestedEnvKey,
   type RiskLevel,
   type SetupState,
   SetupStateSchema,
@@ -302,6 +307,15 @@ export class RegistryStore {
         is_secret INTEGER NOT NULL DEFAULT 1,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (app_slug, key)
+      );
+
+      CREATE TABLE IF NOT EXISTS app_env_requests (
+        app_slug TEXT PRIMARY KEY REFERENCES apps(slug) ON DELETE CASCADE,
+        note TEXT,
+        keys_json TEXT NOT NULL,
+        rebuild_after_save INTEGER NOT NULL DEFAULT 0,
+        requested_by TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS deployments (
@@ -1090,7 +1104,9 @@ export class RegistryStore {
 
     for (const item of vars) {
       const safeKey = validateEnvKey(item.key);
-      const isSecret = item.isSecret ?? ENV_SECRET_KEY_HINT.test(safeKey);
+      const isSecret =
+        item.isSecret ??
+        (!isBuildTimePublicEnvKey(safeKey) && ENV_SECRET_KEY_HINT.test(safeKey));
       const encrypted = encryptValue(item.value, this.encryptionKey);
       stmt.run(slug, safeKey, encrypted, isSecret ? 1 : 0, now);
     }
@@ -1137,6 +1153,165 @@ export class RegistryStore {
       out[row.key] = decryptValue(row.value_enc, this.encryptionKey);
     }
     return out;
+  }
+
+  /**
+   * Stores a pending environment variable checklist requested by an AI agent so the
+   * server owner can enter values (especially secrets) directly in the dashboard
+   * without ever pasting secret values into chat.
+   */
+  upsertAppEnvRequest(input: {
+    slug: string;
+    note?: string | null | undefined;
+    keys: Array<{
+      key: string;
+      description?: string | undefined;
+      isSecret?: boolean | undefined;
+      required?: boolean | undefined;
+    }>;
+    rebuildAfterSave?: boolean | undefined;
+    requestedBy: string;
+  }): AppEnvRequest {
+    const slug = validateAppSlug(input.slug);
+    const app = this.getApp(slug);
+    if (!app) {
+      throw new Error(`App "${slug}" not found.`);
+    }
+    const deduped = new Map<string, RequestedEnvKey>();
+    for (const item of input.keys) {
+      const safeKey = validateEnvKey(item.key.trim());
+      if (isForbiddenAppEnvKey(safeKey)) {
+        throw new Error(
+          `Environment variable "${safeKey}" is reserved and cannot be requested.`,
+        );
+      }
+      const isPublicBuildVar = isBuildTimePublicEnvKey(safeKey);
+      const isSecret =
+        item.isSecret ??
+        (!isPublicBuildVar && ENV_SECRET_KEY_HINT.test(safeKey));
+      const cleanDesc = item.description?.trim()
+        ? redactSecrets(item.description.trim()).slice(0, 240)
+        : undefined;
+      deduped.set(safeKey, {
+        key: safeKey,
+        ...(cleanDesc ? { description: cleanDesc } : {}),
+        isSecret,
+        required: item.required ?? true,
+      });
+    }
+    const keys = Array.from(deduped.values()).slice(0, 60);
+    if (keys.length === 0) {
+      throw new Error("At least one environment variable key is required.");
+    }
+    const cleanNote = input.note?.trim()
+      ? redactSecrets(input.note.trim()).slice(0, 400)
+      : null;
+    const hasBuildTimeKey = keys.some((k) => isBuildTimePublicEnvKey(k.key));
+    const rebuildAfterSave = input.rebuildAfterSave ?? hasBuildTimeKey;
+    const requestedBy = input.requestedBy.trim().slice(0, 80) || "agent";
+    const now = new Date().toISOString();
+
+    this.db
+      .prepare(
+        `INSERT INTO app_env_requests (app_slug, note, keys_json, rebuild_after_save, requested_by, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(app_slug) DO UPDATE SET
+           note = excluded.note,
+           keys_json = excluded.keys_json,
+           rebuild_after_save = excluded.rebuild_after_save,
+           requested_by = excluded.requested_by,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        slug,
+        cleanNote,
+        JSON.stringify(keys),
+        rebuildAfterSave ? 1 : 0,
+        requestedBy,
+        now,
+      );
+
+    return AppEnvRequestSchema.parse({
+      slug,
+      note: cleanNote,
+      keys,
+      rebuildAfterSave,
+      requestedBy,
+      updatedAt: now,
+    });
+  }
+
+  getAppEnvRequest(slug: string): AppEnvRequest | null {
+    const row = this.db
+      .prepare("SELECT * FROM app_env_requests WHERE app_slug = ?")
+      .get(slug) as
+      | {
+          app_slug: string;
+          note: string | null;
+          keys_json: string;
+          rebuild_after_save: number;
+          requested_by: string;
+          updated_at: string;
+        }
+      | undefined;
+    if (!row) {
+      return null;
+    }
+    let keys: RequestedEnvKey[] = [];
+    try {
+      keys = JSON.parse(row.keys_json) as RequestedEnvKey[];
+    } catch {
+      keys = [];
+    }
+    return AppEnvRequestSchema.parse({
+      slug: row.app_slug,
+      note: row.note ?? null,
+      keys,
+      rebuildAfterSave: row.rebuild_after_save === 1,
+      requestedBy: row.requested_by,
+      updatedAt: row.updated_at,
+    });
+  }
+
+  clearAppEnvRequest(slug: string): boolean {
+    const res = this.db
+      .prepare("DELETE FROM app_env_requests WHERE app_slug = ?")
+      .run(slug);
+    return Number(res.changes) > 0;
+  }
+
+  /**
+   * Removes any requested keys that have just been saved by the user, clearing the
+   * pending request completely once all requested keys are fulfilled.
+   */
+  pruneFulfilledEnvRequestKeys(
+    slug: string,
+    savedKeys: string[],
+  ): AppEnvRequest | null {
+    const existing = this.getAppEnvRequest(slug);
+    if (!existing || savedKeys.length === 0) {
+      return existing;
+    }
+    const savedSet = new Set(savedKeys);
+    const remaining = existing.keys.filter((item) => !savedSet.has(item.key));
+    if (remaining.length === 0) {
+      this.clearAppEnvRequest(slug);
+      return null;
+    }
+    if (remaining.length === existing.keys.length) {
+      return existing;
+    }
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        "UPDATE app_env_requests SET keys_json = ?, updated_at = ? WHERE app_slug = ?",
+      )
+      .run(JSON.stringify(remaining), now, slug);
+    return {
+      ...existing,
+      keys: remaining,
+      updatedAt: now,
+    };
   }
 
   // ---------------------------------------------------------------------------

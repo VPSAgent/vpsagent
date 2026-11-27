@@ -19,6 +19,7 @@ import {
   type RuntimeManageServiceResult,
   RuntimeServiceActionSchema,
   type RuntimeWriteFileResult,
+  extractBuildTimePublicEnvVars,
   generateApartmentBlueprint,
   isGithubHttpsRepoUrl,
   parseGithubRepoOwnerAndName,
@@ -819,6 +820,7 @@ export class AppExecutor {
                 ? "Cloning private GitHub repository and building image..."
                 : "Cloning GitHub repository and building image...",
             });
+            const buildArgs = extractBuildTimePublicEnvVars(mergedUserEnv);
             const { value: buildRes, usedCredentialId } =
               await this.runGitWithCandidates(
                 validatedGitUrl,
@@ -835,6 +837,7 @@ export class AppExecutor {
                       safeDockerfile === "auto",
                     timeoutSeconds: this.buildTimeoutSeconds,
                     previousMode,
+                    ...(Object.keys(buildArgs).length > 0 ? { buildArgs } : {}),
                   }),
               );
             buildLogs = buildRes.buildLogTail;
@@ -1183,6 +1186,7 @@ export class AppExecutor {
                 ? "Re-cloning private GitHub repository and rebuilding image..."
                 : "Re-cloning GitHub repository and rebuilding image...",
             });
+            const buildArgs = extractBuildTimePublicEnvVars(userEnv);
             const { value: buildRes, usedCredentialId } =
               await this.runGitWithCandidates(
                 safeRepo,
@@ -1199,6 +1203,7 @@ export class AppExecutor {
                       existing.dockerfilePath === "auto",
                     timeoutSeconds: this.buildTimeoutSeconds,
                     previousMode,
+                    ...(Object.keys(buildArgs).length > 0 ? { buildArgs } : {}),
                   }),
               );
             buildLogs = buildRes.buildLogTail;
@@ -1499,6 +1504,10 @@ export class AppExecutor {
       }
       if (validatedVars.length > 0) {
         this.store.setAppEnvVars(slug, validatedVars);
+        this.store.pruneFulfilledEnvRequestKeys(
+          slug,
+          validatedVars.map((v) => v.key),
+        );
       }
 
       const changedKeys = [
