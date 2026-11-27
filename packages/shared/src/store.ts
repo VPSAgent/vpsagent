@@ -39,6 +39,11 @@ import {
   type GitCredentialRecord,
   GitCredentialRecordSchema,
   type GitProvider,
+  type NotificationChannel,
+  NotificationChannelSchema,
+  type NotificationRuntimeConfig,
+  type NotificationSettings,
+  NotificationSettingsSchema,
   type RiskLevel,
   type SetupState,
   SetupStateSchema,
@@ -65,6 +70,12 @@ interface AppRow {
   detected_runtime: string | null;
   env_example_keys_json: string;
   git_credential_id: string | null;
+  webhook_enabled: number;
+  webhook_secret_enc: string | null;
+  webhook_last_triggered_at: string | null;
+  previous_commit_sha: string | null;
+  previous_image: string | null;
+  rollback_available: number;
   created_at: string;
   updated_at: string;
 }
@@ -273,6 +284,13 @@ export class RegistryStore {
         last_commit_sha TEXT,
         detected_runtime TEXT,
         env_example_keys_json TEXT NOT NULL DEFAULT '[]',
+        git_credential_id TEXT,
+        webhook_enabled INTEGER NOT NULL DEFAULT 0,
+        webhook_secret_enc TEXT,
+        webhook_last_triggered_at TEXT,
+        previous_commit_sha TEXT,
+        previous_image TEXT,
+        rollback_available INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -289,7 +307,7 @@ export class RegistryStore {
       CREATE TABLE IF NOT EXISTS deployments (
         id TEXT PRIMARY KEY,
         slug TEXT NOT NULL,
-        action TEXT NOT NULL CHECK (action IN ('deploy_app', 'rebuild_app')),
+        action TEXT NOT NULL CHECK (action IN ('deploy_app', 'rebuild_app', 'rollback_app')),
         status TEXT NOT NULL CHECK (status IN ('queued', 'cloning', 'building', 'starting', 'verifying', 'succeeded', 'failed')),
         actor TEXT NOT NULL CHECK (actor IN ('user', 'agent', 'system')),
         actor_token_id TEXT,
@@ -398,6 +416,12 @@ export class RegistryStore {
       "TEXT NOT NULL DEFAULT '[]'",
     );
     this.ensureColumn("apps", "git_credential_id", "TEXT");
+    this.ensureColumn("apps", "webhook_enabled", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureColumn("apps", "webhook_secret_enc", "TEXT");
+    this.ensureColumn("apps", "webhook_last_triggered_at", "TEXT");
+    this.ensureColumn("apps", "previous_commit_sha", "TEXT");
+    this.ensureColumn("apps", "previous_image", "TEXT");
+    this.ensureColumn("apps", "rollback_available", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("approval_requests", "token_id", "TEXT");
     this.ensureColumn("audit_events", "actor_token_id", "TEXT");
     this.ensureColumn(
@@ -406,6 +430,68 @@ export class RegistryStore {
       "TEXT NOT NULL DEFAULT '[]'",
     );
     this.migrateScopeCheckConstraints();
+    this.migrateDeploymentActionConstraint();
+  }
+
+  private migrateDeploymentActionConstraint(): void {
+    const depTable = this.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deployments'",
+      )
+      .get() as { sql?: string } | undefined;
+    if (depTable?.sql && !depTable.sql.includes("rollback_app")) {
+      this.db.exec("PRAGMA foreign_keys = OFF;");
+      try {
+        this.db.exec(`
+          BEGIN;
+          CREATE TABLE deployments_new (
+            id TEXT PRIMARY KEY,
+            slug TEXT NOT NULL,
+            action TEXT NOT NULL CHECK (action IN ('deploy_app', 'rebuild_app', 'rollback_app')),
+            status TEXT NOT NULL CHECK (status IN ('queued', 'cloning', 'building', 'starting', 'verifying', 'succeeded', 'failed')),
+            actor TEXT NOT NULL CHECK (actor IN ('user', 'agent', 'system')),
+            actor_token_id TEXT,
+            source_type TEXT NOT NULL CHECK (source_type IN ('image', 'git')),
+            git_repo_url TEXT,
+            git_branch TEXT,
+            commit_sha TEXT,
+            detected_runtime TEXT,
+            used_auto_dockerfile INTEGER NOT NULL DEFAULT 0,
+            domain TEXT,
+            phase_detail TEXT,
+            build_logs_json TEXT NOT NULL DEFAULT '[]',
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT
+          );
+          INSERT INTO deployments_new (
+            id, slug, action, status, actor, actor_token_id, source_type,
+            git_repo_url, git_branch, commit_sha, detected_runtime,
+            used_auto_dockerfile, domain, phase_detail, build_logs_json,
+            error_message, created_at, updated_at, finished_at
+          )
+            SELECT
+              id, slug, action, status, actor, actor_token_id, source_type,
+              git_repo_url, git_branch, commit_sha, detected_runtime,
+              used_auto_dockerfile, domain, phase_detail, build_logs_json,
+              error_message, created_at, updated_at, finished_at
+            FROM deployments;
+          DROP TABLE deployments;
+          ALTER TABLE deployments_new RENAME TO deployments;
+          CREATE INDEX IF NOT EXISTS idx_deployments_slug_created
+            ON deployments (slug, created_at DESC);
+          CREATE INDEX IF NOT EXISTS idx_deployments_created
+            ON deployments (created_at DESC);
+          COMMIT;
+        `);
+      } catch (err) {
+        this.db.exec("ROLLBACK;");
+        throw err;
+      } finally {
+        this.db.exec("PRAGMA foreign_keys = ON;");
+      }
+    }
   }
 
   private migrateScopeCheckConstraints(): void {
@@ -518,6 +604,11 @@ export class RegistryStore {
       | "detectedRuntime"
       | "envExampleKeys"
       | "gitCredentialId"
+      | "webhookEnabled"
+      | "webhookLastTriggeredAt"
+      | "previousCommitSha"
+      | "previousImage"
+      | "rollbackAvailable"
     > & {
       probeHttp?: boolean;
       probePath?: string;
@@ -525,6 +616,11 @@ export class RegistryStore {
       detectedRuntime?: string | null;
       envExampleKeys?: string[];
       gitCredentialId?: string | null;
+      webhookEnabled?: boolean;
+      webhookLastTriggeredAt?: string | null;
+      previousCommitSha?: string | null;
+      previousImage?: string | null;
+      rollbackAvailable?: boolean;
       createdAt?: string;
       updatedAt?: string;
     },
@@ -556,6 +652,21 @@ export class RegistryStore {
         input.gitCredentialId !== undefined
           ? input.gitCredentialId
           : (existing?.gitCredentialId ?? null),
+      webhookEnabled: input.webhookEnabled ?? existing?.webhookEnabled ?? false,
+      webhookLastTriggeredAt:
+        input.webhookLastTriggeredAt !== undefined
+          ? input.webhookLastTriggeredAt
+          : (existing?.webhookLastTriggeredAt ?? null),
+      previousCommitSha:
+        input.previousCommitSha !== undefined
+          ? input.previousCommitSha
+          : (existing?.previousCommitSha ?? null),
+      previousImage:
+        input.previousImage !== undefined
+          ? input.previousImage
+          : (existing?.previousImage ?? null),
+      rollbackAvailable:
+        input.rollbackAvailable ?? existing?.rollbackAvailable ?? false,
       createdAt: existing?.createdAt ?? input.createdAt ?? now,
       updatedAt: input.updatedAt ?? now,
     });
@@ -566,8 +677,10 @@ export class RegistryStore {
           slug, name, source_type, image, git_repo_url, git_branch, dockerfile_path,
           domain, folder_path, internal_port, probe_http, probe_path, status, cpu_limit,
           memory_limit_mb, companions_json, last_commit_sha, detected_runtime,
-          env_example_keys_json, git_credential_id, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          env_example_keys_json, git_credential_id, webhook_enabled,
+          webhook_last_triggered_at, previous_commit_sha, previous_image,
+          rollback_available, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(slug) DO UPDATE SET
           name = excluded.name,
           source_type = excluded.source_type,
@@ -588,6 +701,11 @@ export class RegistryStore {
           detected_runtime = excluded.detected_runtime,
           env_example_keys_json = excluded.env_example_keys_json,
           git_credential_id = excluded.git_credential_id,
+          webhook_enabled = excluded.webhook_enabled,
+          webhook_last_triggered_at = excluded.webhook_last_triggered_at,
+          previous_commit_sha = excluded.previous_commit_sha,
+          previous_image = excluded.previous_image,
+          rollback_available = excluded.rollback_available,
           updated_at = excluded.updated_at`,
       )
       .run(
@@ -611,6 +729,11 @@ export class RegistryStore {
         record.detectedRuntime,
         JSON.stringify(record.envExampleKeys),
         record.gitCredentialId,
+        record.webhookEnabled ? 1 : 0,
+        record.webhookLastTriggeredAt,
+        record.previousCommitSha,
+        record.previousImage,
+        record.rollbackAvailable ? 1 : 0,
         record.createdAt,
         record.updatedAt,
       );
@@ -740,6 +863,11 @@ export class RegistryStore {
       detectedRuntime: row.detected_runtime ?? null,
       envExampleKeys,
       gitCredentialId: row.git_credential_id ?? null,
+      webhookEnabled: (row.webhook_enabled ?? 0) !== 0,
+      webhookLastTriggeredAt: row.webhook_last_triggered_at ?? null,
+      previousCommitSha: row.previous_commit_sha ?? null,
+      previousImage: row.previous_image ?? null,
+      rollbackAvailable: (row.rollback_available ?? 0) !== 0,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     });
@@ -1741,5 +1869,353 @@ export class RegistryStore {
       throw err;
     }
     return deleted;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Session Versioning (invalidates older cookies on password change / logout all)
+  // ---------------------------------------------------------------------------
+
+  getSessionVersion(): number {
+    const stored = this.getSetting<{ version?: unknown }>("session_version");
+    const ver = stored?.version;
+    if (typeof ver === "number" && Number.isInteger(ver) && ver >= 1) {
+      return ver;
+    }
+    return 1;
+  }
+
+  bumpSessionVersion(): number {
+    let nextVersion = 2;
+    this.db.exec("BEGIN IMMEDIATE;");
+    try {
+      const current = this.getSessionVersion();
+      nextVersion = Math.max(1, current) + 1;
+      const now = new Date().toISOString();
+      this.db
+        .prepare(
+          `INSERT INTO system_settings (key, value_json, updated_at)
+           VALUES ('session_version', ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`,
+        )
+        .run(JSON.stringify({ version: nextVersion }), now);
+      this.db.exec("COMMIT;");
+    } catch (err) {
+      this.db.exec("ROLLBACK;");
+      throw err;
+    }
+    return nextVersion;
+  }
+
+  // ---------------------------------------------------------------------------
+  // App Webhooks & Rollback Metadata
+  // ---------------------------------------------------------------------------
+
+  enableAppWebhook(slug: string): { app: AppRecord; rawSecret: string } {
+    const safeSlug = validateAppSlug(slug);
+    const existing = this.getApp(safeSlug);
+    if (!existing) {
+      throw new Error(`App "${safeSlug}" not found.`);
+    }
+    if (existing.sourceType !== "git") {
+      throw new Error(
+        `App "${safeSlug}" uses a Docker image and does not support GitHub push webhooks.`,
+      );
+    }
+    const rawSecret = `whsec_${crypto.randomBytes(24).toString("hex")}`;
+    const secretEnc = encryptValue(rawSecret, this.encryptionKey);
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE apps
+         SET webhook_enabled = 1, webhook_secret_enc = ?, updated_at = ?
+         WHERE slug = ?`,
+      )
+      .run(secretEnc, now, safeSlug);
+    return { app: this.getApp(safeSlug)!, rawSecret };
+  }
+
+  disableAppWebhook(slug: string): AppRecord | null {
+    const safeSlug = validateAppSlug(slug);
+    const existing = this.getApp(safeSlug);
+    if (!existing) {
+      return null;
+    }
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE apps
+         SET webhook_enabled = 0, webhook_secret_enc = NULL, updated_at = ?
+         WHERE slug = ?`,
+      )
+      .run(now, safeSlug);
+    return this.getApp(safeSlug);
+  }
+
+  /** Internal runtime helper: decrypts webhook secret strictly for HMAC-SHA256 verification. */
+  getAppWebhookSecretForRuntime(slug: string): string | null {
+    const safeSlug = validateAppSlug(slug);
+    const row = this.db
+      .prepare(
+        "SELECT webhook_enabled, webhook_secret_enc FROM apps WHERE slug = ?",
+      )
+      .get(safeSlug) as
+      | { webhook_enabled: number; webhook_secret_enc: string | null }
+      | undefined;
+    if (!row || row.webhook_enabled === 0 || !row.webhook_secret_enc) {
+      return null;
+    }
+    return decryptValue(row.webhook_secret_enc, this.encryptionKey);
+  }
+
+  touchAppWebhookTriggered(slug: string): void {
+    const safeSlug = validateAppSlug(slug);
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        "UPDATE apps SET webhook_last_triggered_at = ?, updated_at = ? WHERE slug = ?",
+      )
+      .run(now, now, safeSlug);
+  }
+
+  updateAppRollbackState(
+    slug: string,
+    patch: {
+      previousCommitSha?: string | null;
+      previousImage?: string | null;
+      rollbackAvailable?: boolean;
+    },
+  ): AppRecord | null {
+    const safeSlug = validateAppSlug(slug);
+    const existing = this.getApp(safeSlug);
+    if (!existing) {
+      return null;
+    }
+    const nextPrevSha =
+      patch.previousCommitSha !== undefined
+        ? patch.previousCommitSha
+        : existing.previousCommitSha;
+    const nextPrevImage =
+      patch.previousImage !== undefined
+        ? patch.previousImage
+        : existing.previousImage;
+    const nextAvailable =
+      patch.rollbackAvailable !== undefined
+        ? patch.rollbackAvailable
+        : existing.rollbackAvailable;
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `UPDATE apps
+         SET previous_commit_sha = ?, previous_image = ?, rollback_available = ?, updated_at = ?
+         WHERE slug = ?`,
+      )
+      .run(nextPrevSha, nextPrevImage, nextAvailable ? 1 : 0, now, safeSlug);
+    return this.getApp(safeSlug);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Encrypted Alert / Notification Settings
+  // ---------------------------------------------------------------------------
+
+  private readStoredNotificationSettings(): {
+    enabled: boolean;
+    channel: NotificationChannel;
+    webhookUrlEnc: string | null;
+    webhookHint: string | null;
+    telegramBotTokenEnc: string | null;
+    telegramHint: string | null;
+    telegramChatId: string | null;
+    notifyOnApproval: boolean;
+    notifyOnAppDown: boolean;
+    notifyOnDeployFailure: boolean;
+    lastSentAt: string | null;
+    lastError: string | null;
+  } {
+    const raw = this.getSetting<Record<string, unknown>>("notification_settings");
+    if (!raw || typeof raw !== "object") {
+      return {
+        enabled: false,
+        channel: "none",
+        webhookUrlEnc: null,
+        webhookHint: null,
+        telegramBotTokenEnc: null,
+        telegramHint: null,
+        telegramChatId: null,
+        notifyOnApproval: true,
+        notifyOnAppDown: true,
+        notifyOnDeployFailure: true,
+        lastSentAt: null,
+        lastError: null,
+      };
+    }
+    const channelParsed = NotificationChannelSchema.safeParse(raw.channel);
+    return {
+      enabled: Boolean(raw.enabled),
+      channel: channelParsed.success ? channelParsed.data : "none",
+      webhookUrlEnc:
+        typeof raw.webhookUrlEnc === "string" ? raw.webhookUrlEnc : null,
+      webhookHint: typeof raw.webhookHint === "string" ? raw.webhookHint : null,
+      telegramBotTokenEnc:
+        typeof raw.telegramBotTokenEnc === "string"
+          ? raw.telegramBotTokenEnc
+          : null,
+      telegramHint:
+        typeof raw.telegramHint === "string" ? raw.telegramHint : null,
+      telegramChatId:
+        typeof raw.telegramChatId === "string" ? raw.telegramChatId : null,
+      notifyOnApproval:
+        typeof raw.notifyOnApproval === "boolean" ? raw.notifyOnApproval : true,
+      notifyOnAppDown:
+        typeof raw.notifyOnAppDown === "boolean" ? raw.notifyOnAppDown : true,
+      notifyOnDeployFailure:
+        typeof raw.notifyOnDeployFailure === "boolean"
+          ? raw.notifyOnDeployFailure
+          : true,
+      lastSentAt: typeof raw.lastSentAt === "string" ? raw.lastSentAt : null,
+      lastError: typeof raw.lastError === "string" ? raw.lastError : null,
+    };
+  }
+
+  private formatWebhookHint(url: string): string {
+    try {
+      const u = new URL(url);
+      const tail = u.pathname.replace(/\/+$/, "").slice(-4);
+      return `${u.origin}/...••••${tail || ""}`;
+    } catch {
+      return "https://...••••";
+    }
+  }
+
+  private formatTelegramTokenHint(token: string): string {
+    const last4 = token.trim().slice(-4);
+    return `bot••••${last4}`;
+  }
+
+  getNotificationSettings(): NotificationSettings {
+    const stored = this.readStoredNotificationSettings();
+    const isTelegram = stored.channel === "telegram";
+    const isWebhook =
+      stored.channel === "discord" ||
+      stored.channel === "slack" ||
+      stored.channel === "webhook";
+    const hasTargetSecret = isTelegram
+      ? Boolean(stored.telegramBotTokenEnc && stored.telegramChatId)
+      : isWebhook
+        ? Boolean(stored.webhookUrlEnc)
+        : false;
+    const targetHint = isTelegram
+      ? stored.telegramHint
+      : isWebhook
+        ? stored.webhookHint
+        : null;
+    return NotificationSettingsSchema.parse({
+      enabled: stored.enabled,
+      channel: stored.channel,
+      hasTargetSecret,
+      targetHint,
+      telegramChatId: stored.telegramChatId,
+      notifyOnApproval: stored.notifyOnApproval,
+      notifyOnAppDown: stored.notifyOnAppDown,
+      notifyOnDeployFailure: stored.notifyOnDeployFailure,
+      lastSentAt: stored.lastSentAt,
+      lastError: stored.lastError,
+    });
+  }
+
+  /** Internal runtime helper: decrypts webhook URL or Telegram bot token for outbound delivery. */
+  getNotificationConfigForRuntime(): NotificationRuntimeConfig {
+    const stored = this.readStoredNotificationSettings();
+    return {
+      enabled: stored.enabled,
+      channel: stored.channel,
+      webhookUrl: stored.webhookUrlEnc
+        ? decryptValue(stored.webhookUrlEnc, this.encryptionKey)
+        : null,
+      telegramBotToken: stored.telegramBotTokenEnc
+        ? decryptValue(stored.telegramBotTokenEnc, this.encryptionKey)
+        : null,
+      telegramChatId: stored.telegramChatId,
+      notifyOnApproval: stored.notifyOnApproval,
+      notifyOnAppDown: stored.notifyOnAppDown,
+      notifyOnDeployFailure: stored.notifyOnDeployFailure,
+    };
+  }
+
+  updateNotificationSettings(input: {
+    enabled?: boolean;
+    channel?: NotificationChannel;
+    webhookUrl?: string | null;
+    telegramBotToken?: string | null;
+    telegramChatId?: string | null;
+    notifyOnApproval?: boolean;
+    notifyOnAppDown?: boolean;
+    notifyOnDeployFailure?: boolean;
+  }): NotificationSettings {
+    const current = this.readStoredNotificationSettings();
+    const nextChannel = input.channel ?? current.channel;
+    const nextEnabled =
+      nextChannel === "none" ? false : (input.enabled ?? current.enabled);
+
+    let nextWebhookUrlEnc = current.webhookUrlEnc;
+    let nextWebhookHint = current.webhookHint;
+    if (input.webhookUrl !== undefined) {
+      const cleaned = input.webhookUrl?.trim() ?? "";
+      if (!cleaned) {
+        nextWebhookUrlEnc = null;
+        nextWebhookHint = null;
+      } else {
+        nextWebhookUrlEnc = encryptValue(cleaned, this.encryptionKey);
+        nextWebhookHint = this.formatWebhookHint(cleaned);
+      }
+    }
+
+    let nextTelegramBotTokenEnc = current.telegramBotTokenEnc;
+    let nextTelegramHint = current.telegramHint;
+    if (input.telegramBotToken !== undefined) {
+      const cleaned = input.telegramBotToken?.trim() ?? "";
+      if (!cleaned) {
+        nextTelegramBotTokenEnc = null;
+        nextTelegramHint = null;
+      } else {
+        nextTelegramBotTokenEnc = encryptValue(cleaned, this.encryptionKey);
+        nextTelegramHint = this.formatTelegramTokenHint(cleaned);
+      }
+    }
+
+    const nextTelegramChatId =
+      input.telegramChatId === undefined
+        ? current.telegramChatId
+        : input.telegramChatId?.trim() || null;
+
+    this.setSetting("notification_settings", {
+      enabled: nextEnabled,
+      channel: nextChannel,
+      webhookUrlEnc: nextWebhookUrlEnc,
+      webhookHint: nextWebhookHint,
+      telegramBotTokenEnc: nextTelegramBotTokenEnc,
+      telegramHint: nextTelegramHint,
+      telegramChatId: nextTelegramChatId,
+      notifyOnApproval: input.notifyOnApproval ?? current.notifyOnApproval,
+      notifyOnAppDown: input.notifyOnAppDown ?? current.notifyOnAppDown,
+      notifyOnDeployFailure:
+        input.notifyOnDeployFailure ?? current.notifyOnDeployFailure,
+      lastSentAt: current.lastSentAt,
+      lastError: null,
+    });
+    return this.getNotificationSettings();
+  }
+
+  recordNotificationDelivery(ok: boolean, error?: string | null): void {
+    const current = this.readStoredNotificationSettings();
+    const now = new Date().toISOString();
+    this.setSetting("notification_settings", {
+      ...current,
+      lastSentAt: ok ? now : current.lastSentAt,
+      lastError: ok
+        ? null
+        : error
+          ? redactSecrets(error).slice(0, 300)
+          : "Notification delivery failed.",
+    });
   }
 }

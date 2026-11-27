@@ -448,4 +448,141 @@ describe("RegistryStore (SQLite WAL)", () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("migrates legacy deployments CHECK constraint for rollback_app and manages sessions, webhooks, rollback, and encrypted alerts", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vpsagent-alpha2-"));
+    const legacyDbFile = path.join(tmpDir, "legacy-deploy.db");
+    try {
+      const legacy = new DatabaseSync(legacyDbFile);
+      legacy.exec(`
+        CREATE TABLE deployments (
+          id TEXT PRIMARY KEY,
+          slug TEXT NOT NULL,
+          action TEXT NOT NULL CHECK (action IN ('deploy_app', 'rebuild_app')),
+          status TEXT NOT NULL CHECK (status IN ('queued', 'cloning', 'building', 'starting', 'verifying', 'succeeded', 'failed')),
+          actor TEXT NOT NULL CHECK (actor IN ('user', 'agent', 'system')),
+          actor_token_id TEXT,
+          source_type TEXT NOT NULL CHECK (source_type IN ('image', 'git')),
+          git_repo_url TEXT,
+          git_branch TEXT,
+          commit_sha TEXT,
+          detected_runtime TEXT,
+          used_auto_dockerfile INTEGER NOT NULL DEFAULT 0,
+          domain TEXT,
+          phase_detail TEXT,
+          build_logs_json TEXT NOT NULL DEFAULT '[]',
+          error_message TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          finished_at TEXT
+        );
+        INSERT INTO deployments (
+          id, slug, action, status, actor, source_type, created_at, updated_at
+        ) VALUES (
+          'dep_existing', 'demo', 'deploy_app', 'succeeded', 'user', 'git',
+          '2026-11-26T00:00:00.000Z', '2026-11-26T00:00:00.000Z'
+        );
+      `);
+      legacy.close();
+
+      const migrated = new RegistryStore(legacyDbFile, {
+        encryptionSecret: "alpha2-store-encryption-secret-32b",
+      });
+      try {
+        expect(migrated.getDeployment("dep_existing")?.action).toBe("deploy_app");
+        const rbDep = migrated.createDeployment({
+          slug: "demo",
+          action: "rollback_app",
+          actor: "user",
+          sourceType: "git",
+        });
+        expect(rbDep.action).toBe("rollback_app");
+
+        // Session version starts at 1 and increments atomically
+        expect(migrated.getSessionVersion()).toBe(1);
+        expect(migrated.bumpSessionVersion()).toBe(2);
+        expect(migrated.getSessionVersion()).toBe(2);
+
+        // App webhook + rollback metadata persist across upsertApp
+        migrated.upsertApp({
+          slug: "git-demo",
+          name: "Git Demo",
+          sourceType: "git",
+          image: "vpsagent-app-git-demo:latest",
+          gitRepoUrl: "https://github.com/acme/git-demo",
+          gitBranch: "main",
+          dockerfilePath: "Dockerfile",
+          domain: null,
+          folderPath: "/apps/git-demo",
+          internalPort: 3000,
+          status: "running",
+          cpuLimit: "0.5",
+          memoryLimitMb: 512,
+          companions: [],
+        });
+
+        const { app: hooked, rawSecret } = migrated.enableAppWebhook("git-demo");
+        expect(hooked.webhookEnabled).toBe(true);
+        expect(rawSecret.startsWith("whsec_")).toBe(true);
+        expect(migrated.getAppWebhookSecretForRuntime("git-demo")).toBe(rawSecret);
+
+        migrated.updateAppRollbackState("git-demo", {
+          previousCommitSha: "1111222233334444",
+          rollbackAvailable: true,
+        });
+
+        // Ordinary upsertApp preserves webhook secret & rollback metadata
+        const reUpserted = migrated.upsertApp({
+          slug: "git-demo",
+          name: "Git Demo Renamed",
+          sourceType: "git",
+          image: "vpsagent-app-git-demo:latest",
+          gitRepoUrl: "https://github.com/acme/git-demo",
+          gitBranch: "main",
+          dockerfilePath: "Dockerfile",
+          domain: null,
+          folderPath: "/apps/git-demo",
+          internalPort: 3000,
+          status: "running",
+          cpuLimit: "1.0",
+          memoryLimitMb: 1024,
+          companions: [],
+        });
+        expect(reUpserted.webhookEnabled).toBe(true);
+        expect(reUpserted.rollbackAvailable).toBe(true);
+        expect(reUpserted.previousCommitSha).toBe("1111222233334444");
+        expect(migrated.getAppWebhookSecretForRuntime("git-demo")).toBe(rawSecret);
+
+        const disabled = migrated.disableAppWebhook("git-demo");
+        expect(disabled?.webhookEnabled).toBe(false);
+        expect(migrated.getAppWebhookSecretForRuntime("git-demo")).toBeNull();
+
+        // Encrypted notification settings mask secrets in public view
+        const webhookUrl = "https://discord.com/api/webhooks/12345/super-secret-token";
+        const savedAlerts = migrated.updateNotificationSettings({
+          enabled: true,
+          channel: "discord",
+          webhookUrl,
+          notifyOnApproval: true,
+          notifyOnAppDown: false,
+        });
+        expect(savedAlerts.enabled).toBe(true);
+        expect(savedAlerts.hasTargetSecret).toBe(true);
+        expect(savedAlerts.targetHint).not.toContain("super-secret-token");
+        expect(JSON.stringify(savedAlerts)).not.toContain("super-secret-token");
+        expect(migrated.getNotificationConfigForRuntime().webhookUrl).toBe(
+          webhookUrl,
+        );
+
+        migrated.recordNotificationDelivery(false, "Failed with Bearer secret999");
+        expect(migrated.getNotificationSettings().lastError).not.toContain(
+          "secret999",
+        );
+      } finally {
+        migrated.close();
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

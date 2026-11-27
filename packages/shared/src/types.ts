@@ -74,6 +74,11 @@ export const AppRecordSchema = z.object({
   detectedRuntime: z.string().max(48).nullable().default(null),
   envExampleKeys: z.array(z.string().min(1).max(128)).default([]),
   gitCredentialId: z.string().max(64).nullable().default(null),
+  webhookEnabled: z.boolean().default(false),
+  webhookLastTriggeredAt: z.string().nullable().default(null),
+  previousCommitSha: z.string().max(64).nullable().default(null),
+  previousImage: z.string().max(255).nullable().default(null),
+  rollbackAvailable: z.boolean().default(false),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -101,7 +106,11 @@ export const DeploymentStatusSchema = z.enum([
 ]);
 export type DeploymentStatus = z.infer<typeof DeploymentStatusSchema>;
 
-export const DeploymentActionSchema = z.enum(["deploy_app", "rebuild_app"]);
+export const DeploymentActionSchema = z.enum([
+  "deploy_app",
+  "rebuild_app",
+  "rollback_app",
+]);
 export type DeploymentAction = z.infer<typeof DeploymentActionSchema>;
 
 export const DeploymentRecordSchema = z.object({
@@ -165,6 +174,8 @@ export type ApprovalStatus = z.infer<typeof ApprovalStatusSchema>;
 export const ApprovalActionTypeSchema = z.enum([
   "deploy_app",
   "rebuild_app",
+  "rollback_app",
+  "update_app_settings",
   "update_env",
   "set_domain",
   "start_app",
@@ -238,3 +249,37 @@ export const DiskMetricsSchema = z.object({
   mount: z.string(),
 });
 export type DiskMetrics = z.infer<typeof DiskMetricsSchema>;
+
+export const NotificationChannelSchema = z.enum([
+  "none",
+  "discord",
+  "slack",
+  "telegram",
+  "webhook",
+]);
+export type NotificationChannel = z.infer<typeof NotificationChannelSchema>;
+
+export const NotificationSettingsSchema = z.object({
+  enabled: z.boolean().default(false),
+  channel: NotificationChannelSchema.default("none"),
+  hasTargetSecret: z.boolean().default(false),
+  targetHint: z.string().nullable().default(null),
+  telegramChatId: z.string().max(64).nullable().default(null),
+  notifyOnApproval: z.boolean().default(true),
+  notifyOnAppDown: z.boolean().default(true),
+  notifyOnDeployFailure: z.boolean().default(true),
+  lastSentAt: z.string().nullable().default(null),
+  lastError: z.string().nullable().default(null),
+});
+export type NotificationSettings = z.infer<typeof NotificationSettingsSchema>;
+
+export interface NotificationRuntimeConfig {
+  enabled: boolean;
+  channel: NotificationChannel;
+  webhookUrl: string | null;
+  telegramBotToken: string | null;
+  telegramChatId: string | null;
+  notifyOnApproval: boolean;
+  notifyOnAppDown: boolean;
+  notifyOnDeployFailure: boolean;
+}

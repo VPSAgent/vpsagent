@@ -105,6 +105,8 @@ export interface AppRecord {
   domain: string | null;
   folderPath: string;
   internalPort: number;
+  probeHttp?: boolean;
+  probePath?: string;
   status: "provisioning" | "building" | "running" | "stopped" | "error";
   cpuLimit: string;
   memoryLimitMb: number;
@@ -113,6 +115,11 @@ export interface AppRecord {
   detectedRuntime: string | null;
   envExampleKeys: string[];
   gitCredentialId: string | null;
+  webhookEnabled?: boolean;
+  webhookLastTriggeredAt?: string | null;
+  previousCommitSha?: string | null;
+  previousImage?: string | null;
+  rollbackAvailable?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -120,7 +127,7 @@ export interface AppRecord {
 export interface DeploymentRecord {
   id: string;
   slug: string;
-  action: "deploy_app" | "rebuild_app";
+  action: "deploy_app" | "rebuild_app" | "rollback_app";
   status:
     | "queued"
     | "cloning"
@@ -369,6 +376,26 @@ export interface InspectResult {
   }>;
 }
 
+export type NotificationChannel =
+  | "none"
+  | "discord"
+  | "slack"
+  | "telegram"
+  | "webhook";
+
+export interface NotificationSettings {
+  enabled: boolean;
+  channel: NotificationChannel;
+  hasTargetSecret: boolean;
+  targetHint: string | null;
+  telegramChatId: string | null;
+  notifyOnApproval: boolean;
+  notifyOnAppDown: boolean;
+  notifyOnDeployFailure: boolean;
+  lastSentAt: string | null;
+  lastError: string | null;
+}
+
 async function apiFetch<T>(
   url: string,
   init?: RequestInit,
@@ -401,6 +428,52 @@ async function apiFetch<T>(
     throw new Error(msg);
   }
   return data as T;
+}
+
+async function downloadBackupArchive(
+  url: string,
+  body: Record<string, unknown>,
+  fallbackFilename: string,
+): Promise<{ filename: string; sizeBytes: number }> {
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    let msg = `Download failed (${res.status}).`;
+    if (text.trim()) {
+      try {
+        const parsed = JSON.parse(text) as { error?: unknown };
+        if (typeof parsed.error === "string" && parsed.error.trim()) {
+          msg = parsed.error;
+        }
+      } catch {
+        // Ignore non-JSON error text
+      }
+    }
+    throw new Error(msg);
+  }
+  const headerName = res.headers.get("x-vpsagent-backup-filename");
+  const disp = res.headers.get("content-disposition") ?? "";
+  const dispMatch = disp.match(/filename="?([^";]+)"?/i);
+  const filename =
+    (headerName || dispMatch?.[1] || fallbackFilename)
+      .replace(/[^A-Za-z0-9._-]/g, "_") || fallbackFilename;
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = objectUrl;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  return { filename, sizeBytes: blob.size };
 }
 
 export const api = {
@@ -452,6 +525,16 @@ export const api = {
       body: JSON.stringify({ passphrase }),
     }),
   logout: () => apiFetch<{ ok: true }>("/api/auth/logout", { method: "POST" }),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    apiFetch<{ ok: true }>("/api/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({ currentPassword, newPassword }),
+    }),
+  logoutAll: (keepCurrent = false) =>
+    apiFetch<{ ok: true; signedOutCurrent: boolean }>("/api/auth/logout-all", {
+      method: "POST",
+      body: JSON.stringify({ keepCurrent }),
+    }),
 
   getOverview: () => apiFetch<OverviewResponse>("/api/overview"),
   listApps: () => apiFetch<{ apps: AppRecord[] }>("/api/apps"),
@@ -578,6 +661,92 @@ export const api = {
   deleteApp: (slug: string) =>
     apiFetch<{ ok: true }>(`/api/apps/${encodeURIComponent(slug)}?removeFiles=true`, {
       method: "DELETE",
+    }),
+  updateAppSettings: (
+    slug: string,
+    patch: {
+      name?: string;
+      cpuLimit?: string;
+      memoryLimitMb?: number;
+      internalPort?: number;
+      probeHttp?: boolean;
+      probePath?: string;
+      image?: string;
+      gitBranch?: string | null;
+      dockerfilePath?: string;
+      gitCredentialId?: string | null;
+      companions?: CompanionService[];
+    },
+  ) =>
+    apiFetch<{ app: AppRecord; needsRebuild: boolean }>(
+      `/api/apps/${encodeURIComponent(slug)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      },
+    ),
+  rollbackApp: (slug: string) =>
+    apiFetch<{ app: AppRecord; deployment: DeploymentRecord }>(
+      `/api/apps/${encodeURIComponent(slug)}/rollback`,
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+    ),
+  enableAppWebhook: (slug: string) =>
+    apiFetch<{
+      app: AppRecord;
+      webhookUrl: string;
+      rawSecret: string;
+      branch: string;
+      publicDomainReady: boolean;
+    }>(`/api/apps/${encodeURIComponent(slug)}/webhook`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
+  disableAppWebhook: (slug: string) =>
+    apiFetch<{ app: AppRecord }>(
+      `/api/apps/${encodeURIComponent(slug)}/webhook`,
+      {
+        method: "DELETE",
+      },
+    ),
+  downloadAppBackup: (slug: string) =>
+    downloadBackupArchive(
+      `/api/apps/${encodeURIComponent(slug)}/backup`,
+      {},
+      `vpsagent-app-${slug}.tar.gz`,
+    ),
+  downloadSystemBackup: (includeAppData = false) =>
+    downloadBackupArchive(
+      "/api/system/backup",
+      { includeAppData },
+      "vpsagent-server-backup.tar.gz",
+    ),
+  getNotifications: () =>
+    apiFetch<{ settings: NotificationSettings }>("/api/notifications"),
+  updateNotifications: (payload: {
+    enabled?: boolean;
+    channel?: NotificationChannel;
+    webhookUrl?: string | null;
+    telegramBotToken?: string | null;
+    telegramChatId?: string | null;
+    notifyOnApproval?: boolean;
+    notifyOnAppDown?: boolean;
+    notifyOnDeployFailure?: boolean;
+  }) =>
+    apiFetch<{ settings: NotificationSettings }>("/api/notifications", {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+  testNotification: () =>
+    apiFetch<{
+      ok: boolean;
+      error: string | null;
+      settings: NotificationSettings;
+    }>("/api/notifications/test", {
+      method: "POST",
+      body: JSON.stringify({}),
     }),
   getAppLogs: (slug: string, tail = 100) =>
     apiFetch<{ slug: string; lines: string[] }>(

@@ -12,6 +12,7 @@ interface SessionPayload {
   sub: "owner";
   iat: number;
   exp: number;
+  ver?: number;
 }
 
 export interface TransportContextOptions {
@@ -315,6 +316,7 @@ export class SessionManager {
       sub: "owner",
       iat: nowSec,
       exp: nowSec + SESSION_TTL_SECONDS,
+      ver: this.store.getSessionVersion(),
     };
     const encoded = Buffer.from(JSON.stringify(payload), "utf8").toString(
       "base64url",
@@ -345,7 +347,14 @@ export class SessionManager {
       ) as SessionPayload;
       if (parsed.sub !== "owner") return false;
       const nowSec = Math.floor(Date.now() / 1000);
-      return typeof parsed.exp === "number" && parsed.exp > nowSec;
+      if (typeof parsed.exp !== "number" || parsed.exp <= nowSec) {
+        return false;
+      }
+      const currentVer = this.store.getSessionVersion();
+      if (parsed.ver === currentVer) {
+        return true;
+      }
+      return parsed.ver === undefined && currentVer === 1;
     } catch {
       return false;
     }

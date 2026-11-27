@@ -9,9 +9,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import threading
@@ -4484,6 +4486,437 @@ sys.exit(0)
         )
         for leaked in ("admin", "supersecret", "querysecret", "frag"):
             self.assertNotIn(leaked, str(root_cred_status))
+
+
+class TestReleaseAlpha2Features(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_dir = tempfile.mkdtemp(prefix="vpsagent-alpha2-py-")
+        self.vpsagent_root = os.path.join(self.tmp_dir, "vpsagent")
+        self.apps_root = os.path.join(self.vpsagent_root, "apps")
+        self.caddy_core_dir = os.path.join(self.vpsagent_root, "caddy", "core.d")
+        self.caddy_apps_dir = os.path.join(self.vpsagent_root, "caddy", "apps.d")
+        os.makedirs(self.apps_root, exist_ok=True)
+        os.makedirs(self.caddy_core_dir, exist_ok=True)
+        os.makedirs(self.caddy_apps_dir, exist_ok=True)
+        self.state_file = os.path.join(self.tmp_dir, "docker-state.json")
+        self.calls_file = os.path.join(self.tmp_dir, "docker-calls.jsonl")
+        Path(self.state_file).write_text(
+            json.dumps(
+                {
+                    "images": {},
+                    "buildSeq": 0,
+                    "failBuild": False,
+                    "runningProjects": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        git_py = os.path.join(self.tmp_dir, "fake_git.py")
+        Path(git_py).write_text(
+            """import os, sys
+args = sys.argv[1:]
+if "clone" in args:
+    dst = args[-1]
+    os.makedirs(dst, exist_ok=True)
+    with open(os.path.join(dst, "Dockerfile"), "w", encoding="utf-8") as fh:
+        fh.write("FROM alpine:3.20\\n")
+    sys.exit(0)
+if "rev-parse" in args:
+    if "--abbrev-ref" in args:
+        print("main")
+    else:
+        print("deadbeef1234567890abcdef1234567890abcdef")
+    sys.exit(0)
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        self.git_sh = os.path.join(self.tmp_dir, "fake-git")
+        Path(self.git_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{git_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(self.git_sh, 0o755)
+
+        docker_py = os.path.join(self.tmp_dir, "fake_docker.py")
+        Path(docker_py).write_text(
+            f"""import json, os, sys
+state_file = {self.state_file!r}
+calls_file = {self.calls_file!r}
+args = sys.argv[1:]
+with open(calls_file, "a", encoding="utf-8") as cfh:
+    cfh.write(json.dumps(args) + "\\n")
+
+with open(state_file, "r", encoding="utf-8") as fh:
+    st = json.load(fh)
+
+def save():
+    with open(state_file, "w", encoding="utf-8") as fh:
+        json.dump(st, fh)
+
+if args[:1] == ["build"]:
+    if st.get("failBuild"):
+        sys.stderr.write("Simulated build error\\n")
+        sys.exit(1)
+    tag = args[args.index("-t") + 1]
+    st["buildSeq"] += 1
+    st["images"][tag] = f"sha256:img{{st['buildSeq']}}"
+    save()
+    print(f"Built {{tag}} -> {{st['images'][tag]}}")
+    sys.exit(0)
+
+if args[:2] == ["image", "inspect"]:
+    ref = args[-1]
+    img_id = st["images"].get(ref)
+    if not img_id:
+        sys.exit(1)
+    print(img_id)
+    sys.exit(0)
+
+if args[:1] == ["tag"]:
+    src, dst = args[1], args[2]
+    # Support tagging by sha256 id or tag name
+    resolved = src if src.startswith("sha256:") else st["images"].get(src)
+    if not resolved:
+        sys.exit(1)
+    st["images"][dst] = resolved
+    save()
+    sys.exit(0)
+
+if args[:1] == ["rmi"]:
+    for target in args[1:]:
+        if not target.startswith("-"):
+            st["images"].pop(target, None)
+    save()
+    sys.exit(0)
+
+if args[:2] in (["container", "prune"], ["image", "prune"], ["builder", "prune"], ["volume", "prune"]):
+    print("Total reclaimed space: 0B")
+    sys.exit(0)
+
+if args[:1] == ["compose"]:
+    proj = args[args.index("-p") + 1] if "-p" in args else ""
+    if "up" in args:
+        if proj not in st["runningProjects"]:
+            st["runningProjects"].append(proj)
+        save()
+        sys.exit(0)
+    if "ps" in args:
+        if proj in st["runningProjects"]:
+            print(json.dumps({{"Name": proj, "State": "running", "Health": "healthy", "ExitCode": 0}}))
+        sys.exit(0)
+    if "exec" in args:
+        sys.stdout.write("-- PostgreSQL database dump\\nSELECT 1;\\n")
+        sys.exit(0)
+
+sys.exit(0)
+""",
+            encoding="utf-8",
+        )
+        self.docker_sh = os.path.join(self.tmp_dir, "fake-docker")
+        Path(self.docker_sh).write_text(
+            f'#!/usr/bin/env sh\nexec "{sys.executable}" "{docker_py}" "$@"\n',
+            encoding="utf-8",
+        )
+        os.chmod(self.docker_sh, 0o755)
+
+        self.svc = rb.RuntimeService(
+            apps_root=self.apps_root,
+            caddy_apps_dir=self.caddy_apps_dir,
+            caddy_core_dir=self.caddy_core_dir,
+            caddy_container="vpsagent-caddy",
+            docker_bin=self.docker_sh,
+            git_bin=self.git_sh,
+            vpsagent_root=self.vpsagent_root,
+            runtime_token="alpha2-python-bridge-secret-token",
+            dns_resolver=lambda _host, _port: ["140.82.121.4"],
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _write_minimal_app(self, slug: str, *, with_postgres: bool = False) -> None:
+        app_dir = os.path.join(self.apps_root, slug)
+        os.makedirs(os.path.join(app_dir, "data"), exist_ok=True)
+        compose_lines = [
+            "services:",
+            "  app:",
+            f'    image: "vpsagent-app-{slug}:latest"',
+            f'    container_name: "vpsagent-app-{slug}"',
+            "    restart: unless-stopped",
+            "    env_file:",
+            "      - .env",
+            "    volumes:",
+            "      - ./data:/app/data:rw",
+            '    cpus: "0.5"',
+            '    mem_limit: "256m"',
+            "    cap_drop:",
+            "      - ALL",
+            "    security_opt:",
+            "      - no-new-privileges:true",
+            "    networks:",
+            "      - app_net",
+        ]
+        if with_postgres:
+            os.makedirs(os.path.join(app_dir, "data", "postgres"), exist_ok=True)
+            Path(os.path.join(app_dir, "data", "postgres", "PG_VERSION")).write_text(
+                "16\n", encoding="utf-8"
+            )
+            compose_lines.extend(
+                [
+                    "  postgres:",
+                    '    image: "postgres:16-alpine"',
+                    f'    container_name: "vpsagent-app-{slug}-postgres"',
+                    "    restart: unless-stopped",
+                    '    user: "70:70"',
+                    "    volumes:",
+                    "      - ./data/postgres:/var/lib/postgresql/data:rw",
+                    '    cpus: "0.5"',
+                    '    mem_limit: "256m"',
+                    "    cap_drop:",
+                    "      - ALL",
+                    "    security_opt:",
+                    "      - no-new-privileges:true",
+                    "    networks:",
+                    "      - app_net",
+                ]
+            )
+        compose_lines.extend(["networks:", "  app_net:", "    driver: bridge", ""])
+        Path(os.path.join(app_dir, "docker-compose.yml")).write_text(
+            "\n".join(compose_lines), encoding="utf-8"
+        )
+        Path(os.path.join(app_dir, ".env")).write_text(
+            "APP_PORT='8080'\nTOP_SECRET='never-put-in-backup'\nPOSTGRES_DB='app_db'\nPOSTGRES_USER='vps_user'\nPOSTGRES_PASSWORD='pg_secret_password'\n",
+            encoding="utf-8",
+        )
+        Path(os.path.join(app_dir, "probe.json")).write_text(
+            json.dumps({"probeHttp": True, "internalPort": 8080, "probePath": "/"}),
+            encoding="utf-8",
+        )
+        Path(os.path.join(app_dir, "data", "hello.txt")).write_text(
+            "persistent app data", encoding="utf-8"
+        )
+
+    def test_build_git_rollback_and_protected_docker_cleanup(self) -> None:
+        self._write_minimal_app("demo-rb")
+        with self.assertRaises(rb.BridgeRequestError) as cm_missing:
+            self.svc.rollback_app({"slug": "demo-rb"})
+        self.assertEqual(cm_missing.exception.status_code, 404)
+
+        # Build #1 -> no previous image yet
+        b1 = self.svc.build_git(
+            {
+                "slug": "demo-rb",
+                "gitRepoUrl": "https://github.com/acme/demo-rb.git",
+            }
+        )
+        self.assertFalse(b1["previousImageSaved"])
+
+        # Build #2 -> saves build #1 as :previous
+        b2 = self.svc.build_git(
+            {
+                "slug": "demo-rb",
+                "gitRepoUrl": "https://github.com/acme/demo-rb.git",
+            }
+        )
+        self.assertTrue(b2["previousImageSaved"])
+        st = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        self.assertEqual(st["images"]["vpsagent-app-demo-rb:latest"], "sha256:img2")
+        self.assertEqual(st["images"]["vpsagent-app-demo-rb:previous"], "sha256:img1")
+
+        # Failed build #3 leaves :latest and :previous intact
+        st["failBuild"] = True
+        Path(self.state_file).write_text(json.dumps(st), encoding="utf-8")
+        with self.assertRaises(rb.BridgeRequestError):
+            self.svc.build_git(
+                {
+                    "slug": "demo-rb",
+                    "gitRepoUrl": "https://github.com/acme/demo-rb.git",
+                }
+            )
+        st_after_fail = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        self.assertEqual(
+            st_after_fail["images"]["vpsagent-app-demo-rb:previous"], "sha256:img1"
+        )
+
+        # docker_cleanup protects vpsagent.managed=true images
+        self.svc.docker_cleanup({"pruneImages": True})
+        calls = [
+            json.loads(line)
+            for line in Path(self.calls_file).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(
+            ["image", "prune", "-af", "--filter", "label!=vpsagent.managed=true"],
+            calls,
+        )
+
+        # Rollback swaps :previous <-> :latest and brings compose up
+        rb_res = self.svc.rollback_app({"slug": "demo-rb"})
+        self.assertTrue(rb_res["ok"])
+        self.assertTrue(rb_res["swapped"])
+        self.assertEqual(rb_res["status"], "running")
+        st_after_rb = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        self.assertEqual(
+            st_after_rb["images"]["vpsagent-app-demo-rb:latest"], "sha256:img1"
+        )
+        self.assertEqual(
+            st_after_rb["images"]["vpsagent-app-demo-rb:previous"], "sha256:img2"
+        )
+
+    def test_backups_exclude_env_secrets_and_symlinks_and_include_dumps(self) -> None:
+        self._write_minimal_app("pg-app", with_postgres=True)
+        # Mark pg-app as running in fake docker so pg_dump executes
+        st = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        st["runningProjects"] = ["vpsagent-pg-app"]
+        Path(self.state_file).write_text(json.dumps(st), encoding="utf-8")
+
+        # Add secret .pem and symlink inside data/ to verify exclusion
+        Path(os.path.join(self.apps_root, "pg-app", "data", "private.pem")).write_text(
+            "PRIVATE KEY", encoding="utf-8"
+        )
+        os.symlink(
+            "/etc/passwd",
+            os.path.join(self.apps_root, "pg-app", "data", "escape-link"),
+        )
+
+        # Create SQLite registry.db & Caddy route files
+        data_dir = os.path.join(self.vpsagent_root, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        db_path = os.path.join(data_dir, "registry.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE sample (id INTEGER PRIMARY KEY, name TEXT)")
+        conn.execute("INSERT INTO sample (name) VALUES ('ok')")
+        conn.commit()
+        conn.close()
+        Path(os.path.join(self.caddy_apps_dir, "pg-app.caddy")).write_text(
+            "pg.example.com {\n  reverse_proxy vpsagent-app-pg-app:8080\n}\n",
+            encoding="utf-8",
+        )
+        Path(os.path.join(self.vpsagent_root, ".env")).write_text(
+            "VPSAGENT_ENCRYPTION_SECRET=super-secret-master-key\n",
+            encoding="utf-8",
+        )
+
+        app_tar, app_name = self.svc.create_app_backup({"slug": "pg-app"})
+        try:
+            self.assertTrue(app_name.endswith(".tar.gz"))
+            with tarfile.open(app_tar, "r:gz") as tf:
+                names = tf.getnames()
+            self.assertTrue(any(n.endswith("/manifest.json") for n in names))
+            self.assertTrue(any(n.endswith("/RESTORE.txt") for n in names))
+            self.assertTrue(any(n.endswith("/docker-compose.yml") for n in names))
+            self.assertTrue(any(n.endswith("/postgres.sql") for n in names))
+            self.assertTrue(any(n.endswith("/data/hello.txt") for n in names))
+            self.assertFalse(any(".env" in n for n in names))
+            self.assertFalse(any("private.pem" in n for n in names))
+            self.assertFalse(any("escape-link" in n for n in names))
+            # Hot PG data dir skipped when pg_dump succeeded
+            self.assertFalse(any("data/postgres" in n for n in names))
+        finally:
+            if os.path.exists(app_tar):
+                os.unlink(app_tar)
+
+        core_tar, core_name = self.svc.create_core_backup({"includeAppData": True})
+        try:
+            self.assertTrue(core_name.endswith(".tar.gz"))
+            with tarfile.open(core_tar, "r:gz") as tf:
+                names = tf.getnames()
+            self.assertTrue(any(n.endswith("/registry.db") for n in names))
+            self.assertTrue(any(n.endswith("/caddy/apps.d/pg-app.caddy") for n in names))
+            self.assertTrue(any(n.endswith("/apps/pg-app/postgres.sql") for n in names))
+            self.assertFalse(any(".env" in n for n in names))
+        finally:
+            if os.path.exists(core_tar):
+                os.unlink(core_tar)
+
+    def test_reset_password_cli_updates_hash_and_bumps_session_version(self) -> None:
+        data_dir = os.path.join(self.vpsagent_root, "data")
+        os.makedirs(data_dir, exist_ok=True)
+        db_path = os.path.join(data_dir, "registry.db")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE system_settings (
+              key TEXT PRIMARY KEY,
+              value_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE audit_events (
+              id TEXT PRIMARY KEY,
+              actor TEXT NOT NULL,
+              actor_token_id TEXT,
+              action TEXT NOT NULL,
+              target_slug TEXT,
+              summary TEXT NOT NULL,
+              risk_level TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            );
+            INSERT INTO system_settings (key, value_json, updated_at)
+            VALUES ('setup_state', '{"claimed": false}', '2026-11-26T00:00:00Z');
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        # Unclaimed DB must reject password reset
+        proc_unclaimed = subprocess.run(
+            [
+                sys.executable,
+                str(BRIDGE_PATH),
+                "--reset-password",
+                "--db-path",
+                db_path,
+                "--password-stdin",
+            ],
+            input="new-valid-password-123\n",
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertNotEqual(proc_unclaimed.returncode, 0)
+
+        # Claim DB, then reset password via CLI
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "UPDATE system_settings SET value_json = ? WHERE key = 'setup_state'",
+            (json.dumps({"claimed": True}),),
+        )
+        conn.commit()
+        conn.close()
+
+        proc_ok = subprocess.run(
+            [
+                sys.executable,
+                str(BRIDGE_PATH),
+                "--reset-password",
+                "--db-path",
+                db_path,
+                "--password-stdin",
+            ],
+            input="new-valid-password-123\n",
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(proc_ok.returncode, 0, msg=proc_ok.stderr)
+
+        conn = sqlite3.connect(db_path)
+        pw_row = conn.execute(
+            "SELECT value_json FROM system_settings WHERE key = 'admin_passphrase'"
+        ).fetchone()
+        ver_row = conn.execute(
+            "SELECT value_json FROM system_settings WHERE key = 'session_version'"
+        ).fetchone()
+        audit_row = conn.execute(
+            "SELECT action FROM audit_events WHERE action = 'auth.password_reset_cli'"
+        ).fetchone()
+        conn.close()
+
+        self.assertIsNotNone(pw_row)
+        self.assertIsNotNone(ver_row)
+        self.assertIsNotNone(audit_row)
+        self.assertEqual(json.loads(ver_row[0])["version"], 2)
 
 
 if __name__ == "__main__":

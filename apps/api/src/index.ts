@@ -12,6 +12,7 @@ export * from "./auth.js";
 export * from "./executor.js";
 export * from "./github.js";
 export * from "./mcp-gateway.js";
+export * from "./notifications.js";
 
 function startServerFromEnv(): void {
   const port = Number.parseInt(process.env.PORT ?? "3001", 10);
@@ -80,7 +81,7 @@ function startServerFromEnv(): void {
   }
 
   // 1. Primary Caddy-fronted server (strictly requires HTTPS via X-Forwarded-Proto)
-  const { app, generatedClaimToken } = createVpsAgentApp({
+  const { app, generatedClaimToken, healthAlerter } = createVpsAgentApp({
     store,
     bridge,
     appsRoot,
@@ -91,6 +92,10 @@ function startServerFromEnv(): void {
     trustProxy: process.env.VPSAGENT_TRUST_PROXY === "true",
     isLocalListener: false,
   });
+
+  if (process.env.VPSAGENT_ALERT_POLL_MS !== "0") {
+    healthAlerter.start();
+  }
 
   if (generatedClaimToken) {
     console.log(

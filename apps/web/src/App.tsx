@@ -21,7 +21,14 @@ import { Boxes, Inbox, LayoutGrid, LogOut, Settings2, type LucideIcon } from "lu
 import { Logo } from "./brand/Logo";
 
 type TabId = "overview" | "apps" | "approvals" | "keys";
-type AppDrawerSection = "deployments" | "logs" | "domain" | "env" | "security";
+type AppDrawerSection =
+  | "deployments"
+  | "logs"
+  | "domain"
+  | "env"
+  | "security"
+  | "settings";
+type KeysFocusSection = "github" | "updates" | "alerts" | "backups" | "account";
 
 interface AppDeepLink {
   slug: string;
@@ -31,7 +38,7 @@ interface AppDeepLink {
 
 function parseAppDeepLink(hash: string): AppDeepLink | null {
   const match = hash.match(
-    /^#?\/?apps\/([a-z0-9][a-z0-9-]{0,46}[a-z0-9])\/(deployments|logs|domain|env|security)$/i,
+    /^#?\/?apps\/([a-z0-9][a-z0-9-]{0,46}[a-z0-9])\/(deployments|logs|domain|env|security|settings)$/i,
   );
   if (!match) return null;
   return {
@@ -40,12 +47,15 @@ function parseAppDeepLink(hash: string): AppDeepLink | null {
   };
 }
 
-function isGithubKeysDeepLink(hash: string): boolean {
-  return /^#?\/?keys\/github$/i.test(hash.trim());
+function parseKeysDeepLink(hash: string): KeysFocusSection | null {
+  const match = hash
+    .trim()
+    .match(/^#?\/?keys\/(github|updates|alerts|backups|account)$/i);
+  return match ? (match[1]!.toLowerCase() as KeysFocusSection) : null;
 }
 
-function isUpdatesKeysDeepLink(hash: string): boolean {
-  return /^#?\/?keys\/updates$/i.test(hash.trim());
+function isApprovalsDeepLink(hash: string): boolean {
+  return /^#?\/?approvals$/i.test(hash.trim());
 }
 
 export function App() {
@@ -53,10 +63,10 @@ export function App() {
   const [connectError, setConnectError] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>(() => {
     if (typeof window !== "undefined") {
-      if (
-        isGithubKeysDeepLink(window.location.hash) ||
-        isUpdatesKeysDeepLink(window.location.hash)
-      ) {
+      if (isApprovalsDeepLink(window.location.hash)) {
+        return "approvals";
+      }
+      if (parseKeysDeepLink(window.location.hash)) {
         return "keys";
       }
       if (parseAppDeepLink(window.location.hash)) return "apps";
@@ -66,15 +76,12 @@ export function App() {
   const [deepLink, setDeepLink] = useState<AppDeepLink | null>(() =>
     typeof window !== "undefined" ? parseAppDeepLink(window.location.hash) : null,
   );
-  const [keysFocusSection, setKeysFocusSection] = useState<
-    "github" | "updates" | null
-  >(() => {
-    if (typeof window !== "undefined") {
-      if (isGithubKeysDeepLink(window.location.hash)) return "github";
-      if (isUpdatesKeysDeepLink(window.location.hash)) return "updates";
-    }
-    return null;
-  });
+  const [keysFocusSection, setKeysFocusSection] =
+    useState<KeysFocusSection | null>(() =>
+      typeof window !== "undefined"
+        ? parseKeysDeepLink(window.location.hash)
+        : null,
+    );
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
@@ -88,20 +95,20 @@ export function App() {
 
   useEffect(() => {
     const syncFromHash = () => {
+      if (isApprovalsDeepLink(window.location.hash)) {
+        setTab("approvals");
+        return;
+      }
       const parsed = parseAppDeepLink(window.location.hash);
       if (parsed) {
         setTab("apps");
         setDeepLink(parsed);
         return;
       }
-      if (isGithubKeysDeepLink(window.location.hash)) {
+      const keySection = parseKeysDeepLink(window.location.hash);
+      if (keySection) {
         setTab("keys");
-        setKeysFocusSection("github");
-        return;
-      }
-      if (isUpdatesKeysDeepLink(window.location.hash)) {
-        setTab("keys");
-        setKeysFocusSection("updates");
+        setKeysFocusSection(keySection);
       }
     };
     syncFromHash();
@@ -405,6 +412,7 @@ export function App() {
             initialUpdateStatus={systemUpdate}
             onUpdateStatusChange={setSystemUpdate}
             onRefresh={() => loadAll()}
+            onSignedOut={() => void loadAll()}
           />
         )}
       </main>

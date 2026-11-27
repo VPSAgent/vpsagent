@@ -116,8 +116,24 @@ export const RuntimeBuildGitResultSchema = z.object({
   usedAuth: z.boolean().optional(),
   suggestedPort: z.number().int().min(1).max(65535).nullable().optional(),
   envExampleKeys: z.array(z.string()).optional(),
+  previousImageSaved: z.boolean().optional(),
 });
 export type RuntimeBuildGitResult = z.infer<typeof RuntimeBuildGitResultSchema>;
+
+export const RuntimeRollbackResultSchema = z.object({
+  ok: z.boolean(),
+  slug: z.string(),
+  status: AppStatusSchema,
+  swapped: z.boolean().default(true),
+});
+export type RuntimeRollbackResult = z.infer<typeof RuntimeRollbackResultSchema>;
+
+export interface RuntimeBinaryDownloadResult {
+  filename: string;
+  contentType: string;
+  bytes: Uint8Array;
+  sizeBytes: number;
+}
 
 export const GitEnvExampleKeySchema = z.object({
   key: z.string().min(1).max(128),
@@ -648,6 +664,11 @@ export interface RuntimeBridge {
   connectTailscale?(
     input?: RuntimeTailscaleConnectInput,
   ): Promise<RuntimeTailscaleConnectResult>;
+  rollbackApp?(slug: string): Promise<RuntimeRollbackResult>;
+  downloadAppBackup?(slug: string): Promise<RuntimeBinaryDownloadResult>;
+  downloadCoreBackup?(options?: {
+    includeAppData?: boolean | undefined;
+  }): Promise<RuntimeBinaryDownloadResult>;
 }
 
 export class RuntimeBridgeError extends Error {
@@ -1477,6 +1498,208 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
       ...parsed,
       status: this.sanitizeTailscaleStatus(parsed.status),
     };
+  }
+
+  async rollbackApp(slug: string): Promise<RuntimeRollbackResult> {
+    const safeSlug = validateAppSlug(slug);
+    const raw = await this.requestJson(
+      "POST",
+      "/v1/apps/rollback",
+      { slug: safeSlug },
+      this.defaultTimeoutMs,
+    );
+    return RuntimeRollbackResultSchema.parse(raw);
+  }
+
+  async downloadAppBackup(slug: string): Promise<RuntimeBinaryDownloadResult> {
+    const safeSlug = validateAppSlug(slug);
+    return this.requestBinary(
+      "POST",
+      "/v1/apps/backup",
+      { slug: safeSlug },
+      180_000,
+    );
+  }
+
+  async downloadCoreBackup(options?: {
+    includeAppData?: boolean | undefined;
+  }): Promise<RuntimeBinaryDownloadResult> {
+    return this.requestBinary(
+      "POST",
+      "/v1/core/backup",
+      { includeAppData: Boolean(options?.includeAppData) },
+      240_000,
+    );
+  }
+
+  private async requestBinary(
+    method: "POST",
+    routePath: string,
+    body: Record<string, unknown>,
+    timeoutMs: number,
+    maxBytes = 100 * 1024 * 1024,
+  ): Promise<RuntimeBinaryDownloadResult> {
+    const payload = JSON.stringify(body);
+    const headers: Record<string, string> = {
+      accept: "application/gzip, application/octet-stream, application/json",
+      "content-type": "application/json",
+      "content-length": String(Buffer.byteLength(payload, "utf8")),
+    };
+    if (this.runtimeToken) {
+      headers["x-vpsagent-runtime-token"] = this.runtimeToken;
+    }
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let req: http.ClientRequest | undefined;
+      const timer = setTimeout(() => {
+        req?.destroy();
+        fail(
+          new RuntimeBridgeError(
+            504,
+            `Host runtime bridge timed out after ${timeoutMs}ms.`,
+          ),
+        );
+      }, timeoutMs);
+      timer.unref();
+
+      const fail = (err: RuntimeBridgeError) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      };
+
+      const succeed = (value: RuntimeBinaryDownloadResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      };
+
+      const sanitizeFilename = (rawName: string | undefined): string => {
+        const cleaned = (rawName ?? "").trim().replace(/["\\/]/g, "");
+        const base = cleaned.replace(/[^A-Za-z0-9._-]/g, "_");
+        return base || "vpsagent-backup.tar.gz";
+      };
+
+      const onResponse = (res: http.IncomingMessage) => {
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+
+        res.on("data", (chunk: Buffer) => {
+          totalBytes += chunk.length;
+          if (totalBytes > maxBytes) {
+            res.destroy();
+            fail(
+              new RuntimeBridgeError(
+                413,
+                "Backup archive exceeded maximum allowed transfer size.",
+              ),
+            );
+            return;
+          }
+          chunks.push(chunk);
+        });
+
+        res.on("error", (err) => {
+          fail(
+            new RuntimeBridgeError(
+              502,
+              `Runtime bridge stream error: ${err.message}`,
+            ),
+          );
+        });
+
+        res.on("end", () => {
+          if (settled) return;
+          const buf = Buffer.concat(chunks);
+          const status = res.statusCode ?? 502;
+          if (status >= 400) {
+            let msg = `Runtime bridge failed with HTTP ${status}.`;
+            try {
+              const parsed = JSON.parse(buf.toString("utf8")) as {
+                error?: unknown;
+              };
+              if (typeof parsed.error === "string" && parsed.error.trim()) {
+                msg = parsed.error;
+              }
+            } catch {
+              const txt = buf.toString("utf8").trim();
+              if (txt) msg = txt.slice(0, 300);
+            }
+            fail(new RuntimeBridgeError(status, msg));
+            return;
+          }
+
+          const headerFilename =
+            typeof res.headers["x-vpsagent-backup-filename"] === "string"
+              ? res.headers["x-vpsagent-backup-filename"]
+              : undefined;
+          const disp =
+            typeof res.headers["content-disposition"] === "string"
+              ? res.headers["content-disposition"]
+              : "";
+          const dispMatch = disp.match(/filename="?([^";]+)"?/i);
+          const filename = sanitizeFilename(headerFilename ?? dispMatch?.[1]);
+          const contentType =
+            typeof res.headers["content-type"] === "string"
+              ? res.headers["content-type"]
+              : "application/gzip";
+
+          succeed({
+            filename,
+            contentType,
+            bytes: new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
+            sizeBytes: buf.byteLength,
+          });
+        });
+      };
+
+      if (this.socketPath) {
+        req = http.request(
+          {
+            socketPath: this.socketPath,
+            path: routePath,
+            method,
+            headers,
+          },
+          onResponse,
+        );
+      } else if (this.parsedBaseUrl) {
+        const basePath = this.parsedBaseUrl.pathname.replace(/\/+$/, "");
+        const transport =
+          this.parsedBaseUrl.protocol === "https:" ? https : http;
+        req = transport.request(
+          {
+            protocol: this.parsedBaseUrl.protocol,
+            hostname: this.parsedBaseUrl.hostname,
+            port: this.parsedBaseUrl.port || undefined,
+            path: `${basePath}${routePath}`,
+            method,
+            headers,
+          },
+          onResponse,
+        );
+      } else {
+        fail(
+          new RuntimeBridgeError(500, "Runtime bridge transport is unconfigured."),
+        );
+        return;
+      }
+
+      req.on("error", (err) => {
+        fail(
+          new RuntimeBridgeError(
+            503,
+            `Host runtime bridge is unavailable: ${err.message}`,
+          ),
+        );
+      });
+
+      req.write(payload);
+      req.end();
+    });
   }
 
   private async requestJson(
