@@ -1,13 +1,22 @@
-import { useState } from "react";
+import { useId, useState } from "react";
 import type { AppRecord, OverviewResponse } from "../api";
+import {
+  buildChartGeometry,
+  clampPercent,
+  type ResourceDisplayMode,
+  type ResourceSample,
+} from "../resource-display";
 import { AppCard } from "./AppCard";
 import { PageHeader, SectionHeading, buttonPrimary, buttonSecondary } from "./PageHeader";
 
 interface OverviewTabProps {
   data: OverviewResponse | null;
   loading: boolean;
+  resourceDisplay?: ResourceDisplayMode;
+  resourceHistory?: ResourceSample[];
   onRefresh: () => void;
   onNavigateTab: (tab: "overview" | "apps" | "approvals" | "keys") => void;
+  onOpenAccessSettings?: () => void;
   onOpenApp?: (slug: string) => void;
 }
 
@@ -24,22 +33,116 @@ function formatMb(mb: number): string {
   return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
 }
 
-function Stat({ label, percent, detail }: { label: string; percent: number; detail: string }) {
-  const clamped = Math.min(100, Math.max(0, percent));
+function Stat({
+  label,
+  percent,
+  detail,
+  displayMode = "bar",
+  series,
+}: {
+  label: string;
+  percent: number;
+  detail: string;
+  displayMode?: ResourceDisplayMode;
+  series?: number[];
+}) {
+  const gradientId = useId();
+  const clamped = clampPercent(percent);
   const tight = clamped >= 75;
+  const chartValues = series && series.length > 0 ? series : [clamped];
+  const chart =
+    displayMode === "chart"
+      ? buildChartGeometry(chartValues, 280, 76, 6)
+      : null;
+  const lastPoint = chart?.points[chart.points.length - 1];
+
   return (
     <div className="rounded-lg border border-line bg-surface px-5 py-4">
-      <p className="text-xs text-muted">{label}</p>
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs text-muted">{label}</p>
+        {displayMode === "chart" && (
+          <span className="text-[11px] text-subtle tabular-nums">
+            {chartValues.length === 1
+              ? "1 sample"
+              : `${chartValues.length} samples`}
+          </span>
+        )}
+      </div>
       <p className="mt-2 flex items-baseline gap-2">
         <span className="text-2xl font-semibold tabular-nums tracking-[-0.02em]">{clamped}%</span>
         <span className="text-xs text-subtle tabular-nums">{detail}</span>
       </p>
-      <div className="mt-3 h-1 w-full rounded-full bg-fill overflow-hidden">
-        <div
-          className={`h-full w-full rounded-full meter-fill ${tight ? "bg-fg" : "bg-muted"}`}
-          style={{ transform: `scaleX(${clamped / 100})` }}
-        />
-      </div>
+      {displayMode === "chart" && chart ? (
+        <div className="mt-3">
+          <svg
+            viewBox="0 0 280 76"
+            className="block h-20 w-full overflow-visible"
+            role="img"
+            aria-label={`${label} usage chart, currently ${clamped}%`}
+          >
+            <defs>
+              <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+                <stop
+                  offset="0%"
+                  stopColor="var(--color-fg)"
+                  stopOpacity={tight ? 0.24 : 0.14}
+                />
+                <stop offset="100%" stopColor="var(--color-fg)" stopOpacity="0" />
+              </linearGradient>
+            </defs>
+            <line
+              x1="6"
+              y1="6"
+              x2="274"
+              y2="6"
+              stroke="var(--color-line)"
+              strokeDasharray="2 3"
+              strokeWidth="1"
+            />
+            <line
+              x1="6"
+              y1="38"
+              x2="274"
+              y2="38"
+              stroke="var(--color-line)"
+              strokeDasharray="2 3"
+              strokeWidth="1"
+            />
+            <line
+              x1="6"
+              y1="70"
+              x2="274"
+              y2="70"
+              stroke="var(--color-line)"
+              strokeWidth="1"
+            />
+            <path d={chart.areaPath} fill={`url(#${gradientId})`} />
+            <path
+              d={chart.linePath}
+              fill="none"
+              stroke={tight ? "var(--color-fg)" : "var(--color-fg-2)"}
+              strokeWidth="1.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+            {lastPoint && (
+              <circle
+                cx={lastPoint.x}
+                cy={lastPoint.y}
+                r="3"
+                fill={tight ? "var(--color-fg)" : "var(--color-fg-2)"}
+              />
+            )}
+          </svg>
+        </div>
+      ) : (
+        <div className="mt-3 h-1 w-full rounded-full bg-fill overflow-hidden">
+          <div
+            className={`h-full w-full rounded-full meter-fill ${tight ? "bg-fg" : "bg-muted"}`}
+            style={{ transform: `scaleX(${clamped / 100})` }}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -89,8 +192,11 @@ function OverviewSkeleton() {
 export function OverviewTab({
   data,
   loading,
+  resourceDisplay = "bar",
+  resourceHistory = [],
   onRefresh,
   onNavigateTab,
+  onOpenAccessSettings,
   onOpenApp,
 }: OverviewTabProps) {
   if (!data) {
@@ -160,13 +266,39 @@ export function OverviewTab({
         <section>
           <SectionHeading title="Resources" />
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <Stat label="CPU" percent={cpuPercent} detail={`load ${metrics.loadAverage1m.toFixed(2)}`} />
+            <Stat
+              label="CPU"
+              percent={cpuPercent}
+              detail={`load ${metrics.loadAverage1m.toFixed(2)}`}
+              displayMode={resourceDisplay}
+              series={
+                resourceHistory.length > 0
+                  ? resourceHistory.map((s) => s.cpu)
+                  : [cpuPercent]
+              }
+            />
             <Stat
               label="Memory"
               percent={metrics.memoryUsagePercent}
               detail={`${formatMb(metrics.memoryUsedMb)} / ${formatMb(metrics.memoryTotalMb)}`}
+              displayMode={resourceDisplay}
+              series={
+                resourceHistory.length > 0
+                  ? resourceHistory.map((s) => s.memory)
+                  : [metrics.memoryUsagePercent]
+              }
             />
-            <Stat label="Disk" percent={disk.usedPercent} detail={`${disk.usedGb} / ${disk.totalGb} GB`} />
+            <Stat
+              label="Disk"
+              percent={disk.usedPercent}
+              detail={`${disk.usedGb} / ${disk.totalGb} GB`}
+              displayMode={resourceDisplay}
+              series={
+                resourceHistory.length > 0
+                  ? resourceHistory.map((s) => s.disk)
+                  : [disk.usedPercent]
+              }
+            />
           </div>
         </section>
 
@@ -212,7 +344,11 @@ export function OverviewTab({
             action={
               <button
                 type="button"
-                onClick={() => onNavigateTab("keys")}
+                onClick={() =>
+                  onOpenAccessSettings
+                    ? onOpenAccessSettings()
+                    : onNavigateTab("keys")
+                }
                 className="btn-press text-xs text-muted hover:text-fg cursor-pointer"
               >
                 Manage access

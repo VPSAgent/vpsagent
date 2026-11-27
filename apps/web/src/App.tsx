@@ -19,9 +19,30 @@ import { OverviewTab } from "./components/OverviewTab";
 import { SetupAndAuth } from "./components/SetupAndAuth";
 import { Boxes, Inbox, LayoutGrid, LogOut, Settings2, type LucideIcon } from "lucide-react";
 import { Logo } from "./brand/Logo";
+import {
+  appendResourceSample,
+  loadResourceDisplayMode,
+  saveResourceDisplayMode,
+  type ResourceDisplayMode,
+  type ResourceSample,
+} from "./resource-display";
 
 type TabId = "overview" | "apps" | "approvals" | "keys";
-type AppDrawerSection = "deployments" | "logs" | "domain" | "env" | "security";
+type AppDrawerSection =
+  | "deployments"
+  | "logs"
+  | "domain"
+  | "env"
+  | "security"
+  | "settings";
+type KeysFocusSection =
+  | "general"
+  | "access"
+  | "github"
+  | "updates"
+  | "alerts"
+  | "backups"
+  | "account";
 
 interface AppDeepLink {
   slug: string;
@@ -31,7 +52,7 @@ interface AppDeepLink {
 
 function parseAppDeepLink(hash: string): AppDeepLink | null {
   const match = hash.match(
-    /^#?\/?apps\/([a-z0-9][a-z0-9-]{0,46}[a-z0-9])\/(deployments|logs|domain|env|security)$/i,
+    /^#?\/?apps\/([a-z0-9][a-z0-9-]{0,46}[a-z0-9])\/(deployments|logs|domain|env|security|settings)$/i,
   );
   if (!match) return null;
   return {
@@ -40,12 +61,15 @@ function parseAppDeepLink(hash: string): AppDeepLink | null {
   };
 }
 
-function isGithubKeysDeepLink(hash: string): boolean {
-  return /^#?\/?keys\/github$/i.test(hash.trim());
+function parseKeysDeepLink(hash: string): KeysFocusSection | null {
+  const match = hash
+    .trim()
+    .match(/^#?\/?keys\/(general|access|github|updates|alerts|backups|account)$/i);
+  return match ? (match[1]!.toLowerCase() as KeysFocusSection) : null;
 }
 
-function isUpdatesKeysDeepLink(hash: string): boolean {
-  return /^#?\/?keys\/updates$/i.test(hash.trim());
+function isApprovalsDeepLink(hash: string): boolean {
+  return /^#?\/?approvals$/i.test(hash.trim());
 }
 
 export function App() {
@@ -53,10 +77,10 @@ export function App() {
   const [connectError, setConnectError] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>(() => {
     if (typeof window !== "undefined") {
-      if (
-        isGithubKeysDeepLink(window.location.hash) ||
-        isUpdatesKeysDeepLink(window.location.hash)
-      ) {
+      if (isApprovalsDeepLink(window.location.hash)) {
+        return "approvals";
+      }
+      if (parseKeysDeepLink(window.location.hash)) {
         return "keys";
       }
       if (parseAppDeepLink(window.location.hash)) return "apps";
@@ -66,15 +90,12 @@ export function App() {
   const [deepLink, setDeepLink] = useState<AppDeepLink | null>(() =>
     typeof window !== "undefined" ? parseAppDeepLink(window.location.hash) : null,
   );
-  const [keysFocusSection, setKeysFocusSection] = useState<
-    "github" | "updates" | null
-  >(() => {
-    if (typeof window !== "undefined") {
-      if (isGithubKeysDeepLink(window.location.hash)) return "github";
-      if (isUpdatesKeysDeepLink(window.location.hash)) return "updates";
-    }
-    return null;
-  });
+  const [keysFocusSection, setKeysFocusSection] =
+    useState<KeysFocusSection | null>(() =>
+      typeof window !== "undefined"
+        ? parseKeysDeepLink(window.location.hash)
+        : null,
+    );
   const [overview, setOverview] = useState<OverviewResponse | null>(null);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
@@ -84,24 +105,57 @@ export function App() {
   const [systemUpdate, setSystemUpdate] = useState<SystemUpdateStatus | null>(
     null,
   );
+  const [resourceDisplay, setResourceDisplay] = useState<ResourceDisplayMode>(
+    () => loadResourceDisplayMode(),
+  );
+  const [resourceHistory, setResourceHistory] = useState<ResourceSample[]>([]);
   const [loading, setLoading] = useState(true);
+
+  const handleResourceDisplayChange = useCallback(
+    (mode: ResourceDisplayMode) => {
+      setResourceDisplay(mode);
+      saveResourceDisplayMode(mode);
+    },
+    [],
+  );
+
+  const recordOverviewSample = useCallback(
+    (sample: Pick<OverviewResponse, "metrics" | "disk">) => {
+      const cpuPercent = Math.min(
+        100,
+        Math.round(
+          (sample.metrics.loadAverage1m / Math.max(1, sample.metrics.cpuCount)) *
+            100,
+        ),
+      );
+      setResourceHistory((prev) =>
+        appendResourceSample(prev, {
+          timestamp: sample.metrics.collectedAt,
+          cpu: cpuPercent,
+          memory: sample.metrics.memoryUsagePercent,
+          disk: sample.disk.usedPercent,
+        }),
+      );
+    },
+    [],
+  );
 
   useEffect(() => {
     const syncFromHash = () => {
+      if (isApprovalsDeepLink(window.location.hash)) {
+        setTab("approvals");
+        return;
+      }
       const parsed = parseAppDeepLink(window.location.hash);
       if (parsed) {
         setTab("apps");
         setDeepLink(parsed);
         return;
       }
-      if (isGithubKeysDeepLink(window.location.hash)) {
+      const keySection = parseKeysDeepLink(window.location.hash);
+      if (keySection) {
         setTab("keys");
-        setKeysFocusSection("github");
-        return;
-      }
-      if (isUpdatesKeysDeepLink(window.location.hash)) {
-        setTab("keys");
-        setKeysFocusSection("updates");
+        setKeysFocusSection(keySection);
       }
     };
     syncFromHash();
@@ -129,6 +183,7 @@ export function App() {
             .catch(() => null),
         ]);
         setOverview(ov);
+        recordOverviewSample(ov);
         setApprovals(appr.approvals);
         setAuditEvents(aud.events);
         setTokens(toks.tokens);
@@ -145,11 +200,77 @@ export function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [recordOverviewSample]);
 
   useEffect(() => {
     void loadAll();
   }, [loadAll]);
+
+  useEffect(() => {
+    if (
+      !session?.claimed ||
+      !session?.authenticated ||
+      tab !== "overview" ||
+      resourceDisplay !== "chart"
+    ) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      if (document.hidden) return;
+      void api
+        .getMetrics()
+        .then((sample) => {
+          setOverview((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  metrics: sample.metrics,
+                  disk: sample.disk,
+                  apps: sample.apps,
+                  pendingApprovals: sample.pendingApprovals,
+                }
+              : prev,
+          );
+          setApprovals(sample.approvals);
+          recordOverviewSample(sample);
+        })
+        .catch(() => {
+          // Ignore background poll errors; manual refresh surfaces connectivity issues.
+        });
+    }, 10000);
+    return () => window.clearInterval(timer);
+  }, [
+    session?.claimed,
+    session?.authenticated,
+    tab,
+    resourceDisplay,
+    recordOverviewSample,
+  ]);
+
+  useEffect(() => {
+    if (!session?.claimed || !session?.authenticated || tab !== "approvals") {
+      return;
+    }
+    let cancelled = false;
+    void api
+      .listApprovals()
+      .then((res) => {
+        if (cancelled) return;
+        setApprovals(res.approvals);
+        const pending = res.approvals.filter(
+          (a) => a.status === "pending",
+        ).length;
+        setOverview((prev) =>
+          prev ? { ...prev, pendingApprovals: pending } : prev,
+        );
+      })
+      .catch(() => {
+        // Non-fatal; manual refresh remains available.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.claimed, session?.authenticated, tab]);
 
   const handleInspectSync = useCallback((inspect: InspectResult) => {
     setOverview((prev) =>
@@ -358,8 +479,14 @@ export function App() {
           <OverviewTab
             data={overview}
             loading={loading}
+            resourceDisplay={resourceDisplay}
+            resourceHistory={resourceHistory}
             onRefresh={() => void loadAll()}
             onNavigateTab={setTab}
+            onOpenAccessSettings={() => {
+              setKeysFocusSection("access");
+              setTab("keys");
+            }}
             onOpenApp={(slug) => {
               setDeepLink({ slug, section: "deployments" });
               setTab("apps");
@@ -400,11 +527,14 @@ export function App() {
             snippets={snippets}
             setup={session.setup}
             publicIp={session.publicIp}
+            resourceDisplay={resourceDisplay}
+            onResourceDisplayChange={handleResourceDisplayChange}
             focusSection={keysFocusSection}
             onConsumeFocusSection={() => setKeysFocusSection(null)}
             initialUpdateStatus={systemUpdate}
             onUpdateStatusChange={setSystemUpdate}
             onRefresh={() => loadAll()}
+            onSignedOut={() => void loadAll()}
           />
         )}
       </main>

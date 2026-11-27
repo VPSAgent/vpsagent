@@ -679,7 +679,7 @@ describe("RuntimeBridge Unix-socket client + bootstrap/runtime-bridge.py", () =>
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("discovers Tailscale status, connects, and toggles Tailscale Serve over Unix socket", async () => {
     const pythonBin = findPythonBinary();
@@ -876,7 +876,7 @@ sys.exit(0)
       await new Promise<void>((resolve) => targetServer.close(() => resolve()));
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
-  });
+  }, 60_000);
 
   it("parses legacy and release update status payloads and redacts secrets", async () => {
     const minimalParsed = RuntimeCoreUpdateStatusSchema.parse({

@@ -26,6 +26,7 @@ import base64
 from concurrent.futures import ALL_COMPLETED, ThreadPoolExecutor, wait as wait_futures
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import getpass
 import hashlib
 import hmac
 import http.client
@@ -43,6 +44,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import sqlite3
 import ssl
 import stat
 import subprocess
@@ -61,6 +63,11 @@ MAX_HOST_CMD_TIMEOUT_S = 180
 DEFAULT_HOST_CMD_TIMEOUT_S = 30
 MAX_READ_FILE_BYTES = 128 * 1024
 MAX_WRITE_FILE_BYTES = 256 * 1024
+MAX_BACKUP_ARCHIVE_BYTES = 100 * 1024 * 1024
+MAX_BACKUP_STAGING_BYTES = 200 * 1024 * 1024
+BACKUP_SECRET_BASENAME_RE = re.compile(
+    r"^(?:\.env(?:\..*)?|runtime\.token|.*\.(?:pem|key|p12|pfx))$", re.IGNORECASE
+)
 
 SERVICE_UNIT_PATTERN = re.compile(r"^[A-Za-z0-9@._-]{1,128}$")
 ALLOWED_SERVICE_ACTIONS = frozenset(
@@ -3177,6 +3184,17 @@ class RuntimeService:
         (`/v1/apps/statuses`), lifecycle status, and Safety Check (`/v1/apps/inspect`).
         """
         if docker_status == "running":
+            app_dir = resolve_scoped_app_dir(
+                self.apps_root, slug, require_exists=False
+            )
+            probe_cfg = (
+                self._read_app_probe_config(app_dir, slug)
+                if os.path.isdir(app_dir)
+                else None
+            )
+            if probe_cfg is not None and not probe_cfg["probeHttp"]:
+                self._clear_host_health(slug)
+                return docker_status
             host_health = self._get_host_health(slug)
             if host_health is not None and host_health.get("status") == "unhealthy":
                 return "error"
@@ -3232,6 +3250,7 @@ class RuntimeService:
             return None
         cfg = self._read_app_probe_config(app_dir, safe_slug)
         if cfg is None or not cfg["probeHttp"]:
+            self._clear_host_health(safe_slug)
             return None
 
         inspected = self.inspect_workload(
@@ -3745,12 +3764,35 @@ class RuntimeService:
                 f"Field 'timeoutSeconds' must be between {MIN_BUILD_TIMEOUT_S} and {MAX_BUILD_TIMEOUT_S}.",
             )
         total_timeout_s = float(raw_timeout)
+        raw_previous_mode = payload.get("previousMode", "save")
+        if raw_previous_mode not in ("save", "preserve", "clear"):
+            raise BridgeRequestError(
+                400,
+                "Field 'previousMode' must be one of: save, preserve, clear.",
+            )
+        previous_mode = str(raw_previous_mode)
         image_tag = f"vpsagent-app-{slug}:latest"
 
         t0 = time.monotonic()
         deadline = t0 + total_timeout_s
 
         with self._lock_for(slug):
+            prev_image_id: str | None = None
+            if previous_mode == "clear":
+                self._run_docker(
+                    ["rmi", "-f", f"vpsagent-app-{slug}:previous"],
+                    timeout=15,
+                    check=False,
+                )
+            elif previous_mode == "save":
+                prev_proc = self._run_docker(
+                    ["image", "inspect", "--format", "{{.Id}}", image_tag],
+                    timeout=15,
+                    check=False,
+                )
+                if prev_proc.returncode == 0 and prev_proc.stdout.strip():
+                    prev_image_id = prev_proc.stdout.strip().splitlines()[0].strip()
+
             build_dir = tempfile.mkdtemp(prefix=f"vpsagent-git-{slug}-")
             os.chmod(build_dir, 0o700)
             clone_dir = os.path.join(build_dir, "repo")
@@ -3844,6 +3886,10 @@ class RuntimeService:
                 build_proc = self._run_docker(
                     [
                         "build",
+                        "--label",
+                        "vpsagent.managed=true",
+                        "--label",
+                        f"vpsagent.slug={slug}",
                         "-t",
                         image_tag,
                         "-f",
@@ -3874,6 +3920,25 @@ class RuntimeService:
                         build_log_tail=log_tail,
                     )
 
+                previous_image_saved = False
+                if previous_mode == "save" and prev_image_id:
+                    new_proc = self._run_docker(
+                        ["image", "inspect", "--format", "{{.Id}}", image_tag],
+                        timeout=15,
+                        check=False,
+                    )
+                    new_image_id = (
+                        new_proc.stdout.strip().splitlines()[0].strip()
+                        if new_proc.returncode == 0 and new_proc.stdout.strip()
+                        else ""
+                    )
+                    if new_image_id and new_image_id != prev_image_id:
+                        prev_tag = f"vpsagent-app-{slug}:previous"
+                        tag_proc = self._run_docker(
+                            ["tag", prev_image_id, prev_tag], timeout=15, check=False
+                        )
+                        previous_image_saved = tag_proc.returncode == 0
+
                 return {
                     "ok": True,
                     "slug": slug,
@@ -3888,6 +3953,7 @@ class RuntimeService:
                     "envExampleKeys": [
                         item["key"] for item in inspected["envExampleKeys"]
                     ],
+                    "previousImageSaved": previous_image_saved,
                 }
             finally:
                 shutil.rmtree(build_dir, ignore_errors=True)
@@ -4293,8 +4359,593 @@ class RuntimeService:
             if remove_files and os.path.exists(app_dir):
                 shutil.rmtree(app_dir)
 
+            self._run_docker(
+                [
+                    "rmi",
+                    "-f",
+                    f"vpsagent-app-{slug}:latest",
+                    f"vpsagent-app-{slug}:previous",
+                ],
+                timeout=20,
+                check=False,
+            )
+
             self._clear_host_health(slug)
             return {"ok": True, "slug": slug}
+
+    def rollback_app(self, payload: dict[str, Any]) -> dict[str, Any]:
+        slug = validate_slug(payload.get("slug"))
+        latest_tag = f"vpsagent-app-{slug}:latest"
+        prev_tag = f"vpsagent-app-{slug}:previous"
+
+        with self._lock_for(slug):
+            prev_proc = self._run_docker(
+                ["image", "inspect", "--format", "{{.Id}}", prev_tag],
+                timeout=15,
+                check=False,
+            )
+            if prev_proc.returncode != 0 or not prev_proc.stdout.strip():
+                raise BridgeRequestError(
+                    404,
+                    f'No previous build image is available to roll back "{slug}".',
+                )
+            prev_id = prev_proc.stdout.strip().splitlines()[0].strip()
+
+            cur_proc = self._run_docker(
+                ["image", "inspect", "--format", "{{.Id}}", latest_tag],
+                timeout=15,
+                check=False,
+            )
+            cur_id = (
+                cur_proc.stdout.strip().splitlines()[0].strip()
+                if cur_proc.returncode == 0 and cur_proc.stdout.strip()
+                else None
+            )
+
+            self._run_docker(["tag", prev_id, latest_tag], timeout=15, check=True)
+            swapped = False
+            if cur_id and cur_id != prev_id:
+                swap_proc = self._run_docker(
+                    ["tag", cur_id, prev_tag], timeout=15, check=False
+                )
+                swapped = swap_proc.returncode == 0
+
+            app_dir = resolve_scoped_app_dir(self.apps_root, slug)
+            try:
+                with self._validated_compose_context(
+                    app_dir, slug, prepare_volumes=True
+                ) as (compose_path, project_dir):
+                    base = self._compose_cmd_base(slug, project_dir, compose_path)
+                    self._clear_host_health(slug)
+                    self._run_docker(
+                        [*base, "up", "-d", "--remove-orphans"], timeout=180
+                    )
+                    status = self._compose_status(slug, project_dir, compose_path)
+                    status = self._resolve_overall_status(slug, status)
+            except Exception:
+                if cur_id:
+                    self._run_docker(
+                        ["tag", cur_id, latest_tag], timeout=15, check=False
+                    )
+                self._run_docker(
+                    ["tag", prev_id, prev_tag], timeout=15, check=False
+                )
+                raise
+            return {
+                "ok": True,
+                "slug": slug,
+                "status": status,
+                "swapped": swapped,
+            }
+
+    @staticmethod
+    def _is_backup_excluded_filename(name: str) -> bool:
+        return name in SECRET_FILE_BASENAMES or bool(
+            BACKUP_SECRET_BASENAME_RE.match(name)
+        )
+
+    def _copy_regular_file_for_backup(
+        self, src_path: str, dst_path: str, remaining_budget: list[int]
+    ) -> bool:
+        if not os.path.lexists(src_path) or os.path.islink(src_path):
+            return False
+        if not os.path.isfile(src_path):
+            return False
+        name = os.path.basename(src_path)
+        if self._is_backup_excluded_filename(name):
+            return False
+        st = os.lstat(src_path)
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        remaining_budget[0] -= st.st_size
+        if remaining_budget[0] < 0:
+            raise BridgeRequestError(
+                413,
+                "Backup data exceeds maximum staging size limit (200 MB).",
+            )
+        os.makedirs(os.path.dirname(dst_path), mode=0o750, exist_ok=True)
+        shutil.copyfile(src_path, dst_path)
+        return True
+
+    def _copy_safe_tree_for_backup(
+        self,
+        src_dir: str,
+        dst_dir: str,
+        *,
+        remaining_budget: list[int],
+        skip_rel_prefixes: tuple[str, ...] = (),
+    ) -> int:
+        if not os.path.lexists(src_dir) or os.path.islink(src_dir) or not os.path.isdir(src_dir):
+            return 0
+        copied = 0
+        for root, dirs, files in os.walk(src_dir, followlinks=False):
+            rel_root = os.path.relpath(root, src_dir)
+            if rel_root == ".":
+                rel_root = ""
+            # Prune symlinks and skipped prefixes
+            kept_dirs: list[str] = []
+            for d in sorted(dirs):
+                full_d = os.path.join(root, d)
+                if os.path.islink(full_d):
+                    continue
+                rel_d = os.path.join(rel_root, d) if rel_root else d
+                norm_d = rel_d.replace(os.sep, "/")
+                if any(
+                    norm_d == p or norm_d.startswith(p + "/")
+                    for p in skip_rel_prefixes
+                ):
+                    continue
+                kept_dirs.append(d)
+            dirs[:] = kept_dirs
+
+            for fname in sorted(files):
+                full_f = os.path.join(root, fname)
+                if os.path.islink(full_f):
+                    continue
+                if self._is_backup_excluded_filename(fname):
+                    continue
+                rel_f = os.path.join(rel_root, fname) if rel_root else fname
+                out_f = os.path.join(dst_dir, rel_f)
+                if self._copy_regular_file_for_backup(
+                    full_f, out_f, remaining_budget
+                ):
+                    copied += 1
+        return copied
+
+    def _postgres_service_state(
+        self, slug: str, project_dir: str, compose_path: str
+    ) -> str:
+        proc = self._run_docker(
+            [
+                *self._compose_cmd_base(slug, project_dir, compose_path),
+                "ps",
+                "-a",
+                "--format",
+                "json",
+                "postgres",
+            ],
+            timeout=20,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return "unknown"
+        rows = parse_compose_ps_output(proc.stdout)
+        if not rows:
+            return "stopped"
+        matched = [
+            r
+            for r in rows
+            if str(r.get("Service", "")).strip().lower() == "postgres"
+            or "postgres" in str(r.get("Name", "")).strip().lower()
+        ]
+        if not matched:
+            has_service_field = any(
+                bool(str(r.get("Service", "")).strip()) for r in rows
+            )
+            if has_service_field:
+                return "stopped"
+            matched = rows
+        for r in matched:
+            state = str(r.get("State", "")).strip().lower()
+            if state in ("running", "restarting", "paused", "created"):
+                return "running"
+        return "stopped"
+
+    def _collect_app_backup_into(
+        self, slug: str, target_dir: str, remaining_budget: list[int]
+    ) -> dict[str, Any]:
+        app_dir = resolve_scoped_app_dir(self.apps_root, slug, require_exists=True)
+        os.makedirs(target_dir, mode=0o750, exist_ok=True)
+        copied_compose = self._copy_regular_file_for_backup(
+            os.path.join(app_dir, "docker-compose.yml"),
+            os.path.join(target_dir, "docker-compose.yml"),
+            remaining_budget,
+        )
+        self._copy_regular_file_for_backup(
+            os.path.join(app_dir, "probe.json"),
+            os.path.join(target_dir, "probe.json"),
+            remaining_budget,
+        )
+
+        pg_status = "none"
+        pg_state = "none"
+        has_postgres = False
+        compose_path = os.path.join(app_dir, "docker-compose.yml")
+        if os.path.lexists(compose_path) and not os.path.islink(compose_path):
+            try:
+                with self._validated_compose_context(app_dir, slug) as (
+                    tmp_compose,
+                    project_dir,
+                ):
+                    with open(tmp_compose, "r", encoding="utf-8") as cfh:
+                        rendered_doc = json.load(cfh)
+                    services = (
+                        rendered_doc.get("services")
+                        if isinstance(rendered_doc, dict)
+                        else None
+                    )
+                    has_postgres = isinstance(services, dict) and "postgres" in services
+                    if has_postgres:
+                        pg_state = self._postgres_service_state(
+                            slug, project_dir, tmp_compose
+                        )
+                        if pg_state == "running":
+                            dump_path = os.path.join(target_dir, "postgres.sql")
+                            base = self._compose_cmd_base(slug, project_dir, tmp_compose)
+                            proc: subprocess.Popen[bytes] | None = None
+                            timed_out = False
+                            timer: threading.Timer | None = None
+                            stderr_thread: threading.Thread | None = None
+                            stderr_chunks: list[bytes] = []
+                            stderr_kept = 0
+                            try:
+                                proc = subprocess.Popen(
+                                    [
+                                        self.docker_bin,
+                                        *base,
+                                        "exec",
+                                        "-T",
+                                        "postgres",
+                                        "sh",
+                                        "-c",
+                                        'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"',
+                                    ],
+                                    shell=False,
+                                    env=_sanitized_subprocess_env(),
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                )
+
+                                def _kill_on_timeout() -> None:
+                                    nonlocal timed_out
+                                    timed_out = True
+                                    if proc is not None and proc.poll() is None:
+                                        try:
+                                            proc.kill()
+                                        except OSError:
+                                            pass
+
+                                def _drain_stderr() -> None:
+                                    nonlocal stderr_kept
+                                    assert proc is not None and proc.stderr is not None
+                                    try:
+                                        while True:
+                                            err_chunk = proc.stderr.read(4096)
+                                            if not err_chunk:
+                                                break
+                                            if stderr_kept < 4096:
+                                                take = err_chunk[: 4096 - stderr_kept]
+                                                stderr_chunks.append(take)
+                                                stderr_kept += len(take)
+                                    except OSError:
+                                        pass
+
+                                timer = threading.Timer(90.0, _kill_on_timeout)
+                                timer.daemon = True
+                                timer.start()
+
+                                stderr_thread = threading.Thread(
+                                    target=_drain_stderr, daemon=True
+                                )
+                                stderr_thread.start()
+
+                                written = 0
+                                assert proc.stdout is not None
+                                with open(dump_path, "wb") as dfh:
+                                    while True:
+                                        chunk = proc.stdout.read(65536)
+                                        if not chunk:
+                                            break
+                                        if written + len(chunk) > remaining_budget[0]:
+                                            proc.kill()
+                                            raise BridgeRequestError(
+                                                413,
+                                                "Database dump exceeds backup size limit (200 MB).",
+                                            )
+                                        dfh.write(chunk)
+                                        written += len(chunk)
+
+                                rc = proc.wait(timeout=10)
+                                stderr_thread.join(timeout=2)
+                                stderr_bytes = b"".join(stderr_chunks)
+                                if timed_out or rc != 0:
+                                    err_detail = redact_secrets(
+                                        stderr_bytes.decode(
+                                            "utf-8", errors="replace"
+                                        ).strip()
+                                    )[:200]
+                                    raise BridgeRequestError(
+                                        502,
+                                        f'Failed to dump running Postgres database for "{slug}"'
+                                        + (f": {err_detail}" if err_detail else "")
+                                        + "; refusing to copy live database files.",
+                                    )
+                                remaining_budget[0] -= written
+                                pg_status = "pg_dump"
+                            except BridgeRequestError:
+                                if proc is not None and proc.poll() is None:
+                                    proc.kill()
+                                    try:
+                                        proc.wait(timeout=5)
+                                    except (OSError, subprocess.TimeoutExpired):
+                                        pass
+                                if os.path.exists(dump_path):
+                                    os.unlink(dump_path)
+                                raise
+                            except (OSError, subprocess.TimeoutExpired) as exc:
+                                if proc is not None and proc.poll() is None:
+                                    proc.kill()
+                                    try:
+                                        proc.wait(timeout=5)
+                                    except (OSError, subprocess.TimeoutExpired):
+                                        pass
+                                if os.path.exists(dump_path):
+                                    os.unlink(dump_path)
+                                raise BridgeRequestError(
+                                    502,
+                                    f'Failed to dump running Postgres database for "{slug}": {exc}; refusing to copy live database files.',
+                                ) from exc
+                            finally:
+                                if timer is not None:
+                                    timer.cancel()
+                                if proc is not None:
+                                    if proc.stdout is not None:
+                                        proc.stdout.close()
+                                    if proc.stderr is not None:
+                                        proc.stderr.close()
+                                if stderr_thread is not None:
+                                    stderr_thread.join(timeout=1)
+                        elif pg_state == "unknown":
+                            raise BridgeRequestError(
+                                502,
+                                f'Could not verify Postgres container state for "{slug}"; refusing to copy potentially live database files.',
+                            )
+                        else:
+                            pg_status = "skipped_stopped"
+            except BridgeRequestError as exc:
+                if exc.status_code in (413, 502):
+                    raise
+                pg_state = "unknown"
+                pg_status = "skipped_stopped" if has_postgres else "none"
+
+        skip_prefixes = ("postgres",) if (has_postgres and pg_state != "stopped") else ()
+        data_files = self._copy_safe_tree_for_backup(
+            os.path.join(app_dir, "data"),
+            os.path.join(target_dir, "data"),
+            remaining_budget=remaining_budget,
+            skip_rel_prefixes=skip_prefixes,
+        )
+        return {
+            "slug": slug,
+            "composeIncluded": copied_compose,
+            "postgresDump": pg_status,
+            "dataFilesCopied": data_files,
+        }
+
+    def _package_staging_dir_to_tar_gz(
+        self, staging_dir: str, prefix_name: str
+    ) -> str:
+        fd, tar_path = tempfile.mkstemp(prefix="vpsagent-backup-", suffix=".tar.gz")
+        os.close(fd)
+        os.chmod(tar_path, 0o600)
+        try:
+            with tarfile.open(tar_path, "w:gz") as tf:
+                for root, dirs, files in os.walk(staging_dir, followlinks=False):
+                    dirs.sort()
+                    for fname in sorted(files):
+                        full_path = os.path.join(root, fname)
+                        if os.path.islink(full_path):
+                            continue
+                        rel = os.path.relpath(full_path, staging_dir)
+                        arcname = f"{prefix_name}/{rel.replace(os.sep, '/')}"
+                        tf.add(full_path, arcname=arcname, recursive=False)
+            archive_size = os.path.getsize(tar_path)
+            if archive_size > MAX_BACKUP_ARCHIVE_BYTES:
+                raise BridgeRequestError(
+                    413,
+                    "Backup archive exceeds the 100 MB download limit.",
+                )
+            return tar_path
+        except Exception:
+            if os.path.exists(tar_path):
+                os.unlink(tar_path)
+            raise
+
+    def create_app_backup(self, payload: dict[str, Any]) -> tuple[str, str]:
+        slug = validate_slug(payload.get("slug"))
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        archive_stem = f"vpsagent-app-{slug}-{timestamp}"
+        filename = f"{archive_stem}.tar.gz"
+        budget = [MAX_BACKUP_STAGING_BYTES]
+        staging_dir = tempfile.mkdtemp(prefix=f"vpsagent-appbak-{slug}-")
+        os.chmod(staging_dir, 0o700)
+        try:
+            with self._lock_for(slug):
+                info = self._collect_app_backup_into(slug, staging_dir, budget)
+            manifest = {
+                "type": "app-backup",
+                "createdAt": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "excludesSecrets": True,
+                **info,
+            }
+            with open(
+                os.path.join(staging_dir, "manifest.json"), "w", encoding="utf-8"
+            ) as mfh:
+                json.dump(manifest, mfh, indent=2)
+                mfh.write("\n")
+            with open(
+                os.path.join(staging_dir, "RESTORE.txt"), "w", encoding="utf-8"
+            ) as rfh:
+                rfh.write(
+                    f"VPSAgent App Backup ({slug})\n"
+                    "=============================\n\n"
+                    "For your security, secret environment variables (.env) are NOT inside this archive.\n"
+                    "Keep a separate copy of your app secrets or re-enter them in the dashboard.\n\n"
+                    "Contents:\n"
+                    "- docker-compose.yml & probe.json: container blueprint & health check settings\n"
+                    "- data/: persistent files stored in /app/data\n"
+                    "- postgres.sql (if Postgres was running): clean database dump\n\n"
+                    "To restore a Postgres dump into a running Postgres companion:\n"
+                    f"  docker compose -p vpsagent-{slug} exec -T postgres sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"' < postgres.sql\n"
+                )
+            tar_path = self._package_staging_dir_to_tar_gz(staging_dir, archive_stem)
+            return tar_path, filename
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def create_core_backup(self, payload: dict[str, Any]) -> tuple[str, str]:
+        include_app_data = bool(payload.get("includeAppData", False))
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        archive_stem = f"vpsagent-server-backup-{timestamp}"
+        filename = f"{archive_stem}.tar.gz"
+        budget = [MAX_BACKUP_STAGING_BYTES]
+        staging_dir = tempfile.mkdtemp(prefix="vpsagent-corebak-")
+        os.chmod(staging_dir, 0o700)
+        try:
+            db_candidates = [
+                os.path.join(self.vpsagent_root, "data", "registry.db"),
+                os.path.join(self.vpsagent_root, "registry.db"),
+            ]
+            db_path = next(
+                (
+                    p
+                    for p in db_candidates
+                    if os.path.lexists(p)
+                    and not os.path.islink(p)
+                    and os.path.isfile(p)
+                ),
+                None,
+            )
+            registry_included = False
+            if db_path:
+                dst_db = os.path.join(staging_dir, "registry.db")
+                src_conn: sqlite3.Connection | None = None
+                dst_conn: sqlite3.Connection | None = None
+                try:
+                    src_conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+                    dst_conn = sqlite3.connect(dst_db)
+                    src_conn.backup(dst_conn)
+                    dst_conn.commit()
+                    registry_included = True
+                finally:
+                    if dst_conn is not None:
+                        dst_conn.close()
+                    if src_conn is not None:
+                        src_conn.close()
+                budget[0] -= os.path.getsize(dst_db)
+                if budget[0] < 0:
+                    raise BridgeRequestError(
+                        413, "Registry database exceeds backup staging size limit."
+                    )
+
+            for sub_name, dir_path in (
+                ("core.d", self.caddy_core_dir),
+                ("apps.d", self.caddy_apps_dir),
+            ):
+                if dir_path and os.path.isdir(dir_path) and not os.path.islink(dir_path):
+                    for fname in sorted(os.listdir(dir_path)):
+                        if not fname.endswith(".caddy"):
+                            continue
+                        self._copy_regular_file_for_backup(
+                            os.path.join(dir_path, fname),
+                            os.path.join(staging_dir, "caddy", sub_name, fname),
+                            budget,
+                        )
+
+            app_summaries: list[dict[str, Any]] = []
+            if os.path.isdir(self.apps_root) and not os.path.islink(self.apps_root):
+                for entry in sorted(os.listdir(self.apps_root)):
+                    if not SLUG_PATTERN.match(entry) or entry in RESERVED_SLUGS:
+                        continue
+                    app_dir = os.path.join(self.apps_root, entry)
+                    if os.path.islink(app_dir) or not os.path.isdir(app_dir):
+                        continue
+                    target_app_dir = os.path.join(staging_dir, "apps", entry)
+                    if include_app_data:
+                        with self._lock_for(entry):
+                            info = self._collect_app_backup_into(
+                                entry, target_app_dir, budget
+                            )
+                        app_summaries.append(info)
+                    else:
+                        os.makedirs(target_app_dir, mode=0o750, exist_ok=True)
+                        composed = self._copy_regular_file_for_backup(
+                            os.path.join(app_dir, "docker-compose.yml"),
+                            os.path.join(target_app_dir, "docker-compose.yml"),
+                            budget,
+                        )
+                        self._copy_regular_file_for_backup(
+                            os.path.join(app_dir, "probe.json"),
+                            os.path.join(target_app_dir, "probe.json"),
+                            budget,
+                        )
+                        app_summaries.append(
+                            {
+                                "slug": entry,
+                                "composeIncluded": composed,
+                                "postgresDump": "none",
+                                "dataFilesCopied": 0,
+                            }
+                        )
+
+            manifest = {
+                "type": "core-backup",
+                "createdAt": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "excludesSecrets": True,
+                "includeAppData": include_app_data,
+                "registryDbIncluded": registry_included,
+                "apps": app_summaries,
+            }
+            with open(
+                os.path.join(staging_dir, "manifest.json"), "w", encoding="utf-8"
+            ) as mfh:
+                json.dump(manifest, mfh, indent=2)
+                mfh.write("\n")
+            with open(
+                os.path.join(staging_dir, "RESTORE.txt"), "w", encoding="utf-8"
+            ) as rfh:
+                rfh.write(
+                    "VPSAgent Server Backup\n"
+                    "======================\n\n"
+                    "IMPORTANT SECURITY NOTE:\n"
+                    "This backup intentionally EXCLUDES /var/lib/vpsagent/.env and per-app .env files\n"
+                    "so encryption keys and raw secrets are never stored in a downloadable file.\n\n"
+                    "If you move to a brand-new server, also save a separate offline copy of\n"
+                    "/var/lib/vpsagent/.env (especially VPSAGENT_ENCRYPTION_SECRET) so VPSAgent can\n"
+                    "decrypt your saved app variables, alert webhooks, and GitHub tokens.\n\n"
+                    "Contents:\n"
+                    "- registry.db: clean SQLite snapshot of apps, deployments, approvals, and settings\n"
+                    "- caddy/: reverse-proxy site routes\n"
+                    "- apps/<slug>/: compose blueprints (plus /data and postgres.sql if selected)\n"
+                )
+            tar_path = self._package_staging_dir_to_tar_gz(staging_dir, archive_stem)
+            return tar_path, filename
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
 
     def _single_status(self, slug: str) -> tuple[str, str]:
         app_dir = resolve_scoped_app_dir(self.apps_root, slug, require_exists=False)
@@ -4675,6 +5326,9 @@ class RuntimeService:
         # `/v1/apps/statuses` so the Apps list and Safety Check never disagree.
         host_http_health: dict[str, Any] | None = None
         if _apply_host_health:
+            probe_cfg = self._read_app_probe_config(app_dir, slug)
+            if probe_cfg is not None and not probe_cfg["probeHttp"]:
+                self._clear_host_health(slug)
             cached_host_health = self._get_host_health(slug)
             if cached_host_health is not None:
                 host_http_health = {
@@ -4685,7 +5339,6 @@ class RuntimeService:
                     "lastOutput": cached_host_health.get("lastOutput"),
                 }
             else:
-                probe_cfg = self._read_app_probe_config(app_dir, slug)
                 monitoring_enabled = (
                     probe_cfg["probeHttp"]
                     if probe_cfg is not None
@@ -5495,7 +6148,10 @@ class RuntimeService:
             ("containers", ["container", "prune", "-f"]),
         ]
         if prune_images:
-            steps.append(("images", ["image", "prune", "-af"]))
+            steps.append(("dangling-images", ["image", "prune", "-f"]))
+            steps.append(
+                ("images", ["image", "prune", "-af", "--filter", "label!=vpsagent.managed=true"])
+            )
         if prune_build_cache:
             steps.append(("build-cache", ["builder", "prune", "-f"]))
         if prune_volumes:
@@ -8855,6 +9511,31 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(raw)
 
+        def _send_file_stream(
+            self,
+            file_path: str,
+            filename: str,
+            content_type: str = "application/gzip",
+        ) -> None:
+            size = os.path.getsize(file_path)
+            safe_filename = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(filename)) or "backup.tar.gz"
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(size))
+            self.send_header(
+                "Content-Disposition", f'attachment; filename="{safe_filename}"'
+            )
+            self.send_header("X-VPSAgent-Backup-Filename", safe_filename)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            with open(file_path, "rb") as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+
         def _require_auth(self) -> bool:
             expected = service.runtime_token
             if not expected:
@@ -8963,6 +9644,22 @@ def make_handler(service: RuntimeService) -> type[BaseHTTPRequestHandler]:
                     self._send_json(200, service.start_core_update(payload))
                 elif self.path == "/v1/apps/remove":
                     self._send_json(200, service.remove_workload(payload))
+                elif self.path == "/v1/apps/rollback":
+                    self._send_json(200, service.rollback_app(payload))
+                elif self.path == "/v1/apps/backup":
+                    tar_path, filename = service.create_app_backup(payload)
+                    try:
+                        self._send_file_stream(tar_path, filename)
+                    finally:
+                        if os.path.exists(tar_path):
+                            os.unlink(tar_path)
+                elif self.path == "/v1/core/backup":
+                    tar_path, filename = service.create_core_backup(payload)
+                    try:
+                        self._send_file_stream(tar_path, filename)
+                    finally:
+                        if os.path.exists(tar_path):
+                            os.unlink(tar_path)
                 elif self.path == "/v1/apps/statuses":
                     self._send_json(200, service.statuses(payload))
                 elif self.path == "/v1/apps/inspect":
@@ -9032,6 +9729,88 @@ def prepare_unix_socket(socket_path: str) -> None:
                 f"Refusing to overwrite non-socket file at {socket_path}"
             )
         os.unlink(socket_path)
+
+
+def reset_admin_password_in_db(db_path: str, new_password: str) -> dict[str, Any]:
+    if not isinstance(new_password, str) or len(new_password) < 8 or len(new_password) > 256:
+        raise ValueError("Password must be between 8 and 256 characters long.")
+    if "\x00" in new_password:
+        raise ValueError("Password cannot contain null bytes.")
+    resolved = os.path.abspath(db_path)
+    if not os.path.lexists(resolved) or os.path.islink(resolved) or not os.path.isfile(resolved):
+        raise ValueError(f"Registry database not found at {resolved}.")
+
+    conn = sqlite3.connect(resolved, timeout=5.0)
+    try:
+        conn.execute("PRAGMA busy_timeout = 5000;")
+        setup_row = conn.execute(
+            "SELECT value_json FROM system_settings WHERE key = 'setup_state'"
+        ).fetchone()
+        claimed = False
+        if setup_row and setup_row[0]:
+            try:
+                claimed = bool(json.loads(setup_row[0]).get("claimed"))
+            except (json.JSONDecodeError, AttributeError):
+                claimed = False
+        if not claimed:
+            raise ValueError(
+                "This VPSAgent server has not been claimed yet. Complete first-time setup in your browser."
+            )
+
+        salt = os.urandom(16).hex()
+        derived = hashlib.scrypt(
+            new_password.encode("utf-8"),
+            salt=salt.encode("utf-8"),
+            n=16384,
+            r=8,
+            p=1,
+            dklen=64,
+        ).hex()
+        now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        conn.execute(
+            """
+            INSERT INTO system_settings (key, value_json, updated_at)
+            VALUES ('admin_passphrase', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+            """,
+            (json.dumps({"salt": salt, "hash": derived}), now),
+        )
+
+        ver_row = conn.execute(
+            "SELECT value_json FROM system_settings WHERE key = 'session_version'"
+        ).fetchone()
+        cur_ver = 1
+        if ver_row and ver_row[0]:
+            try:
+                parsed_ver = json.loads(ver_row[0]).get("version")
+                if isinstance(parsed_ver, int) and parsed_ver >= 1:
+                    cur_ver = parsed_ver
+            except (json.JSONDecodeError, AttributeError):
+                cur_ver = 1
+        next_ver = max(1, cur_ver) + 1
+        conn.execute(
+            """
+            INSERT INTO system_settings (key, value_json, updated_at)
+            VALUES ('session_version', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+            """,
+            (json.dumps({"version": next_ver}), now),
+        )
+        conn.execute(
+            """
+            INSERT INTO audit_events (id, actor, actor_token_id, action, target_slug, summary, risk_level, created_at)
+            VALUES (?, 'system', NULL, 'auth.password_reset_cli', NULL, ?, 'high', ?)
+            """,
+            (
+                f"aud_{os.urandom(8).hex()}",
+                "Reset owner login password via server CLI and signed out all existing sessions",
+                now,
+            ),
+        )
+        conn.commit()
+        return {"ok": True, "sessionVersion": next_ver}
+    finally:
+        conn.close()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -9115,6 +9894,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Print JSON output when used with --check-update.",
     )
     parser.add_argument(
+        "--reset-password",
+        action="store_true",
+        help="Reset the owner dashboard password in SQLite and sign out all existing sessions.",
+    )
+    parser.add_argument(
+        "--db-path",
+        default="",
+        help="Path to registry.db for --reset-password (defaults to <vpsagent-root>/data/registry.db).",
+    )
+    parser.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="Read the new password from stdin when running --reset-password.",
+    )
+    parser.add_argument(
         "--runtime-token",
         default=os.environ.get("VPSAGENT_RUNTIME_TOKEN", ""),
     )
@@ -9144,6 +9938,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.reset_password:
+        root_dir = (
+            args.vpsagent_root
+            or os.environ.get("VPSAGENT_ROOT", "").strip()
+            or (
+                os.path.dirname(os.path.abspath(args.apps_root))
+                if os.path.basename(os.path.abspath(args.apps_root)) == "apps"
+                else "/var/lib/vpsagent"
+            )
+        )
+        db_path = (
+            args.db_path.strip()
+            or os.environ.get("VPSAGENT_DB_PATH", "").strip()
+            or os.path.join(root_dir, "data", "registry.db")
+        )
+        if args.password_stdin:
+            raw_line = sys.stdin.readline()
+            new_pw = raw_line.rstrip("\r\n")
+        else:
+            pw1 = getpass.getpass("New VPSAgent dashboard password (min 8 chars): ")
+            pw2 = getpass.getpass("Confirm new password: ")
+            if pw1 != pw2:
+                sys.stderr.write("Error: passwords did not match.\n")
+                return 1
+            new_pw = pw1
+        try:
+            res = reset_admin_password_in_db(db_path, new_pw)
+        except (ValueError, sqlite3.Error) as exc:
+            sys.stderr.write(f"Password reset failed: {exc}\n")
+            return 1
+        sys.stdout.write(
+            f"Dashboard password updated and all existing sessions signed out (session v{res['sessionVersion']}).\n"
+        )
+        return 0
+
     if args.check_update:
         service = RuntimeService(
             apps_root=args.apps_root,

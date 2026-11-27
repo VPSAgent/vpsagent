@@ -33,8 +33,10 @@ import {
   ManageHostServiceInputSchema,
   RunHostCommandInputSchema,
   UpdateAppEnvInputSchema,
+  UpdateAppSettingsInputSchema,
   WriteHostFileInputSchema,
 } from "./executor.js";
+import type { NotificationService } from "./notifications.js";
 
 export const SUPPORTED_MCP_PROTOCOL_VERSIONS = [
   "2025-11-25",
@@ -176,6 +178,20 @@ const TOOL_ANNOTATIONS: Record<string, McpToolAnnotations> = {
     destructiveHint: false,
     idempotentHint: false,
     openWorldHint: true,
+  },
+  rollback_app: {
+    title: "Rollback App",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: false,
+  },
+  update_app_settings: {
+    title: "Update App Settings",
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
   },
   update_app_env: {
     title: "Update App Environment",
@@ -504,6 +520,50 @@ const RAW_MCP_TOOLS: McpToolDefinition[] = [
     inputSchema: {
       type: "object",
       properties: { slug: { type: "string" } },
+      required: ["slug"],
+    },
+  },
+  {
+    name: "rollback_app",
+    description:
+      "Roll back an app to its previous working build/image and verify startup health.",
+    inputSchema: {
+      type: "object",
+      properties: { slug: { type: "string" } },
+      required: ["slug"],
+    },
+  },
+  {
+    name: "update_app_settings",
+    description:
+      "Update an existing app's display name, CPU/RAM limits, internal port, health check path, Git branch, Dockerfile path, Docker image, or Postgres/Redis companion databases without losing data or secrets.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        slug: { type: "string" },
+        name: { type: "string" },
+        cpuLimit: { type: "string" },
+        memoryLimitMb: { type: "integer", minimum: 64, maximum: 131072 },
+        internalPort: { type: "integer", minimum: 1, maximum: 65535 },
+        probeHttp: { type: "boolean" },
+        probePath: { type: "string" },
+        image: { type: "string" },
+        gitBranch: { type: ["string", "null"] },
+        dockerfilePath: { type: "string" },
+        gitCredentialId: { type: ["string", "null"] },
+        companions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: ["postgres", "redis"] },
+              version: { type: "string" },
+              envKey: { type: "string" },
+            },
+            required: ["type"],
+          },
+        },
+      },
       required: ["slug"],
     },
   },
@@ -1146,6 +1206,7 @@ export interface McpGatewayDeps {
   transportOptions: TransportContextOptions;
   mcpDeployGraceMs?: number | undefined;
   sessions?: McpSessionStore | undefined;
+  notifier?: NotificationService | undefined;
 }
 
 function buildActiveHttpsDashboardUrl(store: RegistryStore): string | null {
@@ -1372,6 +1433,7 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
         summary: `AI key "${token.name}" requested approval (${approval.id}): ${input.summary}`,
         riskLevel: input.riskLevel,
       });
+      deps.notifier?.notifyApprovalPending(approval);
       const dashboardUrl = buildActiveHttpsDashboardUrl(store);
       return toolOk({
         status: "pending_approval",
@@ -2037,6 +2099,51 @@ export function createMcpPostHandler(deps: McpGatewayDeps) {
                     : null,
               };
             },
+          });
+          break;
+        }
+
+        case "rollback_app": {
+          const slug = validateAppSlug(String(args.slug ?? ""));
+          callResult = await handleMutation(token, {
+            action: "rollback_app",
+            targetSlug: slug,
+            summary: `Roll back app "${slug}" to previous version`,
+            payload: { slug },
+            riskLevel: "medium",
+            run: () => executor.rollbackApp(slug, "agent", token.id),
+          });
+          break;
+        }
+
+        case "update_app_settings": {
+          const slug = validateAppSlug(String(args.slug ?? ""));
+          const settingsInput = UpdateAppSettingsInputSchema.parse(args);
+          if (
+            token.allowedSlugs.length > 0 &&
+            settingsInput.gitCredentialId !== undefined
+          ) {
+            store.recordAudit({
+              actor: "agent",
+              actorTokenId: token.id,
+              action: "mcp.blocked_app_scope",
+              targetSlug: slug,
+              summary: `Blocked app-locked pass "${token.name}" from modifying GitHub credentials on "${slug}"`,
+              riskLevel: "high",
+            });
+            callResult = toolErr(
+              `Permission denied: visitor pass "${token.name}" is locked to [${token.allowedSlugs.join(", ")}] and cannot change GitHub access credentials.`,
+            );
+            break;
+          }
+          callResult = await handleMutation(token, {
+            action: "update_app_settings",
+            targetSlug: slug,
+            summary: `Update settings for "${slug}"`,
+            payload: { slug, ...settingsInput } as Record<string, unknown>,
+            riskLevel: "medium",
+            run: () =>
+              executor.updateAppSettings(slug, settingsInput, "agent", token.id),
           });
           break;
         }

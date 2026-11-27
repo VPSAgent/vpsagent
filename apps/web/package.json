@@ -1,13 +1,13 @@
 {
   "name": "@vpsagent/web",
-  "version": "2.0.0-alpha.1",
+  "version": "2.0.0-alpha.2",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc -p tsconfig.json --noEmit && vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test tests/health-display.test.ts tests/tailscale-conflict.test.ts"
+    "test": "node --test tests/health-display.test.ts tests/tailscale-conflict.test.ts tests/resource-display.test.ts"
   },
   "dependencies": {
     "lucide-react": "^0.511.0",

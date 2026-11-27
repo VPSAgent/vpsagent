@@ -4,6 +4,7 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  Download,
   ExternalLink,
   Loader2,
   Lock,
@@ -17,12 +18,15 @@ import {
   type McpSnippets,
   type McpTokenRecord,
   type McpTokenScope,
+  type NotificationChannel,
+  type NotificationSettings,
   type SetupState,
   type SystemUpdateStatus,
   type TailscaleStatus,
 } from "../api";
+import type { ResourceDisplayMode } from "../resource-display";
 import { describeTailscaleConflict } from "../tailscale-conflict";
-import { PageHeader } from "./PageHeader";
+import { PageHeader, buttonPrimary, buttonSecondary } from "./PageHeader";
 
 const TAILSCALE_INSTALL_CMD =
   "curl -fsSL https://tailscale.com/install.sh | sudo sh && sudo tailscale up";
@@ -34,11 +38,22 @@ interface KeysSettingsTabProps {
   snippets: McpSnippets | null;
   setup: SetupState;
   publicIp: string | null;
-  focusSection?: "github" | "updates" | null;
+  resourceDisplay: ResourceDisplayMode;
+  onResourceDisplayChange: (mode: ResourceDisplayMode) => void;
+  focusSection?:
+    | "general"
+    | "access"
+    | "github"
+    | "updates"
+    | "alerts"
+    | "backups"
+    | "account"
+    | null;
   onConsumeFocusSection?: () => void;
   initialUpdateStatus?: SystemUpdateStatus | null;
   onUpdateStatusChange?: (status: SystemUpdateStatus) => void;
   onRefresh: () => Promise<void>;
+  onSignedOut?: () => void;
 }
 
 const RELEASE_UPDATE_STEPS = [
@@ -85,14 +100,29 @@ function isSafeHttpsUrl(raw: string | null | undefined): raw is string {
   }
 }
 
-type SettingsPane = "access" | "network" | "github" | "updates";
+type SettingsPane =
+  | "general"
+  | "access"
+  | "network"
+  | "github"
+  | "alerts"
+  | "backups"
+  | "account"
+  | "updates";
 
 const SETTINGS_PANES: Array<{ id: SettingsPane; label: string }> = [
+  { id: "general", label: "General" },
   { id: "access", label: "AI access" },
   { id: "network", label: "Domains & network" },
   { id: "github", label: "GitHub" },
+  { id: "alerts", label: "Alerts" },
+  { id: "backups", label: "Backups" },
+  { id: "account", label: "Account" },
   { id: "updates", label: "Updates" },
 ];
+
+const RESET_PASSWORD_CMD =
+  "sudo python3 /var/lib/vpsagent/runtime-bridge.py --reset-password";
 
 const SCOPE_LABELS: Record<
   McpTokenScope,
@@ -137,11 +167,14 @@ export function KeysSettingsTab({
   snippets,
   setup,
   publicIp,
+  resourceDisplay,
+  onResourceDisplayChange,
   focusSection,
   onConsumeFocusSection,
   initialUpdateStatus = null,
   onUpdateStatusChange,
   onRefresh,
+  onSignedOut,
 }: KeysSettingsTabProps) {
   const [name, setName] = useState("");
   const [scope, setScope] = useState<McpTokenScope>("safe-auto-deploy");
@@ -186,7 +219,7 @@ export function KeysSettingsTab({
   } | null>(null);
 
   const [pane, setPane] = useState<SettingsPane>(() =>
-    focusSection === "github" ? "github" : focusSection === "updates" ? "updates" : "access",
+    focusSection ? focusSection : "general",
   );
   const githubSectionRef = useRef<HTMLElement | null>(null);
   const updatesSectionRef = useRef<HTMLElement | null>(null);
@@ -194,6 +227,30 @@ export function KeysSettingsTab({
   const [githubLabel, setGithubLabel] = useState("");
   const [githubBusy, setGithubBusy] = useState(false);
   const [testingCredId, setTestingCredId] = useState<string | null>(null);
+
+  // Instant Alerts state
+  const [alertSettings, setAlertSettings] =
+    useState<NotificationSettings | null>(null);
+  const [alertEnabled, setAlertEnabled] = useState(false);
+  const [alertChannel, setAlertChannel] = useState<NotificationChannel>("none");
+  const [alertWebhookUrl, setAlertWebhookUrl] = useState("");
+  const [alertTelegramToken, setAlertTelegramToken] = useState("");
+  const [alertTelegramChatId, setAlertTelegramChatId] = useState("");
+  const [notifyOnApproval, setNotifyOnApproval] = useState(true);
+  const [notifyOnAppDown, setNotifyOnAppDown] = useState(true);
+  const [notifyOnDeployFailure, setNotifyOnDeployFailure] = useState(true);
+  const [alertBusy, setAlertBusy] = useState(false);
+  const [alertTesting, setAlertTesting] = useState(false);
+
+  // Server Backup state
+  const [includeBackupAppData, setIncludeBackupAppData] = useState(true);
+  const [backupDownloading, setBackupDownloading] = useState(false);
+
+  // Account & Password state
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmNewPassword, setConfirmNewPassword] = useState("");
+  const [accountBusy, setAccountBusy] = useState(false);
 
   const [tailscaleStatus, setTailscaleStatus] =
     useState<TailscaleStatus | null>(null);
@@ -216,22 +273,44 @@ export function KeysSettingsTab({
   );
 
   useEffect(() => {
+    if (!focusSection) return;
+    setPane(focusSection);
     if (focusSection === "github") {
-      setPane("github");
       githubSectionRef.current?.scrollIntoView({
         behavior: "smooth",
         block: "start",
       });
-      onConsumeFocusSection?.();
     } else if (focusSection === "updates") {
-      setPane("updates");
       updatesSectionRef.current?.scrollIntoView({
         behavior: "smooth",
         block: "start",
       });
-      onConsumeFocusSection?.();
     }
+    onConsumeFocusSection?.();
   }, [focusSection, onConsumeFocusSection]);
+
+  const applyLoadedAlerts = useCallback((settings: NotificationSettings) => {
+    setAlertSettings(settings);
+    setAlertEnabled(settings.enabled);
+    setAlertChannel(settings.channel);
+    setAlertTelegramChatId(settings.telegramChatId ?? "");
+    setNotifyOnApproval(settings.notifyOnApproval);
+    setNotifyOnAppDown(settings.notifyOnAppDown);
+    setNotifyOnDeployFailure(settings.notifyOnDeployFailure);
+  }, []);
+
+  const loadNotificationSettings = useCallback(async () => {
+    try {
+      const res = await api.getNotifications();
+      applyLoadedAlerts(res.settings);
+    } catch {
+      // Non-fatal on initial mount
+    }
+  }, [applyLoadedAlerts]);
+
+  useEffect(() => {
+    void loadNotificationSettings();
+  }, [loadNotificationSettings]);
 
   const loadUpdateStatus = useCallback(async () => {
     try {
@@ -666,6 +745,136 @@ export function KeysSettingsTab({
     }
   };
 
+  const handleSaveAlerts = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAlertBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const payload: Parameters<typeof api.updateNotifications>[0] = {
+        channel: alertChannel,
+        enabled: alertChannel === "none" ? false : alertEnabled,
+        notifyOnApproval,
+        notifyOnAppDown,
+        notifyOnDeployFailure,
+      };
+      if (alertChannel === "telegram") {
+        if (alertTelegramToken.trim()) {
+          payload.telegramBotToken = alertTelegramToken.trim();
+        }
+        payload.telegramChatId = alertTelegramChatId.trim() || null;
+      } else if (alertChannel !== "none") {
+        if (alertWebhookUrl.trim()) {
+          payload.webhookUrl = alertWebhookUrl.trim();
+        }
+      }
+      const res = await api.updateNotifications(payload);
+      applyLoadedAlerts(res.settings);
+      setAlertWebhookUrl("");
+      setAlertTelegramToken("");
+      setNotice(
+        res.settings.enabled
+          ? `Saved instant alerts (${res.settings.channel}).`
+          : "Saved alert settings (currently paused).",
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not save alert settings.",
+      );
+    } finally {
+      setAlertBusy(false);
+    }
+  };
+
+  const handleTestAlert = async () => {
+    setAlertTesting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.testNotification();
+      setAlertSettings(res.settings);
+      if (res.ok) {
+        setNotice("Test alert sent! Check your Discord, Slack, Telegram, or webhook receiver.");
+      } else {
+        setError(res.error || "Test alert failed.");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Test alert failed.");
+    } finally {
+      setAlertTesting(false);
+    }
+  };
+
+  const handleDownloadSystemBackup = async () => {
+    setBackupDownloading(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.downloadSystemBackup(includeBackupAppData);
+      setNotice(
+        `Downloaded ${res.filename} (${(res.sizeBytes / 1024).toFixed(1)} KB, secrets excluded).`,
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not download server backup.",
+      );
+    } finally {
+      setBackupDownloading(false);
+    }
+  };
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newPassword.length < 8) {
+      setError("New password must be at least 8 characters long.");
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      setError("New password and confirmation do not match.");
+      return;
+    }
+    setAccountBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.changePassword(currentPassword, newPassword);
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmNewPassword("");
+      setNotice(
+        "Password updated. All older browser sessions have been signed out.",
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not change password.",
+      );
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
+  const handleLogoutAll = async () => {
+    if (
+      !window.confirm(
+        "Sign out every browser and device currently logged into this dashboard (including this tab)?",
+      )
+    ) {
+      return;
+    }
+    setAccountBusy(true);
+    setError(null);
+    try {
+      await api.logoutAll(false);
+      onSignedOut?.();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not sign out all devices.",
+      );
+    } finally {
+      setAccountBusy(false);
+    }
+  };
+
   const newRawToken = newCreatedToken?.rawToken ?? null;
   const selectedSnippetEndpoint =
     endpointSource === "tailscale" && snippets?.tailscale?.httpsReady
@@ -698,7 +907,7 @@ export function KeysSettingsTab({
     <div className="space-y-6">
       <PageHeader
         title="Settings"
-        description="Access for your AI tools, domains, GitHub and updates."
+        description="General preferences, AI access, domains, GitHub and updates."
       />
 
       {error && (
@@ -735,6 +944,73 @@ export function KeysSettingsTab({
         </nav>
 
         <div className="min-w-0 space-y-6">
+          {pane === "general" && (
+            <section className="surface-panel rounded-xl p-6 space-y-5">
+              <div>
+                <h2 className="text-base font-medium text-fg">
+                  Overview display
+                </h2>
+                <p className="mt-1 text-xs text-muted">
+                  Choose how server CPU, memory, and disk usage appear on the
+                  Overview page.
+                </p>
+              </div>
+
+              <fieldset className="space-y-2">
+                <legend className="block text-xs font-medium text-fg-2">
+                  Resource usage style
+                </legend>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {(
+                    [
+                      {
+                        id: "bar",
+                        title: "Bar",
+                        desc: "Compact progress bar showing current usage.",
+                      },
+                      {
+                        id: "chart",
+                        title: "Chart",
+                        desc: "Live area chart tracking usage over time.",
+                      },
+                    ] as const
+                  ).map((option) => {
+                    const selected = resourceDisplay === option.id;
+                    return (
+                      <label
+                        key={option.id}
+                        className={`btn-press block rounded-lg border px-4 py-3 text-left cursor-pointer has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-fg-2 has-[:focus-visible]:outline-offset-2 ${
+                          selected
+                            ? "border-fg bg-surface-2 text-fg"
+                            : "border-line bg-well text-muted hover:text-fg hover:border-line-strong"
+                        }`}
+                      >
+                        <input
+                          type="radio"
+                          name="resource-display"
+                          value={option.id}
+                          checked={selected}
+                          onChange={() => onResourceDisplayChange(option.id)}
+                          className="sr-only"
+                        />
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-medium text-fg">
+                            {option.title}
+                          </span>
+                          <span
+                            className={`h-2 w-2 rounded-full ${
+                              selected ? "bg-fg" : "bg-line-strong"
+                            }`}
+                          />
+                        </div>
+                        <p className="mt-1 text-xs text-muted">{option.desc}</p>
+                      </label>
+                    );
+                  })}
+                </div>
+              </fieldset>
+            </section>
+          )}
           {pane === "access" && (
             <>
             {snippets && (
@@ -1899,6 +2175,407 @@ export function KeysSettingsTab({
                 </div>
               )}
             </section>
+          )}
+          {pane === "alerts" && (() => {
+            const hasUnsavedAlertChanges = Boolean(
+              alertSettings &&
+                (alertEnabled !== alertSettings.enabled ||
+                  alertChannel !== alertSettings.channel ||
+                  notifyOnApproval !== alertSettings.notifyOnApproval ||
+                  notifyOnAppDown !== alertSettings.notifyOnAppDown ||
+                  notifyOnDeployFailure !== alertSettings.notifyOnDeployFailure ||
+                  (alertChannel === "telegram" &&
+                    (alertTelegramChatId.trim() !==
+                      (alertSettings.telegramChatId ?? "").trim() ||
+                      alertTelegramToken.trim().length > 0)) ||
+                  (alertChannel !== "telegram" &&
+                    alertChannel !== "none" &&
+                    alertWebhookUrl.trim().length > 0)),
+            );
+            const savedTargetMatchesChannel = Boolean(
+              alertSettings?.hasTargetSecret &&
+                alertSettings.channel === alertChannel,
+            );
+            return (
+            <form
+              onSubmit={(e) => void handleSaveAlerts(e)}
+              className="surface-panel rounded-xl p-6 space-y-5"
+            >
+              <div className="flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <h2 className="text-sm font-medium text-fg">
+                    Instant alerts
+                  </h2>
+                  <p className="text-xs text-muted mt-1">
+                    Get notified immediately when an AI pass asks for your approval, an app goes offline, or a build fails.
+                  </p>
+                </div>
+                <label className="inline-flex items-center gap-2 text-xs font-medium text-fg cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={alertEnabled && alertChannel !== "none"}
+                    disabled={alertChannel === "none"}
+                    onChange={(e) => setAlertEnabled(e.target.checked)}
+                    className="rounded border-line-strong bg-canvas accent-fg"
+                  />
+                  Enable alerts
+                </label>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-muted mb-1.5">
+                    Alert channel
+                  </label>
+                  <select
+                    value={alertChannel}
+                    onChange={(e) => {
+                      const next = e.target.value as NotificationChannel;
+                      setAlertChannel(next);
+                      if (next !== "none" && !alertEnabled) {
+                        setAlertEnabled(true);
+                      }
+                    }}
+                    className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
+                  >
+                    <option value="none">Off</option>
+                    <option value="discord">Discord webhook</option>
+                    <option value="slack">Slack webhook</option>
+                    <option value="telegram">Telegram bot</option>
+                    <option value="webhook">Custom HTTPS webhook</option>
+                  </select>
+                </div>
+
+                {savedTargetMatchesChannel && alertSettings?.targetHint && (
+                  <div className="surface-well rounded-lg px-3.5 py-2.5 flex items-center justify-between text-xs">
+                    <span className="text-muted">Saved target:</span>
+                    <code className="font-mono text-fg">
+                      {alertSettings.targetHint}
+                    </code>
+                  </div>
+                )}
+              </div>
+
+              {alertChannel === "telegram" ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-muted mb-1.5">
+                      Telegram bot token (from @BotFather)
+                    </label>
+                    <input
+                      type="password"
+                      value={alertTelegramToken}
+                      onChange={(e) => setAlertTelegramToken(e.target.value)}
+                      placeholder={
+                        alertSettings?.hasTargetSecret &&
+                        alertSettings.channel === "telegram"
+                          ? "Leave blank to keep saved token"
+                          : "123456789:AA..."
+                      }
+                      className="field-input w-full rounded-lg px-3.5 py-2 text-sm font-mono"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted mb-1.5">
+                      Telegram chat ID
+                    </label>
+                    <input
+                      type="text"
+                      value={alertTelegramChatId}
+                      onChange={(e) => setAlertTelegramChatId(e.target.value)}
+                      placeholder="123456789 or @mychannel"
+                      className="field-input w-full rounded-lg px-3.5 py-2 text-sm font-mono"
+                    />
+                  </div>
+                </div>
+              ) : alertChannel !== "none" ? (
+                <div>
+                  <label className="block text-xs font-medium text-muted mb-1.5">
+                    {alertChannel === "discord"
+                      ? "Discord webhook URL"
+                      : alertChannel === "slack"
+                        ? "Slack incoming webhook URL"
+                        : "Custom HTTPS webhook URL"}
+                  </label>
+                  <input
+                    type="password"
+                    value={alertWebhookUrl}
+                    onChange={(e) => setAlertWebhookUrl(e.target.value)}
+                    placeholder={
+                      alertSettings?.hasTargetSecret &&
+                      alertSettings.channel === alertChannel
+                        ? "Leave blank to keep saved webhook URL"
+                        : alertChannel === "discord"
+                          ? "https://discord.com/api/webhooks/..."
+                          : alertChannel === "slack"
+                            ? "https://hooks.slack.com/services/..."
+                            : "https://your-service.example.com/webhook"
+                    }
+                    className="field-input w-full rounded-lg px-3.5 py-2 text-sm font-mono"
+                  />
+                  <p className="mt-1.5 text-[11px] text-subtle">
+                    Encrypted at rest. Payloads automatically scrub secrets before leaving your server.
+                  </p>
+                </div>
+              ) : null}
+
+              {alertChannel !== "none" && (
+                <div className="space-y-2 pt-1">
+                  <p className="text-xs font-medium text-muted">
+                    Send an alert when:
+                  </p>
+                  <div className="flex flex-wrap gap-5">
+                    <label className="inline-flex items-center gap-2 text-xs text-fg-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={notifyOnApproval}
+                        onChange={(e) => setNotifyOnApproval(e.target.checked)}
+                        className="rounded border-line-strong bg-canvas accent-fg"
+                      />
+                      AI asks for approval
+                    </label>
+                    <label className="inline-flex items-center gap-2 text-xs text-fg-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={notifyOnAppDown}
+                        onChange={(e) => setNotifyOnAppDown(e.target.checked)}
+                        className="rounded border-line-strong bg-canvas accent-fg"
+                      />
+                      An app goes offline or recovers
+                    </label>
+                    <label className="inline-flex items-center gap-2 text-xs text-fg-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={notifyOnDeployFailure}
+                        onChange={(e) =>
+                          setNotifyOnDeployFailure(e.target.checked)
+                        }
+                        className="rounded border-line-strong bg-canvas accent-fg"
+                      />
+                      A build or rollback fails
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              {(alertSettings?.lastSentAt || alertSettings?.lastError) && (
+                <div className="surface-well rounded-lg px-3.5 py-2.5 text-xs space-y-1">
+                  {alertSettings.lastSentAt && (
+                    <p className="text-fg-2">
+                      Last alert sent:{" "}
+                      {new Date(alertSettings.lastSentAt).toLocaleString()}
+                    </p>
+                  )}
+                  {alertSettings.lastError && (
+                    <p className="text-bad">
+                      Last delivery error: {alertSettings.lastError}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-end gap-2.5 pt-1">
+                {savedTargetMatchesChannel && alertChannel !== "none" && (
+                  <>
+                    {hasUnsavedAlertChanges && (
+                      <span className="text-xs text-muted mr-auto">
+                        Save changes first to test this destination.
+                      </span>
+                    )}
+                    <button
+                      type="button"
+                      disabled={
+                        alertTesting || alertBusy || hasUnsavedAlertChanges
+                      }
+                      onClick={() => void handleTestAlert()}
+                      className={buttonSecondary}
+                    >
+                      {alertTesting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : null}
+                      {alertTesting ? "Sending..." : "Send test alert"}
+                    </button>
+                  </>
+                )}
+                <button
+                  type="submit"
+                  disabled={alertBusy}
+                  className={buttonPrimary}
+                >
+                  {alertBusy ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : null}
+                  {alertBusy ? "Saving..." : "Save alert settings"}
+                </button>
+              </div>
+            </form>
+            );
+          })()}
+          {pane === "backups" && (
+            <section className="surface-panel rounded-xl p-6 space-y-5">
+              <div>
+                <h2 className="text-sm font-medium text-fg">Server backup</h2>
+                <p className="text-xs text-muted mt-1">
+                  Download a safe archive of your VPSAgent database, reverse-proxy routes, app blueprints, and optionally all app data + Postgres dumps.
+                </p>
+              </div>
+
+              <div className="rounded-lg border border-warn-line bg-warn-soft px-4 py-3 text-xs text-warn space-y-1">
+                <p className="font-medium">Secrets are excluded on purpose</p>
+                <p>
+                  For your protection, downloadable backups never include{" "}
+                  <code className="font-mono">.env</code> files or encryption keys. If you plan to migrate to a brand-new VPS, keep a separate offline copy of{" "}
+                  <code className="font-mono">/var/lib/vpsagent/.env</code> so your saved variables and tokens can be decrypted.
+                </p>
+              </div>
+
+              <label className="inline-flex items-center gap-2 text-sm text-fg-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={includeBackupAppData}
+                  onChange={(e) => setIncludeBackupAppData(e.target.checked)}
+                  className="rounded border-line-strong bg-canvas accent-fg"
+                />
+                Include app <code className="font-mono text-xs">/app/data</code>{" "}
+                files and live Postgres database dumps
+              </label>
+
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  disabled={backupDownloading}
+                  onClick={() => void handleDownloadSystemBackup()}
+                  className={buttonPrimary}
+                >
+                  {backupDownloading ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Download className="h-3.5 w-3.5" />
+                  )}
+                  {backupDownloading
+                    ? "Building archive..."
+                    : "Download server backup (.tar.gz)"}
+                </button>
+              </div>
+            </section>
+          )}
+          {pane === "account" && (
+            <div className="space-y-6">
+              <form
+                onSubmit={(e) => void handleChangePassword(e)}
+                className="surface-panel rounded-xl p-6 space-y-4"
+              >
+                <div>
+                  <h2 className="text-sm font-medium text-fg">
+                    Change login password
+                  </h2>
+                  <p className="text-xs text-muted mt-1">
+                    Updating your password keeps this browser signed in and automatically signs out all older sessions.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-xs font-medium text-muted mb-1.5">
+                      Current password
+                    </label>
+                    <input
+                      type="password"
+                      value={currentPassword}
+                      onChange={(e) => setCurrentPassword(e.target.value)}
+                      required
+                      className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted mb-1.5">
+                      New password (min 8 chars)
+                    </label>
+                    <input
+                      type="password"
+                      value={newPassword}
+                      onChange={(e) => setNewPassword(e.target.value)}
+                      minLength={8}
+                      required
+                      className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted mb-1.5">
+                      Confirm new password
+                    </label>
+                    <input
+                      type="password"
+                      value={confirmNewPassword}
+                      onChange={(e) => setConfirmNewPassword(e.target.value)}
+                      minLength={8}
+                      required
+                      className="field-input w-full rounded-lg px-3.5 py-2 text-sm"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex justify-end">
+                  <button
+                    type="submit"
+                    disabled={accountBusy}
+                    className={buttonPrimary}
+                  >
+                    {accountBusy ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : null}
+                    Update password
+                  </button>
+                </div>
+              </form>
+
+              <section className="surface-panel rounded-xl p-6 flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-sm font-medium text-fg">
+                    Active dashboard sessions
+                  </h2>
+                  <p className="text-xs text-muted mt-1">
+                    Immediately sign out every browser and device using this dashboard (including this window).
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={accountBusy}
+                  onClick={() => void handleLogoutAll()}
+                  className={buttonSecondary}
+                >
+                  Sign out all devices
+                </button>
+              </section>
+
+              <section className="surface-panel rounded-xl p-6 space-y-3">
+                <h2 className="text-sm font-medium text-fg">
+                  Forgot your password?
+                </h2>
+                <p className="text-xs text-muted">
+                  If you ever get locked out, connect to your VPS over SSH and run this recovery command as root/sudo:
+                </p>
+                <div className="flex items-center justify-between gap-3 rounded-lg border border-line bg-canvas px-3.5 py-2.5 text-xs">
+                  <code className="font-mono text-fg break-all">
+                    {RESET_PASSWORD_CMD}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void copyText("reset-cmd", RESET_PASSWORD_CMD)
+                    }
+                    className={buttonSecondary}
+                  >
+                    {copiedId === "reset-cmd" ? (
+                      <Check className="h-3.5 w-3.5 text-ok" />
+                    ) : (
+                      <Copy className="h-3.5 w-3.5" />
+                    )}
+                    Copy
+                  </button>
+                </div>
+              </section>
+            </div>
           )}
           {pane === "updates" && (
             <section

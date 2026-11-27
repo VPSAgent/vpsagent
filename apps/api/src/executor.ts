@@ -34,6 +34,7 @@ import {
   writeApartmentBlueprint,
 } from "@vpsagent/shared";
 import { listGithubReposForToken } from "./github.js";
+import type { NotificationService } from "./notifications.js";
 
 export const DeployAppInputSchema = z.object({
   slug: z.string().min(2).max(48),
@@ -78,6 +79,21 @@ export const UpdateAppEnvInputSchema = z.object({
   deleteKeys: z.array(z.string().min(1).max(128)).default([]),
 });
 export type UpdateAppEnvInput = z.input<typeof UpdateAppEnvInputSchema>;
+
+export const UpdateAppSettingsInputSchema = z.object({
+  name: z.string().trim().min(1).max(100).optional(),
+  cpuLimit: z.string().min(1).max(16).optional(),
+  memoryLimitMb: z.number().int().min(64).max(131072).optional(),
+  internalPort: z.number().int().min(1).max(65535).optional(),
+  probeHttp: z.boolean().optional(),
+  probePath: z.string().min(1).max(128).optional(),
+  image: z.string().min(1).max(255).optional(),
+  gitBranch: z.string().min(1).max(120).nullable().optional(),
+  dockerfilePath: z.string().min(1).max(200).optional(),
+  gitCredentialId: z.string().trim().min(1).max(64).nullable().optional(),
+  companions: z.array(CompanionServiceSchema).optional(),
+});
+export type UpdateAppSettingsInput = z.input<typeof UpdateAppSettingsInputSchema>;
 
 export interface StartDeploymentResult {
   done: boolean;
@@ -147,6 +163,9 @@ export interface AppExecutorOptions {
   buildTimeoutSeconds?: number | undefined;
   githubApiBaseUrl?: string | undefined;
   githubFetchFn?: typeof fetch | undefined;
+  notifier?: NotificationService | undefined;
+  onIntentionalStop?: ((slug: string) => void) | undefined;
+  onAppStarted?: ((slug: string) => void) | undefined;
 }
 
 interface GitAuthCandidate {
@@ -203,7 +222,11 @@ export class AppExecutor {
   private readonly buildTimeoutSeconds: number;
   private readonly githubApiBaseUrl: string | undefined;
   private readonly githubFetchFn: typeof fetch | undefined;
+  private readonly notifier: NotificationService | undefined;
+  private readonly onIntentionalStop: ((slug: string) => void) | undefined;
+  private readonly onAppStarted: ((slug: string) => void) | undefined;
   private readonly activeSlugs = new Set<string>();
+  private readonly pendingWebhookRebuilds = new Set<string>();
 
   constructor(options: AppExecutorOptions) {
     this.store = options.store;
@@ -215,6 +238,9 @@ export class AppExecutor {
     this.buildTimeoutSeconds = options.buildTimeoutSeconds ?? 300;
     this.githubApiBaseUrl = options.githubApiBaseUrl;
     this.githubFetchFn = options.githubFetchFn;
+    this.notifier = options.notifier;
+    this.onIntentionalStop = options.onIntentionalStop;
+    this.onAppStarted = options.onAppStarted;
   }
 
   private acquireSlugLock(slug: string): () => void {
@@ -230,8 +256,53 @@ export class AppExecutor {
       if (!released) {
         released = true;
         this.activeSlugs.delete(slug);
+        if (this.pendingWebhookRebuilds.delete(slug)) {
+          queueMicrotask(() => {
+            const latest = this.store.getApp(slug);
+            if (!latest || latest.sourceType !== "git") {
+              return;
+            }
+            void this.startRebuildApp(slug, "system", { waitMs: 0 }).catch(
+              (err) => {
+                if (err instanceof RuntimeBridgeError && err.statusCode === 409) {
+                  this.pendingWebhookRebuilds.add(slug);
+                }
+              },
+            );
+          });
+        }
       }
     };
+  }
+
+  async queueOrStartWebhookRebuild(slugRaw: string): Promise<{
+    triggered: boolean;
+    queued: boolean;
+    deploymentId?: string;
+    reason?: string;
+  }> {
+    const slug = validateAppSlug(slugRaw);
+    try {
+      const started = await this.startRebuildApp(slug, "system", {
+        waitMs: 0,
+      });
+      return {
+        triggered: true,
+        queued: false,
+        deploymentId: started.deployment.id,
+      };
+    } catch (err) {
+      if (err instanceof RuntimeBridgeError && err.statusCode === 409) {
+        this.pendingWebhookRebuilds.add(slug);
+        return {
+          triggered: false,
+          queued: true,
+          reason:
+            "Rebuild already in progress; queued a follow-up rebuild for the latest push.",
+        };
+      }
+      throw err;
+    }
   }
 
   private async withSlugLock<T>(slug: string, fn: () => Promise<T>): Promise<T> {
@@ -614,6 +685,8 @@ export class AppExecutor {
     let backgroundStarted = false;
     try {
       const existing = this.store.getApp(slug);
+      const priorCommitSha = existing?.lastCommitSha ?? null;
+      const priorImage = existing?.image ?? null;
       if (input.createOnly && existing) {
         throw new RuntimeBridgeError(
           409,
@@ -725,6 +798,12 @@ export class AppExecutor {
             : "Queued Locked Apartment container launch...",
       });
 
+      const previousMode: "clear" | "preserve" | "save" = !existing
+        ? "clear"
+        : existing.status === "error" && existing.rollbackAvailable
+          ? "preserve"
+          : "save";
+
       const runPipeline = async (): Promise<{
         app: AppRecord;
         deployment: DeploymentRecord;
@@ -755,6 +834,7 @@ export class AppExecutor {
                       safeDockerfile === "Dockerfile" ||
                       safeDockerfile === "auto",
                     timeoutSeconds: this.buildTimeoutSeconds,
+                    previousMode,
                   }),
               );
             buildLogs = buildRes.buildLogTail;
@@ -807,6 +887,17 @@ export class AppExecutor {
               internalPort: resolvedPort,
               gitCredentialId: usedCredentialId,
             });
+            if (
+              existing &&
+              previousMode === "save" &&
+              buildRes.previousImageSaved
+            ) {
+              this.store.updateAppRollbackState(slug, {
+                previousCommitSha: priorCommitSha,
+                previousImage: priorImage,
+                rollbackAvailable: true,
+              });
+            }
             this.store.updateDeployment(deployment.id, {
               status: "starting",
               commitSha: buildRes.commitSha ?? null,
@@ -818,6 +909,18 @@ export class AppExecutor {
                 : `Built image (port ${resolvedPort}). Starting container...`,
             });
           } else {
+            if (
+              existing &&
+              priorImage &&
+              priorImage !== blueprint.imageRef &&
+              previousMode === "save"
+            ) {
+              this.store.updateAppRollbackState(slug, {
+                previousCommitSha: null,
+                previousImage: priorImage,
+                rollbackAvailable: true,
+              });
+            }
             this.store.updateDeployment(deployment.id, {
               status: "starting",
               phaseDetail: "Starting Locked Apartment container...",
@@ -856,6 +959,7 @@ export class AppExecutor {
             this.store.updateAppDomain(slug, safeDomain);
           }
 
+          this.onAppStarted?.(slug);
           const running = this.store.updateAppStatus(slug, "running")!;
           const succeededDeployment = this.store.updateDeployment(deployment.id, {
             status: "succeeded",
@@ -889,12 +993,18 @@ export class AppExecutor {
           const errMessage = redactSecrets(
             err instanceof Error ? err.message : String(err),
           );
-          this.store.updateDeployment(deployment.id, {
+          const failedDeployment = this.store.updateDeployment(deployment.id, {
             status: "failed",
             phaseDetail: "Deployment failed.",
             buildLogs: errLogs,
             error: errMessage,
           });
+          this.notifier?.notifyDeployFailed(
+            slug,
+            failedDeployment ?? deployment,
+            errMessage,
+            { appExists: Boolean(existing) },
+          );
 
           if (!existing) {
             try {
@@ -1048,6 +1158,12 @@ export class AppExecutor {
             : "Queued container rebuild...",
       });
 
+      const priorCommitSha = existing.lastCommitSha ?? null;
+      const priorImage = existing.image ?? null;
+      const previousMode: "preserve" | "save" =
+        existing.status === "error" && existing.rollbackAvailable
+          ? "preserve"
+          : "save";
       const runPipeline = async (): Promise<{
         app: AppRecord;
         deployment: DeploymentRecord;
@@ -1082,6 +1198,7 @@ export class AppExecutor {
                       existing.dockerfilePath === "Dockerfile" ||
                       existing.dockerfilePath === "auto",
                     timeoutSeconds: this.buildTimeoutSeconds,
+                    previousMode,
                   }),
               );
             buildLogs = buildRes.buildLogTail;
@@ -1094,6 +1211,13 @@ export class AppExecutor {
                 : {}),
               gitCredentialId: usedCredentialId,
             });
+            if (previousMode === "save" && buildRes.previousImageSaved) {
+              this.store.updateAppRollbackState(slug, {
+                previousCommitSha: priorCommitSha,
+                previousImage: priorImage,
+                rollbackAvailable: true,
+              });
+            }
             this.store.updateDeployment(deployment.id, {
               status: "starting",
               commitSha: buildRes.commitSha ?? null,
@@ -1156,6 +1280,7 @@ export class AppExecutor {
             );
           }
 
+          this.onAppStarted?.(slug);
           const updated = this.store.updateAppStatus(slug, "running")!;
           const succeededDeployment = this.store.updateDeployment(deployment.id, {
             status: "succeeded",
@@ -1183,12 +1308,17 @@ export class AppExecutor {
             err instanceof Error ? err.message : String(err),
           );
           this.store.updateAppStatus(slug, "error");
-          this.store.updateDeployment(deployment.id, {
+          const failedDeployment = this.store.updateDeployment(deployment.id, {
             status: "failed",
             phaseDetail: "Rebuild failed.",
             buildLogs: errLogs,
             error: errMessage,
           });
+          this.notifier?.notifyDeployFailed(
+            slug,
+            failedDeployment ?? deployment,
+            errMessage,
+          );
           this.store.recordAudit({
             actor,
             actorTokenId,
@@ -1388,6 +1518,560 @@ export class AppExecutor {
     });
   }
 
+  async updateAppSettings(
+    slugRaw: string,
+    rawInput: UpdateAppSettingsInput,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<{ app: AppRecord; needsRebuild: boolean; needsStart: boolean }> {
+    const slug = validateAppSlug(slugRaw);
+    const input = UpdateAppSettingsInputSchema.parse(rawInput);
+    const existing = this.store.getApp(slug);
+    if (!existing) {
+      throw new RuntimeBridgeError(404, `App "${slug}" not found.`);
+    }
+
+    return this.withSlugLock(slug, async () => {
+      const current = this.store.getApp(slug);
+      if (!current) {
+        throw new RuntimeBridgeError(404, `App "${slug}" not found.`);
+      }
+
+      if (current.sourceType === "git" && input.image !== undefined) {
+        throw new RuntimeBridgeError(
+          400,
+          "Cannot set a Docker image on a GitHub-built app.",
+        );
+      }
+      if (
+        current.sourceType === "image" &&
+        (input.gitBranch !== undefined ||
+          input.dockerfilePath !== undefined ||
+          input.gitCredentialId !== undefined)
+      ) {
+        throw new RuntimeBridgeError(
+          400,
+          "Git branch, Dockerfile path, and GitHub credentials only apply to GitHub apps.",
+        );
+      }
+
+      const nextName = input.name ?? current.name;
+      const nextCpuLimit = input.cpuLimit ?? current.cpuLimit;
+      const nextMemoryLimitMb = input.memoryLimitMb ?? current.memoryLimitMb;
+      const nextInternalPort = input.internalPort ?? current.internalPort;
+      const nextProbeHttp = input.probeHttp ?? current.probeHttp;
+      const nextProbePath = input.probePath ?? current.probePath;
+      const nextImage =
+        current.sourceType === "image"
+          ? (input.image?.trim() || current.image)
+          : current.image;
+      const nextGitBranch =
+        current.sourceType === "git"
+          ? input.gitBranch === undefined
+            ? current.gitBranch
+            : input.gitBranch
+              ? validateGitBranch(input.gitBranch)
+              : null
+          : null;
+      const nextDockerfilePath =
+        current.sourceType === "git"
+          ? input.dockerfilePath === undefined
+            ? current.dockerfilePath
+            : input.dockerfilePath === "auto"
+              ? "auto"
+              : validateDockerfilePath(input.dockerfilePath)
+          : current.dockerfilePath;
+
+      let nextGitCredentialId = current.gitCredentialId;
+      if (current.sourceType === "git" && input.gitCredentialId !== undefined) {
+        const cleaned = input.gitCredentialId?.trim() || null;
+        if (cleaned && !this.store.getGitCredential(cleaned)) {
+          throw new RuntimeBridgeError(
+            404,
+            `GitHub access token "${cleaned}" was not found.`,
+          );
+        }
+        nextGitCredentialId = cleaned;
+      }
+
+      const nextCompanions = input.companions ?? current.companions;
+      const currentEnv = this.store.getAppEnvMapForRuntime(slug);
+      const userEnv = { ...currentEnv };
+      delete userEnv.APP_SLUG;
+      delete userEnv.APP_PORT;
+      if (
+        nextInternalPort !== current.internalPort &&
+        userEnv.PORT === String(current.internalPort)
+      ) {
+        userEnv.PORT = String(nextInternalPort);
+      }
+
+      const blueprint = generateApartmentBlueprint({
+        slug,
+        sourceType: current.sourceType,
+        image: current.sourceType === "image" ? nextImage : null,
+        gitRepoUrl: current.gitRepoUrl,
+        gitBranch: nextGitBranch,
+        dockerfilePath: nextDockerfilePath,
+        internalPort: nextInternalPort,
+        probeHttp: nextProbeHttp,
+        probePath: nextProbePath,
+        cpuLimit: nextCpuLimit,
+        memoryLimitMb: nextMemoryLimitMb,
+        companions: nextCompanions,
+        envVars: userEnv,
+        companionSecrets: {
+          ...(currentEnv.POSTGRES_PASSWORD
+            ? { postgresPassword: currentEnv.POSTGRES_PASSWORD }
+            : {}),
+          ...(currentEnv.REDIS_PASSWORD
+            ? { redisPassword: currentEnv.REDIS_PASSWORD }
+            : {}),
+        },
+      });
+
+      const appDir = resolveScopedAppDir(this.appsRoot, slug);
+      const composePath = path.join(appDir, "docker-compose.yml");
+      const envPath = path.join(appDir, ".env");
+      const probeConfigPath = path.join(appDir, "probe.json");
+      const prevCompose = fs.existsSync(composePath)
+        ? fs.readFileSync(composePath, "utf8")
+        : null;
+      const prevEnv = fs.existsSync(envPath)
+        ? fs.readFileSync(envPath, "utf8")
+        : null;
+      const prevProbe = fs.existsSync(probeConfigPath)
+        ? fs.readFileSync(probeConfigPath, "utf8")
+        : null;
+
+      let hasRunningContainer = false;
+      if (current.status === "running" || current.status === "error") {
+        try {
+          const live = await this.bridge.inspectWorkload(slug, {
+            probeHttp: false,
+          });
+          const expectedAppContainerName = `vpsagent-app-${slug}`;
+          const appContainer = live.containers.find(
+            (ct) => ct.name === expectedAppContainerName,
+          );
+          hasRunningContainer = appContainer
+            ? appContainer.running ||
+              appContainer.state.trim().toLowerCase() === "running"
+            : live.containers.some(
+                (ct) =>
+                  ct.running || ct.state.trim().toLowerCase() === "running",
+              );
+        } catch {
+          hasRunningContainer = current.status === "running";
+        }
+      }
+
+      const runtimeSpecChanged =
+        nextImage !== current.image ||
+        nextInternalPort !== current.internalPort ||
+        nextCpuLimit !== current.cpuLimit ||
+        nextMemoryLimitMb !== current.memoryLimitMb ||
+        JSON.stringify(nextCompanions) !== JSON.stringify(current.companions);
+      const probeChanged =
+        nextProbeHttp !== current.probeHttp ||
+        nextProbePath !== current.probePath;
+
+      let lifecycleApplied = false;
+      let nextStatus = current.status;
+      try {
+        writeApartmentBlueprint(this.appsRoot, blueprint);
+        if (hasRunningContainer) {
+          if (runtimeSpecChanged || (nextProbeHttp && probeChanged)) {
+            const lifeRes = await this.bridge.lifecycle(slug, "start");
+            lifecycleApplied = true;
+            nextStatus = lifeRes.status;
+          } else {
+            const statusRes = await this.bridge.lifecycle(slug, "status");
+            nextStatus = statusRes.status;
+          }
+        }
+        if (current.domain && nextInternalPort !== current.internalPort) {
+          await this.bridge.routeCaddy({
+            slug,
+            domain: current.domain,
+            internalPort: nextInternalPort,
+          });
+        }
+      } catch (err) {
+        try {
+          if (prevCompose !== null) {
+            fs.writeFileSync(composePath, prevCompose, {
+              encoding: "utf8",
+              mode: 0o644,
+            });
+          }
+          if (prevEnv !== null) {
+            fs.writeFileSync(envPath, prevEnv, {
+              encoding: "utf8",
+              mode: 0o600,
+            });
+          }
+          if (prevProbe !== null) {
+            fs.writeFileSync(probeConfigPath, prevProbe, {
+              encoding: "utf8",
+              mode: 0o644,
+            });
+          }
+          if (lifecycleApplied) {
+            await this.bridge.lifecycle(slug, "start");
+          }
+        } catch {
+          // Best-effort restore on failure
+        }
+        throw err;
+      }
+
+      const envToStore: Array<{ key: string; value: string }> = [];
+      for (const [k, v] of Object.entries(blueprint.envVars)) {
+        if (currentEnv[k] !== v) {
+          envToStore.push({ key: k, value: v });
+        }
+      }
+      if (envToStore.length > 0) {
+        this.store.setAppEnvVars(slug, envToStore);
+      }
+
+      this.store.upsertApp({
+        slug,
+        name: nextName,
+        sourceType: current.sourceType,
+        image: blueprint.imageRef,
+        gitRepoUrl: current.gitRepoUrl,
+        gitBranch: nextGitBranch,
+        dockerfilePath: nextDockerfilePath,
+        domain: current.domain,
+        folderPath: current.folderPath,
+        internalPort: nextInternalPort,
+        probeHttp: nextProbeHttp,
+        probePath: nextProbePath,
+        status: nextStatus,
+        cpuLimit: nextCpuLimit,
+        memoryLimitMb: nextMemoryLimitMb,
+        companions: blueprint.companions,
+        gitCredentialId: nextGitCredentialId,
+      });
+      if (nextStatus === "running") {
+        this.onAppStarted?.(slug);
+      }
+
+      if (
+        current.sourceType === "image" &&
+        current.image &&
+        current.image !== blueprint.imageRef
+      ) {
+        this.store.updateAppRollbackState(slug, {
+          previousImage: current.image,
+          rollbackAvailable: true,
+        });
+      }
+
+      const needsRebuild =
+        current.sourceType === "git" &&
+        (nextGitBranch !== current.gitBranch ||
+          nextDockerfilePath !== current.dockerfilePath ||
+          nextGitCredentialId !== current.gitCredentialId);
+      const needsStart =
+        !hasRunningContainer && (runtimeSpecChanged || probeChanged);
+
+      this.store.recordAudit({
+        actor,
+        actorTokenId: actorTokenId ?? null,
+        action: "update_app_settings",
+        targetSlug: slug,
+        summary: `Updated app settings for "${slug}" (${nextCpuLimit} CPU, ${nextMemoryLimitMb} MB, port ${nextInternalPort})`,
+        riskLevel: "medium",
+      });
+
+      return { app: this.store.getApp(slug)!, needsRebuild, needsStart };
+    });
+  }
+
+  async rollbackApp(
+    slugRaw: string,
+    actor: Actor,
+    actorTokenId?: string | null,
+  ): Promise<{ app: AppRecord; deployment: DeploymentRecord }> {
+    const slug = validateAppSlug(slugRaw);
+    const existing = this.store.getApp(slug);
+    if (!existing) {
+      throw new RuntimeBridgeError(404, `App "${slug}" not found.`);
+    }
+
+    return this.withSlugLock(slug, async () => {
+      const current = this.store.getApp(slug);
+      if (!current) {
+        throw new RuntimeBridgeError(404, `App "${slug}" not found.`);
+      }
+      if (!current.rollbackAvailable) {
+        throw new RuntimeBridgeError(
+          400,
+          `No previous working version is available to roll back "${slug}".`,
+        );
+      }
+
+      const deployment = this.store.createDeployment({
+        slug,
+        action: "rollback_app",
+        actor,
+        actorTokenId: actorTokenId ?? null,
+        sourceType: current.sourceType,
+        gitRepoUrl: current.gitRepoUrl,
+        gitBranch: current.gitBranch,
+        domain: current.domain,
+        phaseDetail: "Rolling back to previous working version...",
+      });
+
+      const preRollbackStatus = current.status;
+      let restoredPreRollback = false;
+
+      try {
+        if (current.sourceType === "git") {
+          if (!this.bridge.rollbackApp) {
+            throw new RuntimeBridgeError(
+              501,
+              "The host Runtime Bridge needs a one-time update before rollback can run.",
+            );
+          }
+          this.store.updateDeployment(deployment.id, {
+            status: "starting",
+            phaseDetail: "Restoring previous built container image...",
+          });
+          const rbRes = await this.bridge.rollbackApp(slug);
+          this.store.updateDeployment(deployment.id, {
+            status: "verifying",
+            phaseDetail: `Checking app health on internal port ${current.internalPort}...`,
+          });
+          try {
+            const readiness = await this.bridge.waitForReadiness(slug, {
+              internalPort: current.internalPort,
+              probeHttp: current.probeHttp,
+              probePath: current.probePath,
+              timeoutSeconds: this.readinessTimeoutSeconds,
+              pollIntervalMs: this.readinessPollIntervalMs,
+            });
+            if (!readiness.ready) {
+              throw new RuntimeBridgeError(
+                502,
+                readiness.reason ??
+                  `App "${slug}" failed readiness after rollback.`,
+              );
+            }
+          } catch (readinessErr) {
+            if (rbRes.swapped) {
+              try {
+                const restoreRes = await this.bridge.rollbackApp(slug);
+                if (preRollbackStatus === "stopped") {
+                  await this.bridge.lifecycle(slug, "stop");
+                  restoredPreRollback = true;
+                } else {
+                  restoredPreRollback = restoreRes.status === "running";
+                }
+              } catch {
+                // Best-effort restore of pre-rollback image/tags
+              }
+            }
+            throw readinessErr;
+          }
+          const nextSha = current.previousCommitSha;
+          const nextPrevSha = current.lastCommitSha;
+          this.store.updateAppBuildMetadata(slug, { lastCommitSha: nextSha });
+          this.store.updateAppRollbackState(slug, {
+            previousCommitSha: nextPrevSha,
+            rollbackAvailable: rbRes.swapped || Boolean(nextPrevSha),
+          });
+        } else {
+          if (!current.previousImage) {
+            throw new RuntimeBridgeError(
+              400,
+              `No previous Docker image is recorded for "${slug}".`,
+            );
+          }
+          const targetImage = current.previousImage;
+          const currentEnv = this.store.getAppEnvMapForRuntime(slug);
+          const userEnv = { ...currentEnv };
+          delete userEnv.APP_SLUG;
+          delete userEnv.APP_PORT;
+
+          const blueprint = generateApartmentBlueprint({
+            slug,
+            sourceType: "image",
+            image: targetImage,
+            gitRepoUrl: null,
+            gitBranch: null,
+            dockerfilePath: current.dockerfilePath,
+            internalPort: current.internalPort,
+            probeHttp: current.probeHttp,
+            probePath: current.probePath,
+            cpuLimit: current.cpuLimit,
+            memoryLimitMb: current.memoryLimitMb,
+            companions: current.companions,
+            envVars: userEnv,
+            companionSecrets: {
+              ...(currentEnv.POSTGRES_PASSWORD
+                ? { postgresPassword: currentEnv.POSTGRES_PASSWORD }
+                : {}),
+              ...(currentEnv.REDIS_PASSWORD
+                ? { redisPassword: currentEnv.REDIS_PASSWORD }
+                : {}),
+            },
+          });
+
+          const appDir = resolveScopedAppDir(this.appsRoot, slug);
+          const composePath = path.join(appDir, "docker-compose.yml");
+          const envPath = path.join(appDir, ".env");
+          const probeConfigPath = path.join(appDir, "probe.json");
+          const prevCompose = fs.existsSync(composePath)
+            ? fs.readFileSync(composePath, "utf8")
+            : null;
+          const prevEnv = fs.existsSync(envPath)
+            ? fs.readFileSync(envPath, "utf8")
+            : null;
+          const prevProbe = fs.existsSync(probeConfigPath)
+            ? fs.readFileSync(probeConfigPath, "utf8")
+            : null;
+
+          this.store.updateDeployment(deployment.id, {
+            status: "starting",
+            phaseDetail: `Restoring previous Docker image (${targetImage})...`,
+          });
+
+          let lifecycleStarted = false;
+          try {
+            writeApartmentBlueprint(this.appsRoot, blueprint);
+            await this.bridge.lifecycle(slug, "start");
+            lifecycleStarted = true;
+
+            this.store.updateDeployment(deployment.id, {
+              status: "verifying",
+              phaseDetail: `Checking app health on internal port ${current.internalPort}...`,
+            });
+            const readiness = await this.bridge.waitForReadiness(slug, {
+              internalPort: current.internalPort,
+              probeHttp: current.probeHttp,
+              probePath: current.probePath,
+              timeoutSeconds: this.readinessTimeoutSeconds,
+              pollIntervalMs: this.readinessPollIntervalMs,
+            });
+            if (!readiness.ready) {
+              throw new RuntimeBridgeError(
+                502,
+                readiness.reason ??
+                  `App "${slug}" failed readiness after rollback.`,
+              );
+            }
+          } catch (err) {
+            try {
+              if (prevCompose !== null) {
+                fs.writeFileSync(composePath, prevCompose, {
+                  encoding: "utf8",
+                  mode: 0o644,
+                });
+              }
+              if (prevEnv !== null) {
+                fs.writeFileSync(envPath, prevEnv, {
+                  encoding: "utf8",
+                  mode: 0o600,
+                });
+              }
+              if (prevProbe !== null) {
+                fs.writeFileSync(probeConfigPath, prevProbe, {
+                  encoding: "utf8",
+                  mode: 0o644,
+                });
+              }
+              if (lifecycleStarted) {
+                const restoreRes = await this.bridge.lifecycle(
+                  slug,
+                  preRollbackStatus === "stopped" ? "stop" : "start",
+                );
+                restoredPreRollback =
+                  preRollbackStatus === "running"
+                    ? restoreRes.status === "running"
+                    : true;
+              }
+            } catch {
+              // Best-effort restore on failure
+            }
+            throw err;
+          }
+
+          this.store.upsertApp({
+            slug,
+            name: current.name,
+            sourceType: "image",
+            image: targetImage,
+            gitRepoUrl: null,
+            gitBranch: null,
+            dockerfilePath: current.dockerfilePath,
+            domain: current.domain,
+            folderPath: current.folderPath,
+            internalPort: current.internalPort,
+            probeHttp: current.probeHttp,
+            probePath: current.probePath,
+            status: "running",
+            cpuLimit: current.cpuLimit,
+            memoryLimitMb: current.memoryLimitMb,
+            companions: current.companions,
+            previousImage: current.image,
+            rollbackAvailable: Boolean(current.image),
+          });
+        }
+
+        this.onAppStarted?.(slug);
+        const running = this.store.updateAppStatus(slug, "running")!;
+        const finishedDep = this.store.updateDeployment(deployment.id, {
+          status: "succeeded",
+          commitSha: running.lastCommitSha,
+          phaseDetail: running.domain
+            ? `Rollback live at https://${running.domain}`
+            : "Rolled back and running safely.",
+          error: null,
+        })!;
+        this.store.recordAudit({
+          actor,
+          actorTokenId: actorTokenId ?? null,
+          action: "rollback_app",
+          targetSlug: slug,
+          summary: `Rolled back app "${slug}" to previous version`,
+          riskLevel: "medium",
+        });
+        return { app: running, deployment: finishedDep };
+      } catch (err) {
+        const errMessage = redactSecrets(
+          err instanceof Error ? err.message : String(err),
+        );
+        this.store.updateAppStatus(
+          slug,
+          restoredPreRollback ? preRollbackStatus : "error",
+        );
+        const failedDeployment = this.store.updateDeployment(deployment.id, {
+          status: "failed",
+          phaseDetail: "Rollback failed.",
+          error: errMessage,
+        });
+        this.store.recordAudit({
+          actor,
+          actorTokenId: actorTokenId ?? null,
+          action: "rollback_app_failed",
+          targetSlug: slug,
+          summary: `Rollback failed for "${slug}": ${errMessage}`,
+          riskLevel: "high",
+        });
+        this.notifier?.notifyDeployFailed(
+          slug,
+          failedDeployment ?? deployment,
+          errMessage,
+        );
+        throw err;
+      }
+    });
+  }
+
   async setAppDomain(
     slugRaw: string,
     domain: string | null,
@@ -1435,6 +2119,11 @@ export class AppExecutor {
     }
 
     return this.withSlugLock(slug, async () => {
+      if (action === "stop") {
+        this.onIntentionalStop?.(slug);
+      } else {
+        this.onAppStarted?.(slug);
+      }
       const res = await this.bridge.lifecycle(slug, action);
       const updated = this.store.updateAppStatus(slug, res.status)!;
       this.store.recordAudit({
@@ -1462,8 +2151,10 @@ export class AppExecutor {
     }
 
     return this.withSlugLock(slug, async () => {
+      this.onIntentionalStop?.(slug);
       await this.bridge.removeWorkload(slug, { removeFiles });
       this.store.deleteApp(slug);
+      this.pendingWebhookRebuilds.delete(slug);
       this.store.recordAudit({
         actor,
         actorTokenId: actorTokenId ?? null,
@@ -1703,6 +2394,27 @@ export class AppExecutor {
           );
           data = app;
           summary = `Updated environment settings for "${app.slug}"`;
+          break;
+        }
+        case "update_app_settings": {
+          const slug = String(execPayload.slug ?? claimed.targetSlug ?? "");
+          const { slug: _ignored, ...settingsPatch } = execPayload;
+          const res = await this.updateAppSettings(
+            slug,
+            settingsPatch as UpdateAppSettingsInput,
+            "agent",
+            tokenId,
+          );
+          data = res;
+          summary = `Updated app settings for "${res.app.slug}"${res.needsRebuild ? " (rebuild needed)" : ""}`;
+          break;
+        }
+        case "rollback_app": {
+          const slug = String(execPayload.slug ?? claimed.targetSlug ?? "");
+          const res = await this.rollbackApp(slug, "agent", tokenId);
+          deployment = res.deployment;
+          data = res;
+          summary = `Rolled back "${res.app.slug}" (${res.app.status})`;
           break;
         }
         case "set_domain": {

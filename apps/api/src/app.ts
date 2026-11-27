@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -5,8 +6,10 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { z } from "zod";
 import {
+  type ApprovalRequest,
   CreateMcpTokenInputSchema,
   type HostLookupFn,
+  NotificationChannelSchema,
   type RegistryStore,
   type RuntimeBridge,
   RuntimeBridgeError,
@@ -15,6 +18,7 @@ import {
   redactSecrets,
   scrubTokenFromText,
   syncAppStatuses,
+  validateAppSlug,
   validateDomain,
   validateTailscaleAuthKey,
 } from "@vpsagent/shared";
@@ -31,6 +35,7 @@ import {
   DeployAppInputSchema,
   InspectGitInputSchema,
   UpdateAppEnvInputSchema,
+  UpdateAppSettingsInputSchema,
 } from "./executor.js";
 import { verifyGithubToken } from "./github.js";
 import {
@@ -41,6 +46,7 @@ import {
   createMcpPostHandler,
   enforceMcpBoundary,
 } from "./mcp-gateway.js";
+import { AppHealthAlerter, NotificationService } from "./notifications.js";
 
 export interface VpsAgentAppOptions {
   store: RegistryStore;
@@ -62,6 +68,11 @@ export interface VpsAgentAppOptions {
   mcpDeployGraceMs?: number | undefined;
   githubApiBaseUrl?: string | undefined;
   githubFetchFn?: typeof fetch | undefined;
+  notificationFetchFn?: typeof fetch | undefined;
+  telegramApiBaseUrl?: string | undefined;
+  notifier?: NotificationService | undefined;
+  healthAlerter?: AppHealthAlerter | undefined;
+  executor?: AppExecutor | undefined;
 }
 
 const ClaimInputSchema = z.object({
@@ -147,11 +158,96 @@ const ApplySystemUpdateBodySchema = z.object({
   source: z.enum(["auto", "release", "git"]).optional(),
 });
 
+const ChangePasswordBodySchema = z.object({
+  currentPassword: z.string().min(1).max(256),
+  newPassword: z
+    .string()
+    .min(8, "New password must be at least 8 characters long.")
+    .max(256),
+});
+
+const LogoutAllBodySchema = z.object({
+  keepCurrent: z.boolean().optional(),
+});
+
+const SystemBackupBodySchema = z.object({
+  includeAppData: z.boolean().optional(),
+});
+
+const UpdateNotificationsBodySchema = z.object({
+  enabled: z.boolean().optional(),
+  channel: NotificationChannelSchema.optional(),
+  webhookUrl: z.string().max(1024).nullable().optional(),
+  telegramBotToken: z.string().max(256).nullable().optional(),
+  telegramChatId: z.string().max(64).nullable().optional(),
+  notifyOnApproval: z.boolean().optional(),
+  notifyOnAppDown: z.boolean().optional(),
+  notifyOnDeployFailure: z.boolean().optional(),
+});
+
+const MAX_GITHUB_WEBHOOK_BYTES = 1024 * 1024;
+const WEBHOOK_RATE_WINDOW_MS = 60_000;
+const WEBHOOK_MAX_REQUESTS_PER_WINDOW = 10;
+
+async function readBoundedRequestBody(
+  req: Request,
+  maxBytes: number,
+): Promise<Buffer | null> {
+  const rawLength = req.headers.get("content-length");
+  if (rawLength !== null) {
+    const parsedLength = Number.parseInt(rawLength, 10);
+    if (Number.isFinite(parsedLength) && parsedLength > maxBytes) {
+      return null;
+    }
+  }
+  if (!req.body) {
+    return Buffer.alloc(0);
+  }
+  const reader = req.body.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader.cancel().catch(() => {});
+          return null;
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+    return Buffer.concat(chunks, totalBytes);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function toStatusCode(code: number): ContentfulStatusCode {
   if (code >= 400 && code <= 599) {
     return code as ContentfulStatusCode;
   }
   return 500;
+}
+
+function listApprovalsWithPending(store: RegistryStore): {
+  approvals: ApprovalRequest[];
+  pendingApprovals: number;
+} {
+  const pendingList = store.listApprovals({ status: "pending", limit: 50 });
+  const recentApprovals = store.listApprovals({ limit: 100 });
+  const seenIds = new Set(recentApprovals.map((a) => a.id));
+  return {
+    approvals: [
+      ...pendingList.filter((a) => !seenIds.has(a.id)),
+      ...recentApprovals,
+    ],
+    pendingApprovals: pendingList.length,
+  };
 }
 
 function handleError(err: unknown): {
@@ -187,6 +283,8 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   app: Hono;
   sessions: SessionManager;
   executor: AppExecutor;
+  notifier: NotificationService;
+  healthAlerter: AppHealthAlerter;
   generatedClaimToken: string | null;
 } {
   const { store, bridge } = options;
@@ -204,17 +302,35 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
   const generatedClaimToken = sessions.ensureClaimToken();
 
-  const executor = new AppExecutor({
-    store,
-    bridge,
-    appsRoot: options.appsRoot,
-    lookupFn: options.lookupFn,
-    readinessTimeoutSeconds: options.readinessTimeoutSeconds,
-    readinessPollIntervalMs: options.readinessPollIntervalMs,
-    buildTimeoutSeconds: options.buildTimeoutSeconds,
-    githubApiBaseUrl: options.githubApiBaseUrl,
-    githubFetchFn: options.githubFetchFn,
-  });
+  const notifier =
+    options.notifier ??
+    new NotificationService({
+      store,
+      lookupFn: options.lookupFn,
+      fetchFn: options.notificationFetchFn,
+      telegramApiBaseUrl: options.telegramApiBaseUrl,
+    });
+
+  const healthAlerter =
+    options.healthAlerter ?? new AppHealthAlerter({ store, bridge, notifier });
+
+  const executor =
+    options.executor ??
+    new AppExecutor({
+      store,
+      bridge,
+      appsRoot: options.appsRoot,
+      lookupFn: options.lookupFn,
+      readinessTimeoutSeconds: options.readinessTimeoutSeconds,
+      readinessPollIntervalMs: options.readinessPollIntervalMs,
+      buildTimeoutSeconds: options.buildTimeoutSeconds,
+      githubApiBaseUrl: options.githubApiBaseUrl,
+      githubFetchFn: options.githubFetchFn,
+      notifier,
+      onIntentionalStop: (slug) => healthAlerter.markIntentionalStop(slug),
+      onAppStarted: (slug) => healthAlerter.clearIntentionalStop(slug),
+    });
+  const webhookHitsBySlug = new Map<string, number[]>();
 
   const app = new Hono();
 
@@ -224,6 +340,87 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     c.header("X-Content-Type-Options", "nosniff");
     c.header("X-Frame-Options", "DENY");
     c.header("Referrer-Policy", "no-referrer");
+  });
+
+  const assertSameOriginRequest = (
+    c: Parameters<Parameters<typeof app.use>[1]>[0],
+    opts: { requireJsonContentType: boolean },
+  ): Response | null => {
+    const fetchSite = c.req.header("sec-fetch-site")?.trim().toLowerCase();
+    if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+      return c.json(
+        { error: "Cross-origin or sibling-site request blocked." },
+        403,
+      );
+    }
+    const origin = c.req.header("origin")?.trim();
+    if (origin) {
+      let parsedOrigin: URL;
+      try {
+        parsedOrigin = new URL(origin);
+      } catch {
+        return c.json({ error: "Invalid Origin header." }, 403);
+      }
+      const expectedProto = getRequestProtocol(c, trustProxy);
+      const isHttps = expectedProto === "https";
+      const expectedHost = normalizeHostWithoutDefaultPort(
+        getRequestHost(c, trustProxy) || "",
+        isHttps,
+      );
+      const originHost = normalizeHostWithoutDefaultPort(
+        parsedOrigin.host,
+        parsedOrigin.protocol.toLowerCase() === "https:",
+      );
+      if (!expectedHost || originHost !== expectedHost) {
+        return c.json({ error: "Cross-origin request blocked." }, 403);
+      }
+      if (isHttps && parsedOrigin.protocol.toLowerCase() !== "https:") {
+        return c.json(
+          { error: "HTTPS Origin is required for this request." },
+          403,
+        );
+      }
+    }
+    const contentType = (c.req.header("content-type") || "").toLowerCase();
+    if (opts.requireJsonContentType) {
+      if (!contentType.includes("application/json")) {
+        return c.json(
+          { error: "Content-Type: application/json is required." },
+          415,
+        );
+      }
+    } else if (contentType && !contentType.includes("application/json")) {
+      return c.json(
+        { error: "Content-Type: application/json is required." },
+        415,
+      );
+    }
+    return null;
+  };
+
+  const assertSameOriginPost = (
+    c: Parameters<Parameters<typeof app.use>[1]>[0],
+  ): Response | null =>
+    assertSameOriginRequest(c, { requireJsonContentType: true });
+
+  // Global same-origin CSRF protection for all browser API mutations (excluding public HMAC webhooks)
+  app.use("/api/*", async (c, next) => {
+    const method = c.req.method.toUpperCase();
+    if (
+      (method === "POST" ||
+        method === "PUT" ||
+        method === "PATCH" ||
+        method === "DELETE") &&
+      !c.req.path.startsWith("/api/webhooks/")
+    ) {
+      const blocked = assertSameOriginRequest(c, {
+        requireJsonContentType: false,
+      });
+      if (blocked) {
+        return blocked;
+      }
+    }
+    await next();
   });
 
   // ---------------------------------------------------------------------------
@@ -378,6 +575,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       transportOptions,
       mcpDeployGraceMs: options.mcpDeployGraceMs,
       sessions: mcpSessions,
+      notifier,
     }),
   );
 
@@ -415,6 +613,189 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
 
   // ---------------------------------------------------------------------------
+  // Public GitHub Push Webhook Receiver (`POST /api/webhooks/github/:slug`)
+  // Authenticates strictly via HMAC-SHA256 signature (`X-Hub-Signature-256`).
+  // ---------------------------------------------------------------------------
+
+  app.post("/api/webhooks/github/:slug", async (c) => {
+    try {
+      assertSecureTransport(c, transportOptions);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "HTTPS required." },
+        403,
+      );
+    }
+
+    let slug: string;
+    try {
+      slug = validateAppSlug(c.req.param("slug"));
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "Invalid app slug." },
+        400,
+      );
+    }
+
+    const appRecord = store.getApp(slug);
+    const webhookSecret = appRecord
+      ? store.getAppWebhookSecretForRuntime(slug)
+      : null;
+    if (
+      !appRecord ||
+      appRecord.sourceType !== "git" ||
+      !appRecord.webhookEnabled ||
+      !webhookSecret
+    ) {
+      return c.json(
+        { error: "GitHub push webhook is not enabled for this app." },
+        404,
+      );
+    }
+
+    const rawBuffer = await readBoundedRequestBody(
+      c.req.raw,
+      MAX_GITHUB_WEBHOOK_BYTES,
+    );
+    if (!rawBuffer) {
+      return c.json({ error: "Webhook payload too large." }, 413);
+    }
+
+    const freshApp = store.getApp(slug);
+    const freshWebhookSecret = freshApp
+      ? store.getAppWebhookSecretForRuntime(slug)
+      : null;
+    if (
+      !freshApp ||
+      freshApp.sourceType !== "git" ||
+      !freshApp.webhookEnabled ||
+      !freshWebhookSecret
+    ) {
+      return c.json(
+        { error: "GitHub push webhook is not enabled for this app." },
+        404,
+      );
+    }
+
+    const sigHeader = (c.req.header("x-hub-signature-256") ?? "").trim().toLowerCase();
+    const expectedSig = `sha256=${crypto
+      .createHmac("sha256", freshWebhookSecret)
+      .update(rawBuffer)
+      .digest("hex")}`;
+    const sigBuf = Buffer.from(sigHeader, "utf8");
+    const expectedBuf = Buffer.from(expectedSig, "utf8");
+    if (
+      !sigHeader.startsWith("sha256=") ||
+      sigBuf.length !== expectedBuf.length ||
+      !crypto.timingSafeEqual(sigBuf, expectedBuf)
+    ) {
+      return c.json({ error: "Invalid webhook signature." }, 401);
+    }
+
+    const now = Date.now();
+    const recentHits = (webhookHitsBySlug.get(slug) ?? []).filter(
+      (ts) => now - ts < WEBHOOK_RATE_WINDOW_MS,
+    );
+    if (recentHits.length >= WEBHOOK_MAX_REQUESTS_PER_WINDOW) {
+      webhookHitsBySlug.set(slug, recentHits);
+      return c.json(
+        { error: "Too many webhook deliveries for this app. Try again shortly." },
+        429,
+      );
+    }
+    recentHits.push(now);
+    webhookHitsBySlug.set(slug, recentHits);
+
+    const eventType = (c.req.header("x-github-event") ?? "").trim().toLowerCase();
+    if (eventType === "ping") {
+      return c.json({ ok: true, event: "ping", slug });
+    }
+    if (eventType !== "push") {
+      return c.json({
+        ok: true,
+        ignored: true,
+        reason: `Ignored GitHub event "${eventType || "unknown"}".`,
+      });
+    }
+
+    let payload: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(rawBuffer.toString("utf8")) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return c.json({ error: "Webhook payload must be a JSON object." }, 400);
+      }
+      payload = parsed as Record<string, unknown>;
+    } catch {
+      return c.json({ error: "Invalid JSON webhook payload." }, 400);
+    }
+
+    if (payload.deleted === true) {
+      return c.json({
+        ok: true,
+        ignored: true,
+        reason: "Branch deletion event ignored.",
+      });
+    }
+
+    const ref = typeof payload.ref === "string" ? payload.ref : "";
+    if (!ref.startsWith("refs/heads/")) {
+      return c.json({
+        ok: true,
+        ignored: true,
+        reason: "Non-branch push ref ignored.",
+      });
+    }
+
+    const pushedBranch = ref.slice("refs/heads/".length);
+    const repoObj =
+      payload.repository && typeof payload.repository === "object"
+        ? (payload.repository as { default_branch?: unknown })
+        : null;
+    const defaultBranch =
+      typeof repoObj?.default_branch === "string" && repoObj.default_branch.trim()
+        ? repoObj.default_branch.trim()
+        : "main";
+    const targetBranch = freshApp.gitBranch || defaultBranch;
+
+    if (pushedBranch !== targetBranch) {
+      return c.json({
+        ok: true,
+        ignored: true,
+        reason: `Push was to "${pushedBranch}", watching "${targetBranch}".`,
+      });
+    }
+
+    store.touchAppWebhookTriggered(slug);
+    store.recordAudit({
+      actor: "system",
+      action: "webhook.push_deploy",
+      targetSlug: slug,
+      summary: `GitHub push to "${pushedBranch}" triggered automatic rebuild for "${slug}"`,
+      riskLevel: "medium",
+    });
+
+    try {
+      const queuedRes = await executor.queueOrStartWebhookRebuild(slug);
+      return c.json(
+        {
+          ok: true,
+          triggered: queuedRes.triggered,
+          queued: queuedRes.queued,
+          ...(queuedRes.deploymentId
+            ? { deploymentId: queuedRes.deploymentId }
+            : {}),
+          ...(queuedRes.reason ? { reason: queuedRes.reason } : {}),
+          branch: pushedBranch,
+        },
+        202,
+      );
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
   // Authenticated Owner Dashboard API (`/api/*`)
   // ---------------------------------------------------------------------------
 
@@ -428,10 +809,13 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     await next();
   };
 
+  app.use("/api/auth/change-password", requireOwner);
+  app.use("/api/auth/logout-all", requireOwner);
   app.use("/api/setup/domain", requireOwner);
   app.use("/api/setup/apps-base-domain", requireOwner);
   app.use("/api/setup/tls-recheck", requireOwner);
   app.use("/api/overview", requireOwner);
+  app.use("/api/metrics", requireOwner);
   app.use("/api/git/*", requireOwner);
   app.use("/api/deployments/*", requireOwner);
   app.use("/api/deployments", requireOwner);
@@ -443,54 +827,87 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   app.use("/api/mcp/*", requireOwner);
   app.use("/api/system/*", requireOwner);
   app.use("/api/tailscale/*", requireOwner);
+  app.use("/api/notifications/*", requireOwner);
+  app.use("/api/notifications", requireOwner);
 
-  const assertSameOriginPost = (
-    c: Parameters<Parameters<typeof app.use>[1]>[0],
-  ): Response | null => {
-    const fetchSite = c.req.header("sec-fetch-site")?.trim().toLowerCase();
-    if (fetchSite && fetchSite !== "same-origin" && fetchSite !== "none") {
+  app.post("/api/auth/change-password", async (c) => {
+    let transport: { isHttps: boolean; isLocalLoopback: boolean };
+    try {
+      transport = assertSecureTransport(c, transportOptions);
+    } catch (err) {
       return c.json(
-        { error: "Cross-origin or sibling-site request blocked." },
+        { error: err instanceof Error ? err.message : "HTTPS required." },
         403,
       );
     }
-    const origin = c.req.header("origin")?.trim();
-    if (origin) {
-      let parsedOrigin: URL;
-      try {
-        parsedOrigin = new URL(origin);
-      } catch {
-        return c.json({ error: "Invalid Origin header." }, 403);
-      }
-      const expectedProto = getRequestProtocol(c, trustProxy);
-      const isHttps = expectedProto === "https";
-      const expectedHost = normalizeHostWithoutDefaultPort(
-        getRequestHost(c, trustProxy) || "",
-        isHttps,
-      );
-      const originHost = normalizeHostWithoutDefaultPort(
-        parsedOrigin.host,
-        parsedOrigin.protocol.toLowerCase() === "https:",
-      );
-      if (!expectedHost || originHost !== expectedHost) {
-        return c.json({ error: "Cross-origin request blocked." }, 403);
-      }
-      if (isHttps && parsedOrigin.protocol.toLowerCase() !== "https:") {
-        return c.json(
-          { error: "HTTPS Origin is required for this request." },
-          403,
-        );
-      }
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
     }
-    const contentType = (c.req.header("content-type") || "").toLowerCase();
-    if (!contentType.includes("application/json")) {
-      return c.json(
-        { error: "Content-Type: application/json is required." },
-        415,
+    try {
+      const body = ChangePasswordBodySchema.parse(await c.req.json());
+      if (!store.verifyAdminPassphrase(body.currentPassword)) {
+        return c.json({ error: "Current password is incorrect." }, 401);
+      }
+      store.setAdminPassphrase(body.newPassword);
+      store.bumpSessionVersion();
+      const freshToken = sessions.createSessionToken();
+      c.header(
+        "Set-Cookie",
+        sessions.buildSetSessionCookie(freshToken, transport.isHttps),
       );
+      store.recordAudit({
+        actor: "user",
+        action: "auth.password_changed",
+        summary: "Changed dashboard password and signed out older sessions",
+        riskLevel: "high",
+      });
+      return c.json({ ok: true });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
     }
-    return null;
-  };
+  });
+
+  app.post("/api/auth/logout-all", async (c) => {
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+    try {
+      let keepCurrent = false;
+      const rawBody = await c.req.text();
+      if (rawBody.trim()) {
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(rawBody);
+        } catch {
+          return c.json({ error: "Invalid JSON body." }, 400);
+        }
+        keepCurrent = Boolean(LogoutAllBodySchema.parse(parsedJson).keepCurrent);
+      }
+      store.bumpSessionVersion();
+      const isHttps = getRequestProtocol(c, trustProxy) === "https";
+      if (keepCurrent) {
+        const freshToken = sessions.createSessionToken();
+        c.header("Set-Cookie", sessions.buildSetSessionCookie(freshToken, isHttps));
+      } else {
+        c.header("Set-Cookie", sessions.buildClearSessionCookie(isHttps));
+      }
+      store.recordAudit({
+        actor: "user",
+        action: "auth.sessions_revoked",
+        summary: keepCurrent
+          ? "Signed out all other dashboard sessions"
+          : "Signed out all dashboard sessions",
+        riskLevel: "high",
+      });
+      return c.json({ ok: true, signedOutCurrent: !keepCurrent });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
 
   // Step 2 of first-boot setup (applies directly to Caddy via Runtime Bridge!)
   app.post("/api/setup/domain", async (c) => {
@@ -789,6 +1206,23 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     }
   });
 
+  app.get("/api/metrics", async (c) => {
+    try {
+      const hostStats = await bridge.getHostStats();
+      const apps = store.listApps();
+      const { approvals, pendingApprovals } = listApprovalsWithPending(store);
+      return c.json({
+        ...hostStats,
+        apps,
+        approvals,
+        pendingApprovals,
+      });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
   // Tab 2 — Apps
   app.get("/api/apps", async (c) => {
     const apps = await syncAppStatuses(store, bridge);
@@ -879,6 +1313,140 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       }
       const updated = await executor.rebuildApp(c.req.param("slug"), "user");
       return c.json({ app: updated });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.patch("/api/apps/:slug", async (c) => {
+    try {
+      const body = UpdateAppSettingsInputSchema.parse(await c.req.json());
+      const res = await executor.updateAppSettings(
+        c.req.param("slug"),
+        body,
+        "user",
+      );
+      return c.json(res);
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/apps/:slug/rollback", async (c) => {
+    try {
+      const res = await executor.rollbackApp(c.req.param("slug"), "user");
+      return c.json(res);
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/apps/:slug/webhook", async (c) => {
+    try {
+      assertSecureTransport(c, transportOptions);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "HTTPS required." },
+        403,
+      );
+    }
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+    try {
+      const slug = validateAppSlug(c.req.param("slug"));
+      const existing = store.getApp(slug);
+      if (!existing) {
+        return c.json({ error: `App "${slug}" not found.` }, 404);
+      }
+      const { app: updated, rawSecret } = store.enableAppWebhook(slug);
+      const setup = store.getSetupState();
+      const publicDomainReady = Boolean(
+        setup.domain && setup.httpsActive && setup.tlsStatus === "active",
+      );
+      const baseHost =
+        setup.domain ||
+        getRequestHost(c, trustProxy) ||
+        "vps.yourdomain.com";
+      const webhookUrl = `https://${baseHost}/api/webhooks/github/${slug}`;
+      store.recordAudit({
+        actor: "user",
+        action: "app.webhook_enabled",
+        targetSlug: slug,
+        summary: `Enabled GitHub push auto-deploy webhook for "${slug}"`,
+        riskLevel: "medium",
+      });
+      return c.json({
+        app: updated,
+        webhookUrl,
+        rawSecret,
+        branch: updated.gitBranch ?? "default",
+        publicDomainReady,
+      });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.delete("/api/apps/:slug/webhook", (c) => {
+    try {
+      const slug = validateAppSlug(c.req.param("slug"));
+      const updated = store.disableAppWebhook(slug);
+      if (!updated) {
+        return c.json({ error: `App "${slug}" not found.` }, 404);
+      }
+      store.recordAudit({
+        actor: "user",
+        action: "app.webhook_disabled",
+        targetSlug: slug,
+        summary: `Disabled GitHub push auto-deploy webhook for "${slug}"`,
+        riskLevel: "low",
+      });
+      return c.json({ app: updated });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/apps/:slug/backup", async (c) => {
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+    try {
+      const slug = validateAppSlug(c.req.param("slug"));
+      if (!store.getApp(slug)) {
+        return c.json({ error: `App "${slug}" not found.` }, 404);
+      }
+      if (!bridge.downloadAppBackup) {
+        return c.json(
+          {
+            error:
+              "The host Runtime Bridge needs a one-time update before dashboard backups can run.",
+          },
+          501,
+        );
+      }
+      const bak = await bridge.downloadAppBackup(slug);
+      store.recordAudit({
+        actor: "user",
+        action: "app.backup_downloaded",
+        targetSlug: slug,
+        summary: `Downloaded backup archive for "${slug}" (${bak.filename}, excludes secrets)`,
+        riskLevel: "medium",
+      });
+      return c.body(Buffer.from(bak.bytes), 200, {
+        "Content-Type": bak.contentType,
+        "Content-Disposition": `attachment; filename="${bak.filename}"`,
+        "X-VPSAgent-Backup-Filename": bak.filename,
+        "Cache-Control": "no-store",
+      });
     } catch (err) {
       const { status, error } = handleError(err);
       return c.json({ error }, status);
@@ -1013,9 +1581,9 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
             | "executed"
             | "failed")
         : undefined;
-    const approvals = store.listApprovals(
-      status ? { status, limit: 100 } : { limit: 100 },
-    );
+    const approvals = status
+      ? store.listApprovals({ status, limit: 100 })
+      : listApprovalsWithPending(store).approvals;
     return c.json({ approvals });
   });
 
@@ -1585,6 +2153,192 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
 
   // ---------------------------------------------------------------------------
+  // Server-Wide Backup & Instant Alerts
+  // ---------------------------------------------------------------------------
+
+  app.post("/api/system/backup", async (c) => {
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+    try {
+      let includeAppData = false;
+      const rawBody = await c.req.text();
+      if (rawBody.trim()) {
+        let parsedJson: unknown;
+        try {
+          parsedJson = JSON.parse(rawBody);
+        } catch {
+          return c.json({ error: "Invalid JSON body." }, 400);
+        }
+        includeAppData = Boolean(
+          SystemBackupBodySchema.parse(parsedJson).includeAppData,
+        );
+      }
+      if (!bridge.downloadCoreBackup) {
+        return c.json(
+          {
+            error:
+              "The host Runtime Bridge needs a one-time update before server backups can run.",
+          },
+          501,
+        );
+      }
+      const bak = await bridge.downloadCoreBackup({ includeAppData });
+      store.recordAudit({
+        actor: "user",
+        action: "system.backup_downloaded",
+        summary: `Downloaded server backup (${bak.filename}, includeAppData=${String(includeAppData)}, excludes secrets)`,
+        riskLevel: "high",
+      });
+      return c.body(Buffer.from(bak.bytes), 200, {
+        "Content-Type": bak.contentType,
+        "Content-Disposition": `attachment; filename="${bak.filename}"`,
+        "X-VPSAgent-Backup-Filename": bak.filename,
+        "Cache-Control": "no-store",
+      });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.get("/api/notifications", (c) => {
+    return c.json({ settings: store.getNotificationSettings() });
+  });
+
+  app.put("/api/notifications", async (c) => {
+    try {
+      assertSecureTransport(c, transportOptions);
+    } catch (err) {
+      return c.json(
+        { error: err instanceof Error ? err.message : "HTTPS required." },
+        403,
+      );
+    }
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+    try {
+      const body = UpdateNotificationsBodySchema.parse(await c.req.json());
+      const current = store.getNotificationSettings();
+      const targetChannel = body.channel ?? current.channel;
+      const isWebhookChannel = (ch: typeof targetChannel) =>
+        ch === "discord" || ch === "slack" || ch === "webhook";
+      const webhookProviderChanged =
+        isWebhookChannel(targetChannel) && targetChannel !== current.channel;
+      const normalized = await notifier.validateAndNormalizeTarget({
+        channel: targetChannel,
+        webhookUrl: body.webhookUrl,
+        telegramBotToken: body.telegramBotToken,
+        telegramChatId: body.telegramChatId,
+      });
+      const clearStaleWebhookUrl =
+        webhookProviderChanged && normalized.webhookUrl === undefined;
+
+      const willEnable =
+        targetChannel === "none" ? false : (body.enabled ?? current.enabled);
+      if (willEnable) {
+        const runtimeBefore = store.getNotificationConfigForRuntime();
+        if (targetChannel === "telegram") {
+          const effectiveToken =
+            normalized.telegramBotToken !== undefined
+              ? normalized.telegramBotToken
+              : runtimeBefore.telegramBotToken;
+          const effectiveChatId =
+            normalized.telegramChatId !== undefined
+              ? normalized.telegramChatId
+              : runtimeBefore.telegramChatId;
+          if (!effectiveToken || !effectiveChatId) {
+            return c.json(
+              {
+                error:
+                  "Enter both a Telegram bot token and chat ID before enabling Telegram alerts.",
+              },
+              400,
+            );
+          }
+        } else {
+          const effectiveUrl =
+            normalized.webhookUrl !== undefined
+              ? normalized.webhookUrl
+              : clearStaleWebhookUrl
+                ? null
+                : runtimeBefore.webhookUrl;
+          if (!effectiveUrl) {
+            return c.json(
+              {
+                error: webhookProviderChanged
+                  ? "Enter a webhook URL for the selected alert channel before enabling alerts."
+                  : "Enter a webhook URL before enabling alerts.",
+              },
+              400,
+            );
+          }
+        }
+      }
+
+      const nextWebhookUrl =
+        normalized.webhookUrl !== undefined
+          ? normalized.webhookUrl
+          : clearStaleWebhookUrl
+            ? null
+            : undefined;
+
+      const settings = store.updateNotificationSettings({
+        ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
+        ...(body.channel !== undefined ? { channel: body.channel } : {}),
+        ...(nextWebhookUrl !== undefined ? { webhookUrl: nextWebhookUrl } : {}),
+        ...(normalized.telegramBotToken !== undefined
+          ? { telegramBotToken: normalized.telegramBotToken }
+          : {}),
+        ...(normalized.telegramChatId !== undefined
+          ? { telegramChatId: normalized.telegramChatId }
+          : {}),
+        ...(body.notifyOnApproval !== undefined
+          ? { notifyOnApproval: body.notifyOnApproval }
+          : {}),
+        ...(body.notifyOnAppDown !== undefined
+          ? { notifyOnAppDown: body.notifyOnAppDown }
+          : {}),
+        ...(body.notifyOnDeployFailure !== undefined
+          ? { notifyOnDeployFailure: body.notifyOnDeployFailure }
+          : {}),
+      });
+      store.recordAudit({
+        actor: "user",
+        action: "notifications.updated",
+        summary: settings.enabled
+          ? `Updated instant alerts (${settings.channel})`
+          : `Paused instant alerts (channel: ${settings.channel})`,
+        riskLevel: "medium",
+      });
+      return c.json({ settings });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.post("/api/notifications/test", async (c) => {
+    const csrfBlocked = assertSameOriginPost(c);
+    if (csrfBlocked) {
+      return csrfBlocked;
+    }
+    const result = await notifier.sendMessage({
+      kind: "test",
+      title: "VPSAgent Test Alert",
+      body: "Your instant alerts are connected and working.",
+    });
+    return c.json({
+      ok: result.ok,
+      error: result.error ?? null,
+      settings: store.getNotificationSettings(),
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Static Dashboard Serving (production single-container bundle)
   // ---------------------------------------------------------------------------
 
@@ -1620,5 +2374,12 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     });
   }
 
-  return { app, sessions, executor, generatedClaimToken };
+  return {
+    app,
+    sessions,
+    executor,
+    notifier,
+    healthAlerter,
+    generatedClaimToken,
+  };
 }

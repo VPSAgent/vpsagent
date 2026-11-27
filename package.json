@@ -1,7 +1,7 @@
 {
   "name": "vpsagent",
   "private": true,
-  "version": "2.0.0-alpha.1",
+  "version": "2.0.0-alpha.2",
   "description": "Lean, agent-native VPS control plane and Remote MCP Gateway",
   "packageManager": "pnpm@10.0.0",
   "engines": {

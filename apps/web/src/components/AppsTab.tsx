@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Check,
+  Copy,
+  Download,
   Loader2,
   RefreshCw,
+  RotateCcw,
 } from "lucide-react";
 import {
   api,
@@ -92,7 +96,13 @@ function pickUnusedSlug(
   return base;
 }
 
-type DrawerSection = "deployments" | "logs" | "domain" | "env" | "security";
+type DrawerSection =
+  | "deployments"
+  | "logs"
+  | "domain"
+  | "env"
+  | "security"
+  | "settings";
 
 interface AppsTabProps {
   apps: AppRecord[];
@@ -163,11 +173,61 @@ export function AppsTab({
   const [editDomain, setEditDomain] = useState("");
   const [drawerLoading, setDrawerLoading] = useState(false);
 
+  // Per-app Settings & Auto-Deploy & Backup state
+  const [editName, setEditName] = useState("");
+  const [editCpuLimit, setEditCpuLimit] = useState("0.5");
+  const [editMemoryMb, setEditMemoryMb] = useState("512");
+  const [editPort, setEditPort] = useState("8080");
+  const [editProbeHttp, setEditProbeHttp] = useState(true);
+  const [editProbePath, setEditProbePath] = useState("/");
+  const [editImage, setEditImage] = useState("");
+  const [editBranch, setEditBranch] = useState("");
+  const [editDockerfile, setEditDockerfile] = useState("auto");
+  const [editGitCredentialId, setEditGitCredentialId] = useState("");
+  const [editPostgres, setEditPostgres] = useState(false);
+  const [editRedis, setEditRedis] = useState(false);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [needsRebuildBanner, setNeedsRebuildBanner] = useState(false);
+  const [webhookBusy, setWebhookBusy] = useState(false);
+  const [webhookSecretInfo, setWebhookSecretInfo] = useState<{
+    webhookUrl: string;
+    rawSecret: string;
+    branch: string;
+    publicDomainReady: boolean;
+  } | null>(null);
+  const [copiedWebhookField, setCopiedWebhookField] = useState<string | null>(
+    null,
+  );
+  const [backingUpSlug, setBackingUpSlug] = useState<string | null>(null);
+
+  const populateEditForm = useCallback((app: AppRecord) => {
+    setEditName(app.name);
+    setEditCpuLimit(app.cpuLimit);
+    setEditMemoryMb(String(app.memoryLimitMb));
+    setEditPort(String(app.internalPort));
+    setEditProbeHttp(app.probeHttp ?? true);
+    setEditProbePath(app.probePath ?? "/");
+    setEditImage(app.image ?? "");
+    setEditBranch(app.gitBranch ?? "");
+    setEditDockerfile(app.dockerfilePath || "auto");
+    setEditGitCredentialId(app.gitCredentialId ?? "");
+    setEditPostgres(app.companions.some((c) => c.type === "postgres"));
+    setEditRedis(app.companions.some((c) => c.type === "redis"));
+  }, []);
+
   const openDrawerBySlug = useCallback(
     async (targetSlug: string, sec: DrawerSection, currentDomain?: string | null) => {
+      if (targetSlug !== selectedSlug) {
+        setWebhookSecretInfo(null);
+      }
       setSelectedSlug(targetSlug);
       setSection(sec);
       setEditDomain(currentDomain ?? "");
+      setNeedsRebuildBanner(false);
+      if (sec === "settings") {
+        const match = apps.find((a) => a.slug === targetSlug);
+        if (match) populateEditForm(match);
+      }
       setDrawerLoading(true);
       setError(null);
       try {
@@ -192,7 +252,7 @@ export function AppsTab({
         setDrawerLoading(false);
       }
     },
-    [onInspectSync],
+    [apps, onInspectSync, populateEditForm, selectedSlug],
   );
 
   useEffect(() => {
@@ -413,6 +473,183 @@ export function AppsTab({
       setError(err instanceof Error ? err.message : "Failed to delete app.");
     } finally {
       setBusySlug(null);
+    }
+  };
+
+  const handleRollback = async (app: AppRecord) => {
+    const targetLabel =
+      app.sourceType === "git"
+        ? app.previousCommitSha
+          ? `commit ${app.previousCommitSha.slice(0, 7)}`
+          : "the previous working build"
+        : app.previousImage || "the previous Docker image";
+    if (
+      !window.confirm(
+        `Roll back "${app.name}" to ${targetLabel}? Your database and secret settings will stay untouched.`,
+      )
+    ) {
+      return;
+    }
+    setBusySlug(app.slug);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.rollbackApp(app.slug);
+      setNotice(`Rolled back "${app.name}" to ${targetLabel}.`);
+      await onRefresh();
+      if (selectedSlug === app.slug && section === "deployments") {
+        const res = await api.listDeployments(app.slug, 10);
+        setDeployments(res.deployments);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Rollback failed.");
+    } finally {
+      setBusySlug(null);
+    }
+  };
+
+  const handleSaveAppSettings = async (
+    e: React.FormEvent,
+    app: AppRecord,
+  ) => {
+    e.preventDefault();
+    const parsedMem = Number.parseInt(editMemoryMb, 10);
+    const parsedPort = Number.parseInt(editPort, 10);
+    if (!Number.isFinite(parsedMem) || parsedMem < 64) {
+      setError("Memory limit must be at least 64 MB.");
+      return;
+    }
+    if (!Number.isFinite(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+      setError("Internal port must be between 1 and 65535.");
+      return;
+    }
+
+    setSavingSettings(true);
+    setError(null);
+    setNotice(null);
+    setNeedsRebuildBanner(false);
+    try {
+      const companions: CompanionService[] = [];
+      if (editPostgres) {
+        companions.push(
+          app.companions.find((c) => c.type === "postgres") ?? {
+            type: "postgres",
+          },
+        );
+      }
+      if (editRedis) {
+        companions.push(
+          app.companions.find((c) => c.type === "redis") ?? { type: "redis" },
+        );
+      }
+
+      const res = await api.updateAppSettings(app.slug, {
+        name: editName.trim() || app.name,
+        cpuLimit: editCpuLimit.trim(),
+        memoryLimitMb: parsedMem,
+        internalPort: parsedPort,
+        probeHttp: editProbeHttp,
+        probePath: editProbePath.trim() || "/",
+        companions,
+        ...(app.sourceType === "image"
+          ? { image: editImage.trim() }
+          : {
+              gitBranch: editBranch.trim() || null,
+              dockerfilePath: editDockerfile.trim() || "auto",
+              gitCredentialId: editGitCredentialId || null,
+            }),
+      });
+      populateEditForm(res.app);
+      setNeedsRebuildBanner(res.needsRebuild);
+      setNotice(
+        res.needsRebuild && res.needsStart
+          ? `Saved settings for "${res.app.name}". Click Rebuild to apply your new Git branch or Dockerfile, or Start to launch with the updated settings.`
+          : res.needsRebuild
+            ? `Saved settings for "${res.app.name}". Click Rebuild to apply your new Git branch or Dockerfile.`
+            : res.needsStart
+              ? `Saved settings for "${res.app.name}". Your app is currently not running — click Start to apply the updated settings.`
+              : `Saved settings for "${res.app.name}".`,
+      );
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not save app settings.",
+      );
+    } finally {
+      setSavingSettings(false);
+    }
+  };
+
+  const handleEnableWebhook = async (targetSlug: string) => {
+    setWebhookBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.enableAppWebhook(targetSlug);
+      setWebhookSecretInfo({
+        webhookUrl: res.webhookUrl,
+        rawSecret: res.rawSecret,
+        branch: res.branch,
+        publicDomainReady: res.publicDomainReady,
+      });
+      setNotice(
+        `GitHub auto-deploy webhook ready for "${targetSlug}". Copy the secret below into GitHub — it is only shown once.`,
+      );
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not enable auto-deploy.",
+      );
+    } finally {
+      setWebhookBusy(false);
+    }
+  };
+
+  const handleDisableWebhook = async (targetSlug: string) => {
+    if (
+      !window.confirm(
+        `Turn off GitHub push auto-deploy for "${targetSlug}"?`,
+      )
+    ) {
+      return;
+    }
+    setWebhookBusy(true);
+    setError(null);
+    try {
+      await api.disableAppWebhook(targetSlug);
+      setWebhookSecretInfo(null);
+      setNotice(`Disabled GitHub push auto-deploy for "${targetSlug}".`);
+      await onRefresh();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not disable auto-deploy.",
+      );
+    } finally {
+      setWebhookBusy(false);
+    }
+  };
+
+  const handleCopyWebhookField = async (label: string, value: string) => {
+    await navigator.clipboard.writeText(value);
+    setCopiedWebhookField(label);
+    window.setTimeout(() => setCopiedWebhookField(null), 1800);
+  };
+
+  const handleDownloadAppBackup = async (targetSlug: string) => {
+    setBackingUpSlug(targetSlug);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.downloadAppBackup(targetSlug);
+      setNotice(
+        `Downloaded ${res.filename} (${(res.sizeBytes / 1024).toFixed(1)} KB, secrets excluded).`,
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Could not download app backup.",
+      );
+    } finally {
+      setBackingUpSlug(null);
     }
   };
 
@@ -1181,7 +1418,10 @@ export function AppsTab({
               <div key={app.slug} className="space-y-6">
                 <button
                   type="button"
-                  onClick={() => setSelectedSlug(null)}
+                  onClick={() => {
+                    setSelectedSlug(null);
+                    setWebhookSecretInfo(null);
+                  }}
                   className="btn-press text-xs text-muted hover:text-fg cursor-pointer"
                 >
                   ← All apps
@@ -1224,6 +1464,25 @@ export function AppsTab({
                     <button type="button" disabled={isBusy} onClick={() => handleAction(app.slug, "rebuild")} className={buttonPrimary}>
                       Rebuild
                     </button>
+                    {app.rollbackAvailable && (
+                      <button
+                        type="button"
+                        disabled={isBusy}
+                        onClick={() => void handleRollback(app)}
+                        title={
+                          app.previousCommitSha
+                            ? `Roll back to ${app.previousCommitSha.slice(0, 7)}`
+                            : app.previousImage ?? "Roll back to previous version"
+                        }
+                        className={buttonSecondary}
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                        Rollback
+                        {app.previousCommitSha
+                          ? ` (${app.previousCommitSha.slice(0, 7)})`
+                          : ""}
+                      </button>
+                    )}
                     <button
                       type="button"
                       disabled={isBusy}
@@ -1274,6 +1533,7 @@ export function AppsTab({
                       ["domain", "Address"],
                       ["env", "Variables"],
                       ["security", "Health"],
+                      ["settings", "Settings"],
                     ] as const
                   ).map(([key, label]) => {
                     const active = section === key;
@@ -1510,7 +1770,7 @@ export function AppsTab({
                           )}
                         </div>
                       </div>
-                    ) : (
+                    ) : section === "security" ? (
                       <div className="space-y-3 text-xs">
                         {inspectData ? (
                           <div className="space-y-3">
@@ -1593,6 +1853,381 @@ export function AppsTab({
                             No container inspection data available.
                           </p>
                         )}
+                      </div>
+                    ) : (
+                      <div className="space-y-6">
+                        {needsRebuildBanner && (
+                          <div className="rounded-lg border border-warn-line bg-warn-soft px-4 py-3 text-xs text-warn flex flex-wrap items-center justify-between gap-3">
+                            <span>
+                              Settings saved. Your Git branch, Dockerfile, or token changed — rebuild to apply it to the running app.
+                            </span>
+                            <button
+                              type="button"
+                              disabled={isBusy}
+                              onClick={() => {
+                                setNeedsRebuildBanner(false);
+                                void handleAction(app.slug, "rebuild");
+                              }}
+                              className="btn-press rounded-md bg-warn px-3 py-1.5 text-xs font-medium text-on-warn hover:opacity-90 cursor-pointer"
+                            >
+                              Rebuild now
+                            </button>
+                          </div>
+                        )}
+
+                        <form
+                          onSubmit={(e) => void handleSaveAppSettings(e, app)}
+                          className="surface-panel rounded-xl p-5 space-y-4"
+                        >
+                          <div>
+                            <h2 className="text-sm font-medium text-fg">
+                              App settings
+                            </h2>
+                            <p className="text-xs text-muted mt-0.5">
+                              Resize CPU/RAM, update the port or health check, or attach Postgres/Redis without losing existing data or passwords.
+                            </p>
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div>
+                              <label className="block text-xs font-medium text-muted mb-1.5">
+                                Display name
+                              </label>
+                              <input
+                                type="text"
+                                value={editName}
+                                onChange={(e) => setEditName(e.target.value)}
+                                required
+                                className="field-input w-full rounded-lg px-3 py-2 text-sm"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-muted mb-1.5">
+                                Internal port
+                              </label>
+                              <input
+                                type="number"
+                                min={1}
+                                max={65535}
+                                value={editPort}
+                                onChange={(e) => setEditPort(e.target.value)}
+                                required
+                                className="field-input w-full rounded-lg px-3 py-2 text-sm tabular-nums"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-muted mb-1.5">
+                                CPU limit (cores)
+                              </label>
+                              <input
+                                type="text"
+                                value={editCpuLimit}
+                                onChange={(e) => setEditCpuLimit(e.target.value)}
+                                placeholder="0.5"
+                                required
+                                className="field-input w-full rounded-lg px-3 py-2 text-sm font-mono"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-muted mb-1.5">
+                                Memory limit (MB)
+                              </label>
+                              <input
+                                type="number"
+                                min={64}
+                                max={131072}
+                                value={editMemoryMb}
+                                onChange={(e) => setEditMemoryMb(e.target.value)}
+                                required
+                                className="field-input w-full rounded-lg px-3 py-2 text-sm tabular-nums"
+                              />
+                            </div>
+                          </div>
+
+                          {app.sourceType === "git" ? (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                              <div>
+                                <label className="block text-xs font-medium text-muted mb-1.5">
+                                  Git branch
+                                </label>
+                                <input
+                                  type="text"
+                                  value={editBranch}
+                                  onChange={(e) => setEditBranch(e.target.value)}
+                                  placeholder="main"
+                                  className="field-input w-full rounded-lg px-3 py-2 text-sm font-mono"
+                                />
+                              </div>
+                              <div>
+                                <label className="block text-xs font-medium text-muted mb-1.5">
+                                  Dockerfile path
+                                </label>
+                                <input
+                                  type="text"
+                                  value={editDockerfile}
+                                  onChange={(e) => setEditDockerfile(e.target.value)}
+                                  placeholder="auto"
+                                  className="field-input w-full rounded-lg px-3 py-2 text-sm font-mono"
+                                />
+                              </div>
+                              {gitCredentials.length > 0 && (
+                                <div className="sm:col-span-2">
+                                  <label className="block text-xs font-medium text-muted mb-1.5">
+                                    GitHub access token
+                                  </label>
+                                  <select
+                                    value={editGitCredentialId}
+                                    onChange={(e) =>
+                                      setEditGitCredentialId(e.target.value)
+                                    }
+                                    className="field-input w-full rounded-lg px-3 py-2 text-sm"
+                                  >
+                                    <option value="">
+                                      Auto (public or default token)
+                                    </option>
+                                    {gitCredentials.map((cred) => (
+                                      <option key={cred.id} value={cred.id}>
+                                        {cred.label}
+                                        {cred.accountLogin
+                                          ? ` (@${cred.accountLogin})`
+                                          : ""}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <div>
+                              <label className="block text-xs font-medium text-muted mb-1.5">
+                                Docker image
+                              </label>
+                              <input
+                                type="text"
+                                value={editImage}
+                                onChange={(e) => setEditImage(e.target.value)}
+                                required
+                                className="field-input w-full rounded-lg px-3 py-2 text-sm font-mono"
+                              />
+                            </div>
+                          )}
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-end">
+                            <label className="inline-flex items-center gap-2 text-sm text-fg-2 cursor-pointer py-2">
+                              <input
+                                type="checkbox"
+                                checked={editProbeHttp}
+                                onChange={(e) => setEditProbeHttp(e.target.checked)}
+                                className="rounded border-line-strong bg-canvas accent-fg"
+                              />
+                              Enable HTTP health check
+                            </label>
+                            <div>
+                              <label className="block text-xs font-medium text-muted mb-1.5">
+                                Health check path
+                              </label>
+                              <input
+                                type="text"
+                                value={editProbePath}
+                                disabled={!editProbeHttp}
+                                onChange={(e) => setEditProbePath(e.target.value)}
+                                placeholder="/"
+                                className="field-input w-full rounded-lg px-3 py-2 text-sm font-mono disabled:opacity-45"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap gap-6 pt-1">
+                            <label className="inline-flex items-center gap-2 text-sm text-fg-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={editPostgres}
+                                onChange={(e) => setEditPostgres(e.target.checked)}
+                                className="rounded border-line-strong bg-canvas accent-fg"
+                              />
+                              Private Postgres database
+                            </label>
+                            <label className="inline-flex items-center gap-2 text-sm text-fg-2 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={editRedis}
+                                onChange={(e) => setEditRedis(e.target.checked)}
+                                className="rounded border-line-strong bg-canvas accent-fg"
+                              />
+                              Private Redis cache
+                            </label>
+                          </div>
+
+                          <div className="flex justify-end pt-1">
+                            <button
+                              type="submit"
+                              disabled={savingSettings}
+                              className={buttonPrimary}
+                            >
+                              {savingSettings ? (
+                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              ) : null}
+                              {savingSettings ? "Saving..." : "Save settings"}
+                            </button>
+                          </div>
+                        </form>
+
+                        {app.sourceType === "git" && (
+                          <section className="surface-panel rounded-xl p-5 space-y-4">
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <div>
+                                <div className="flex items-center gap-2">
+                                  <h2 className="text-sm font-medium text-fg">
+                                    Auto-deploy on GitHub push
+                                  </h2>
+                                  <span
+                                    className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                                      app.webhookEnabled
+                                        ? "bg-ok-soft text-ok"
+                                        : "bg-fill text-muted"
+                                    }`}
+                                  >
+                                    {app.webhookEnabled ? "Enabled" : "Off"}
+                                  </span>
+                                </div>
+                                <p className="text-xs text-muted mt-0.5">
+                                  Automatically rebuild and restart this app whenever you push to{" "}
+                                  <code className="font-mono text-fg-2">
+                                    {app.gitBranch || "the default branch"}
+                                  </code>
+                                  .
+                                  {app.webhookLastTriggeredAt
+                                    ? ` Last triggered ${new Date(app.webhookLastTriggeredAt).toLocaleString()}.`
+                                    : ""}
+                                </p>
+                              </div>
+                              <div className="flex flex-wrap items-center gap-2">
+                                <button
+                                  type="button"
+                                  disabled={webhookBusy}
+                                  onClick={() => void handleEnableWebhook(app.slug)}
+                                  className={buttonSecondary}
+                                >
+                                  {app.webhookEnabled
+                                    ? "Rotate webhook secret"
+                                    : "Enable auto-deploy"}
+                                </button>
+                                {app.webhookEnabled && (
+                                  <button
+                                    type="button"
+                                    disabled={webhookBusy}
+                                    onClick={() =>
+                                      void handleDisableWebhook(app.slug)
+                                    }
+                                    className="btn-press rounded-md px-3 py-2 text-xs text-muted hover:text-bad hover:bg-bad-soft cursor-pointer"
+                                  >
+                                    Disable
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            {webhookSecretInfo && (
+                              <div className="surface-well rounded-lg p-4 space-y-3 text-xs">
+                                {!webhookSecretInfo.publicDomainReady && (
+                                  <p className="text-warn">
+                                    Note: GitHub needs a public HTTPS domain on your VPSAgent dashboard (not Tailscale-only) to send webhooks.
+                                  </p>
+                                )}
+                                <p className="text-fg-2">
+                                  In GitHub, open your repository{" "}
+                                  <strong>Settings → Webhooks → Add webhook</strong>, choose{" "}
+                                  <code className="font-mono">application/json</code>, select{" "}
+                                  <strong>Just the push event</strong>, and paste:
+                                </p>
+                                <div className="space-y-2">
+                                  <div className="flex items-center justify-between gap-2 rounded-md border border-line bg-canvas px-3 py-2">
+                                    <div className="min-w-0">
+                                      <span className="text-[11px] text-subtle block">
+                                        Payload URL
+                                      </span>
+                                      <code className="font-mono text-fg break-all">
+                                        {webhookSecretInfo.webhookUrl}
+                                      </code>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        void handleCopyWebhookField(
+                                          "url",
+                                          webhookSecretInfo.webhookUrl,
+                                        )
+                                      }
+                                      className={buttonSecondary}
+                                    >
+                                      {copiedWebhookField === "url" ? (
+                                        <Check className="h-3.5 w-3.5 text-ok" />
+                                      ) : (
+                                        <Copy className="h-3.5 w-3.5" />
+                                      )}
+                                      Copy
+                                    </button>
+                                  </div>
+                                  <div className="flex items-center justify-between gap-2 rounded-md border border-line bg-canvas px-3 py-2">
+                                    <div className="min-w-0">
+                                      <span className="text-[11px] text-subtle block">
+                                        Webhook Secret (shown once)
+                                      </span>
+                                      <code className="font-mono text-fg break-all">
+                                        {webhookSecretInfo.rawSecret}
+                                      </code>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        void handleCopyWebhookField(
+                                          "secret",
+                                          webhookSecretInfo.rawSecret,
+                                        )
+                                      }
+                                      className={buttonSecondary}
+                                    >
+                                      {copiedWebhookField === "secret" ? (
+                                        <Check className="h-3.5 w-3.5 text-ok" />
+                                      ) : (
+                                        <Copy className="h-3.5 w-3.5" />
+                                      )}
+                                      Copy
+                                    </button>
+                                  </div>
+                                </div>
+                              </div>
+                            )}
+                          </section>
+                        )}
+
+                        <section className="surface-panel rounded-xl p-5 flex flex-wrap items-center justify-between gap-4">
+                          <div>
+                            <h2 className="text-sm font-medium text-fg">
+                              App backup
+                            </h2>
+                            <p className="text-xs text-muted mt-0.5">
+                              Downloads your app&rsquo;s{" "}
+                              <code className="font-mono">/app/data</code> files, compose config, and a safe Postgres dump if running. Secret variables (
+                              <code className="font-mono">.env</code>) are excluded for safety.
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={backingUpSlug === app.slug}
+                            onClick={() => void handleDownloadAppBackup(app.slug)}
+                            className={buttonSecondary}
+                          >
+                            {backingUpSlug === app.slug ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Download className="h-3.5 w-3.5" />
+                            )}
+                            {backingUpSlug === app.slug
+                              ? "Preparing..."
+                              : "Download backup"}
+                          </button>
+                        </section>
                       </div>
                     )}
                   </div>
