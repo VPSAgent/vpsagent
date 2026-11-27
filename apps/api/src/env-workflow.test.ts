@@ -556,6 +556,18 @@ describe("App env workflow & build-time public buildArgs", () => {
         },
       );
       expect(legacySettingsRes.status).toBe(200);
+      const legacyEnvSaveRes = await app.request(
+        "http://127.0.0.1/api/apps/legacy-db-app/env",
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json", cookie },
+          body: JSON.stringify({
+            vars: [{ key: "NEXT_PUBLIC_SITE", value: "https://legacy-v2.test" }],
+            deleteKeys: [],
+          }),
+        },
+      );
+      expect(legacyEnvSaveRes.status).toBe(200);
       const legacyRebuildRes = await app.request(
         "http://127.0.0.1/api/apps/legacy-db-app/rebuild",
         {
@@ -566,7 +578,7 @@ describe("App env workflow & build-time public buildArgs", () => {
       expect(legacyRebuildRes.status).toBe(200);
       const legacyBuildCall = buildCalls.find((c) => c.slug === "legacy-db-app");
       expect(legacyBuildCall?.buildArgs).toEqual({
-        NEXT_PUBLIC_SITE: "https://legacy.test",
+        NEXT_PUBLIC_SITE: "https://legacy-v2.test",
       });
       expect(legacyBuildCall?.buildArgs).not.toHaveProperty("NEXT_PUBLIC_DB_URL");
     } finally {
