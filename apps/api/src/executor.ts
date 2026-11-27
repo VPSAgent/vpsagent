@@ -226,6 +226,7 @@ export class AppExecutor {
   private readonly onIntentionalStop: ((slug: string) => void) | undefined;
   private readonly onAppStarted: ((slug: string) => void) | undefined;
   private readonly activeSlugs = new Set<string>();
+  private readonly pendingWebhookRebuilds = new Set<string>();
 
   constructor(options: AppExecutorOptions) {
     this.store = options.store;
@@ -255,8 +256,53 @@ export class AppExecutor {
       if (!released) {
         released = true;
         this.activeSlugs.delete(slug);
+        if (this.pendingWebhookRebuilds.delete(slug)) {
+          queueMicrotask(() => {
+            const latest = this.store.getApp(slug);
+            if (!latest || latest.sourceType !== "git") {
+              return;
+            }
+            void this.startRebuildApp(slug, "system", { waitMs: 0 }).catch(
+              (err) => {
+                if (err instanceof RuntimeBridgeError && err.statusCode === 409) {
+                  this.pendingWebhookRebuilds.add(slug);
+                }
+              },
+            );
+          });
+        }
       }
     };
+  }
+
+  async queueOrStartWebhookRebuild(slugRaw: string): Promise<{
+    triggered: boolean;
+    queued: boolean;
+    deploymentId?: string;
+    reason?: string;
+  }> {
+    const slug = validateAppSlug(slugRaw);
+    try {
+      const started = await this.startRebuildApp(slug, "system", {
+        waitMs: 0,
+      });
+      return {
+        triggered: true,
+        queued: false,
+        deploymentId: started.deployment.id,
+      };
+    } catch (err) {
+      if (err instanceof RuntimeBridgeError && err.statusCode === 409) {
+        this.pendingWebhookRebuilds.add(slug);
+        return {
+          triggered: false,
+          queued: true,
+          reason:
+            "Rebuild already in progress; queued a follow-up rebuild for the latest push.",
+        };
+      }
+      throw err;
+    }
   }
 
   private async withSlugLock<T>(slug: string, fn: () => Promise<T>): Promise<T> {
@@ -752,6 +798,12 @@ export class AppExecutor {
             : "Queued Locked Apartment container launch...",
       });
 
+      const previousMode: "clear" | "preserve" | "save" = !existing
+        ? "clear"
+        : existing.status === "error" && existing.rollbackAvailable
+          ? "preserve"
+          : "save";
+
       const runPipeline = async (): Promise<{
         app: AppRecord;
         deployment: DeploymentRecord;
@@ -759,7 +811,6 @@ export class AppExecutor {
       }> => {
         let resolvedPort = initialPort;
         let buildLogs: string[] = [];
-        let previousImageSaved = false;
         try {
           if (input.sourceType === "git" && validatedGitUrl) {
             this.store.updateDeployment(deployment.id, {
@@ -783,10 +834,10 @@ export class AppExecutor {
                       safeDockerfile === "Dockerfile" ||
                       safeDockerfile === "auto",
                     timeoutSeconds: this.buildTimeoutSeconds,
+                    previousMode,
                   }),
               );
             buildLogs = buildRes.buildLogTail;
-            previousImageSaved = Boolean(buildRes.previousImageSaved);
             if (
               input.internalPort === undefined &&
               typeof buildRes.suggestedPort === "number"
@@ -836,6 +887,17 @@ export class AppExecutor {
               internalPort: resolvedPort,
               gitCredentialId: usedCredentialId,
             });
+            if (
+              existing &&
+              previousMode === "save" &&
+              buildRes.previousImageSaved
+            ) {
+              this.store.updateAppRollbackState(slug, {
+                previousCommitSha: priorCommitSha,
+                previousImage: priorImage,
+                rollbackAvailable: true,
+              });
+            }
             this.store.updateDeployment(deployment.id, {
               status: "starting",
               commitSha: buildRes.commitSha ?? null,
@@ -847,6 +909,18 @@ export class AppExecutor {
                 : `Built image (port ${resolvedPort}). Starting container...`,
             });
           } else {
+            if (
+              existing &&
+              priorImage &&
+              priorImage !== blueprint.imageRef &&
+              previousMode === "save"
+            ) {
+              this.store.updateAppRollbackState(slug, {
+                previousCommitSha: null,
+                previousImage: priorImage,
+                rollbackAvailable: true,
+              });
+            }
             this.store.updateDeployment(deployment.id, {
               status: "starting",
               phaseDetail: "Starting Locked Apartment container...",
@@ -883,25 +957,6 @@ export class AppExecutor {
               internalPort: resolvedPort,
             });
             this.store.updateAppDomain(slug, safeDomain);
-          }
-
-          if (input.sourceType === "git" && previousImageSaved) {
-            this.store.updateAppRollbackState(slug, {
-              previousCommitSha: priorCommitSha,
-              previousImage: priorImage,
-              rollbackAvailable: true,
-            });
-          } else if (
-            input.sourceType === "image" &&
-            existing &&
-            priorImage &&
-            priorImage !== blueprint.imageRef
-          ) {
-            this.store.updateAppRollbackState(slug, {
-              previousCommitSha: null,
-              previousImage: priorImage,
-              rollbackAvailable: true,
-            });
           }
 
           this.onAppStarted?.(slug);
@@ -948,6 +1003,7 @@ export class AppExecutor {
             slug,
             failedDeployment ?? deployment,
             errMessage,
+            { appExists: Boolean(existing) },
           );
 
           if (!existing) {
@@ -1104,12 +1160,15 @@ export class AppExecutor {
 
       const priorCommitSha = existing.lastCommitSha ?? null;
       const priorImage = existing.image ?? null;
+      const previousMode: "preserve" | "save" =
+        existing.status === "error" && existing.rollbackAvailable
+          ? "preserve"
+          : "save";
       const runPipeline = async (): Promise<{
         app: AppRecord;
         deployment: DeploymentRecord;
       }> => {
         let buildLogs: string[] = [];
-        let previousImageSaved = false;
         try {
           const currentEnv = this.store.getAppEnvMapForRuntime(slug);
           const userEnv = { ...currentEnv };
@@ -1139,10 +1198,10 @@ export class AppExecutor {
                       existing.dockerfilePath === "Dockerfile" ||
                       existing.dockerfilePath === "auto",
                     timeoutSeconds: this.buildTimeoutSeconds,
+                    previousMode,
                   }),
               );
             buildLogs = buildRes.buildLogTail;
-            previousImageSaved = Boolean(buildRes.previousImageSaved);
             this.store.updateAppBuildMetadata(slug, {
               lastCommitSha: buildRes.commitSha ?? null,
               detectedRuntime:
@@ -1152,6 +1211,13 @@ export class AppExecutor {
                 : {}),
               gitCredentialId: usedCredentialId,
             });
+            if (previousMode === "save" && buildRes.previousImageSaved) {
+              this.store.updateAppRollbackState(slug, {
+                previousCommitSha: priorCommitSha,
+                previousImage: priorImage,
+                rollbackAvailable: true,
+              });
+            }
             this.store.updateDeployment(deployment.id, {
               status: "starting",
               commitSha: buildRes.commitSha ?? null,
@@ -1212,14 +1278,6 @@ export class AppExecutor {
               readiness.reason ??
                 `App "${slug}" failed readiness after rebuild.`,
             );
-          }
-
-          if (existing.sourceType === "git" && previousImageSaved) {
-            this.store.updateAppRollbackState(slug, {
-              previousCommitSha: priorCommitSha,
-              previousImage: priorImage,
-              rollbackAvailable: true,
-            });
           }
 
           this.onAppStarted?.(slug);
@@ -1587,11 +1645,13 @@ export class AppExecutor {
         : null;
 
       let lifecycleApplied = false;
+      let nextStatus = current.status;
       try {
         writeApartmentBlueprint(this.appsRoot, blueprint);
-        if (current.status === "running") {
-          await this.bridge.lifecycle(slug, "start");
+        if (current.status === "running" || current.status === "error") {
+          const lifeRes = await this.bridge.lifecycle(slug, "start");
           lifecycleApplied = true;
+          nextStatus = lifeRes.status;
         }
         if (current.domain && nextInternalPort !== current.internalPort) {
           await this.bridge.routeCaddy({
@@ -1652,12 +1712,15 @@ export class AppExecutor {
         internalPort: nextInternalPort,
         probeHttp: nextProbeHttp,
         probePath: nextProbePath,
-        status: current.status,
+        status: nextStatus,
         cpuLimit: nextCpuLimit,
         memoryLimitMb: nextMemoryLimitMb,
         companions: blueprint.companions,
         gitCredentialId: nextGitCredentialId,
       });
+      if (nextStatus === "running") {
+        this.onAppStarted?.(slug);
+      }
 
       if (
         current.sourceType === "image" &&
@@ -1724,6 +1787,9 @@ export class AppExecutor {
         phaseDetail: "Rolling back to previous working version...",
       });
 
+      const preRollbackStatus = current.status;
+      let restoredPreRollback = false;
+
       try {
         if (current.sourceType === "git") {
           if (!this.bridge.rollbackApp) {
@@ -1741,19 +1807,36 @@ export class AppExecutor {
             status: "verifying",
             phaseDetail: `Checking app health on internal port ${current.internalPort}...`,
           });
-          const readiness = await this.bridge.waitForReadiness(slug, {
-            internalPort: current.internalPort,
-            probeHttp: current.probeHttp,
-            probePath: current.probePath,
-            timeoutSeconds: this.readinessTimeoutSeconds,
-            pollIntervalMs: this.readinessPollIntervalMs,
-          });
-          if (!readiness.ready) {
-            throw new RuntimeBridgeError(
-              502,
-              readiness.reason ??
-                `App "${slug}" failed readiness after rollback.`,
-            );
+          try {
+            const readiness = await this.bridge.waitForReadiness(slug, {
+              internalPort: current.internalPort,
+              probeHttp: current.probeHttp,
+              probePath: current.probePath,
+              timeoutSeconds: this.readinessTimeoutSeconds,
+              pollIntervalMs: this.readinessPollIntervalMs,
+            });
+            if (!readiness.ready) {
+              throw new RuntimeBridgeError(
+                502,
+                readiness.reason ??
+                  `App "${slug}" failed readiness after rollback.`,
+              );
+            }
+          } catch (readinessErr) {
+            if (rbRes.swapped) {
+              try {
+                const restoreRes = await this.bridge.rollbackApp(slug);
+                if (preRollbackStatus === "stopped") {
+                  await this.bridge.lifecycle(slug, "stop");
+                  restoredPreRollback = true;
+                } else {
+                  restoredPreRollback = restoreRes.status === "running";
+                }
+              } catch {
+                // Best-effort restore of pre-rollback image/tags
+              }
+            }
+            throw readinessErr;
           }
           const nextSha = current.previousCommitSha;
           const nextPrevSha = current.lastCommitSha;
@@ -1802,11 +1885,15 @@ export class AppExecutor {
           const appDir = resolveScopedAppDir(this.appsRoot, slug);
           const composePath = path.join(appDir, "docker-compose.yml");
           const envPath = path.join(appDir, ".env");
+          const probeConfigPath = path.join(appDir, "probe.json");
           const prevCompose = fs.existsSync(composePath)
             ? fs.readFileSync(composePath, "utf8")
             : null;
           const prevEnv = fs.existsSync(envPath)
             ? fs.readFileSync(envPath, "utf8")
+            : null;
+          const prevProbe = fs.existsSync(probeConfigPath)
+            ? fs.readFileSync(probeConfigPath, "utf8")
             : null;
 
           this.store.updateDeployment(deployment.id, {
@@ -1814,9 +1901,30 @@ export class AppExecutor {
             phaseDetail: `Restoring previous Docker image (${targetImage})...`,
           });
 
+          let lifecycleStarted = false;
           try {
             writeApartmentBlueprint(this.appsRoot, blueprint);
             await this.bridge.lifecycle(slug, "start");
+            lifecycleStarted = true;
+
+            this.store.updateDeployment(deployment.id, {
+              status: "verifying",
+              phaseDetail: `Checking app health on internal port ${current.internalPort}...`,
+            });
+            const readiness = await this.bridge.waitForReadiness(slug, {
+              internalPort: current.internalPort,
+              probeHttp: current.probeHttp,
+              probePath: current.probePath,
+              timeoutSeconds: this.readinessTimeoutSeconds,
+              pollIntervalMs: this.readinessPollIntervalMs,
+            });
+            if (!readiness.ready) {
+              throw new RuntimeBridgeError(
+                502,
+                readiness.reason ??
+                  `App "${slug}" failed readiness after rollback.`,
+              );
+            }
           } catch (err) {
             try {
               if (prevCompose !== null) {
@@ -1831,29 +1939,26 @@ export class AppExecutor {
                   mode: 0o600,
                 });
               }
+              if (prevProbe !== null) {
+                fs.writeFileSync(probeConfigPath, prevProbe, {
+                  encoding: "utf8",
+                  mode: 0o644,
+                });
+              }
+              if (lifecycleStarted) {
+                const restoreRes = await this.bridge.lifecycle(
+                  slug,
+                  preRollbackStatus === "stopped" ? "stop" : "start",
+                );
+                restoredPreRollback =
+                  preRollbackStatus === "running"
+                    ? restoreRes.status === "running"
+                    : true;
+              }
             } catch {
               // Best-effort restore on failure
             }
             throw err;
-          }
-
-          this.store.updateDeployment(deployment.id, {
-            status: "verifying",
-            phaseDetail: `Checking app health on internal port ${current.internalPort}...`,
-          });
-          const readiness = await this.bridge.waitForReadiness(slug, {
-            internalPort: current.internalPort,
-            probeHttp: current.probeHttp,
-            probePath: current.probePath,
-            timeoutSeconds: this.readinessTimeoutSeconds,
-            pollIntervalMs: this.readinessPollIntervalMs,
-          });
-          if (!readiness.ready) {
-            throw new RuntimeBridgeError(
-              502,
-              readiness.reason ??
-                `App "${slug}" failed readiness after rollback.`,
-            );
           }
 
           this.store.upsertApp({
@@ -1901,7 +2006,10 @@ export class AppExecutor {
         const errMessage = redactSecrets(
           err instanceof Error ? err.message : String(err),
         );
-        this.store.updateAppStatus(slug, "error");
+        this.store.updateAppStatus(
+          slug,
+          restoredPreRollback ? preRollbackStatus : "error",
+        );
         const failedDeployment = this.store.updateDeployment(deployment.id, {
           status: "failed",
           phaseDetail: "Rollback failed.",
@@ -2007,6 +2115,7 @@ export class AppExecutor {
       this.onIntentionalStop?.(slug);
       await this.bridge.removeWorkload(slug, { removeFiles });
       this.store.deleteApp(slug);
+      this.pendingWebhookRebuilds.delete(slug);
       this.store.recordAudit({
         actor,
         actorTokenId: actorTokenId ?? null,

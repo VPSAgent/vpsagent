@@ -3184,6 +3184,17 @@ class RuntimeService:
         (`/v1/apps/statuses`), lifecycle status, and Safety Check (`/v1/apps/inspect`).
         """
         if docker_status == "running":
+            app_dir = resolve_scoped_app_dir(
+                self.apps_root, slug, require_exists=False
+            )
+            probe_cfg = (
+                self._read_app_probe_config(app_dir, slug)
+                if os.path.isdir(app_dir)
+                else None
+            )
+            if probe_cfg is not None and not probe_cfg["probeHttp"]:
+                self._clear_host_health(slug)
+                return docker_status
             host_health = self._get_host_health(slug)
             if host_health is not None and host_health.get("status") == "unhealthy":
                 return "error"
@@ -3239,6 +3250,7 @@ class RuntimeService:
             return None
         cfg = self._read_app_probe_config(app_dir, safe_slug)
         if cfg is None or not cfg["probeHttp"]:
+            self._clear_host_health(safe_slug)
             return None
 
         inspected = self.inspect_workload(
@@ -3752,6 +3764,13 @@ class RuntimeService:
                 f"Field 'timeoutSeconds' must be between {MIN_BUILD_TIMEOUT_S} and {MAX_BUILD_TIMEOUT_S}.",
             )
         total_timeout_s = float(raw_timeout)
+        raw_previous_mode = payload.get("previousMode", "save")
+        if raw_previous_mode not in ("save", "preserve", "clear"):
+            raise BridgeRequestError(
+                400,
+                "Field 'previousMode' must be one of: save, preserve, clear.",
+            )
+        previous_mode = str(raw_previous_mode)
         image_tag = f"vpsagent-app-{slug}:latest"
 
         t0 = time.monotonic()
@@ -3759,13 +3778,20 @@ class RuntimeService:
 
         with self._lock_for(slug):
             prev_image_id: str | None = None
-            prev_proc = self._run_docker(
-                ["image", "inspect", "--format", "{{.Id}}", image_tag],
-                timeout=15,
-                check=False,
-            )
-            if prev_proc.returncode == 0 and prev_proc.stdout.strip():
-                prev_image_id = prev_proc.stdout.strip().splitlines()[0].strip()
+            if previous_mode == "clear":
+                self._run_docker(
+                    ["rmi", "-f", f"vpsagent-app-{slug}:previous"],
+                    timeout=15,
+                    check=False,
+                )
+            elif previous_mode == "save":
+                prev_proc = self._run_docker(
+                    ["image", "inspect", "--format", "{{.Id}}", image_tag],
+                    timeout=15,
+                    check=False,
+                )
+                if prev_proc.returncode == 0 and prev_proc.stdout.strip():
+                    prev_image_id = prev_proc.stdout.strip().splitlines()[0].strip()
 
             build_dir = tempfile.mkdtemp(prefix=f"vpsagent-git-{slug}-")
             os.chmod(build_dir, 0o700)
@@ -3895,7 +3921,7 @@ class RuntimeService:
                     )
 
                 previous_image_saved = False
-                if prev_image_id:
+                if previous_mode == "save" and prev_image_id:
                     new_proc = self._run_docker(
                         ["image", "inspect", "--format", "{{.Id}}", image_tag],
                         timeout=15,
@@ -4334,7 +4360,12 @@ class RuntimeService:
                 shutil.rmtree(app_dir)
 
             self._run_docker(
-                ["rmi", "-f", f"vpsagent-app-{slug}:previous"],
+                [
+                    "rmi",
+                    "-f",
+                    f"vpsagent-app-{slug}:latest",
+                    f"vpsagent-app-{slug}:previous",
+                ],
                 timeout=20,
                 check=False,
             )
@@ -4481,6 +4512,45 @@ class RuntimeService:
                     copied += 1
         return copied
 
+    def _postgres_service_state(
+        self, slug: str, project_dir: str, compose_path: str
+    ) -> str:
+        proc = self._run_docker(
+            [
+                *self._compose_cmd_base(slug, project_dir, compose_path),
+                "ps",
+                "-a",
+                "--format",
+                "json",
+                "postgres",
+            ],
+            timeout=20,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return "unknown"
+        rows = parse_compose_ps_output(proc.stdout)
+        if not rows:
+            return "stopped"
+        matched = [
+            r
+            for r in rows
+            if str(r.get("Service", "")).strip().lower() == "postgres"
+            or "postgres" in str(r.get("Name", "")).strip().lower()
+        ]
+        if not matched:
+            has_service_field = any(
+                bool(str(r.get("Service", "")).strip()) for r in rows
+            )
+            if has_service_field:
+                return "stopped"
+            matched = rows
+        for r in matched:
+            state = str(r.get("State", "")).strip().lower()
+            if state in ("running", "restarting", "paused", "created"):
+                return "running"
+        return "stopped"
+
     def _collect_app_backup_into(
         self, slug: str, target_dir: str, remaining_budget: list[int]
     ) -> dict[str, Any]:
@@ -4498,6 +4568,7 @@ class RuntimeService:
         )
 
         pg_status = "none"
+        pg_state = "none"
         has_postgres = False
         compose_path = os.path.join(app_dir, "docker-compose.yml")
         if os.path.lexists(compose_path) and not os.path.islink(compose_path):
@@ -4515,54 +4586,127 @@ class RuntimeService:
                     )
                     has_postgres = isinstance(services, dict) and "postgres" in services
                     if has_postgres:
-                        status = self._compose_status(slug, project_dir, tmp_compose)
-                        if status == "running":
+                        pg_state = self._postgres_service_state(
+                            slug, project_dir, tmp_compose
+                        )
+                        if pg_state == "running":
                             dump_path = os.path.join(target_dir, "postgres.sql")
                             base = self._compose_cmd_base(slug, project_dir, tmp_compose)
+                            proc: subprocess.Popen[bytes] | None = None
+                            timed_out = False
+                            timer: threading.Timer | None = None
                             try:
+                                proc = subprocess.Popen(
+                                    [
+                                        self.docker_bin,
+                                        *base,
+                                        "exec",
+                                        "-T",
+                                        "postgres",
+                                        "sh",
+                                        "-c",
+                                        'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"',
+                                    ],
+                                    shell=False,
+                                    env=_sanitized_subprocess_env(),
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE,
+                                )
+
+                                def _kill_on_timeout() -> None:
+                                    nonlocal timed_out
+                                    timed_out = True
+                                    if proc is not None and proc.poll() is None:
+                                        try:
+                                            proc.kill()
+                                        except OSError:
+                                            pass
+
+                                timer = threading.Timer(90.0, _kill_on_timeout)
+                                timer.daemon = True
+                                timer.start()
+
+                                written = 0
+                                assert proc.stdout is not None
                                 with open(dump_path, "wb") as dfh:
-                                    proc = subprocess.run(
-                                        [
-                                            self.docker_bin,
-                                            *base,
-                                            "exec",
-                                            "-T",
-                                            "postgres",
-                                            "sh",
-                                            "-c",
-                                            'pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"',
-                                        ],
-                                        shell=False,
-                                        env=_sanitized_subprocess_env(),
-                                        stdout=dfh,
-                                        stderr=subprocess.PIPE,
-                                        timeout=90,
+                                    while True:
+                                        chunk = proc.stdout.read(65536)
+                                        if not chunk:
+                                            break
+                                        if written + len(chunk) > remaining_budget[0]:
+                                            proc.kill()
+                                            raise BridgeRequestError(
+                                                413,
+                                                "Database dump exceeds backup size limit (200 MB).",
+                                            )
+                                        dfh.write(chunk)
+                                        written += len(chunk)
+
+                                stderr_bytes = (
+                                    proc.stderr.read(4096)
+                                    if proc.stderr is not None
+                                    else b""
+                                )
+                                rc = proc.wait(timeout=10)
+                                if timed_out or rc != 0:
+                                    err_detail = redact_secrets(
+                                        stderr_bytes.decode(
+                                            "utf-8", errors="replace"
+                                        ).strip()
+                                    )[:200]
+                                    raise BridgeRequestError(
+                                        502,
+                                        f'Failed to dump running Postgres database for "{slug}"'
+                                        + (f": {err_detail}" if err_detail else "")
+                                        + "; refusing to copy live database files.",
                                     )
-                                if proc.returncode == 0 and os.path.isfile(dump_path):
-                                    dump_size = os.path.getsize(dump_path)
-                                    remaining_budget[0] -= dump_size
-                                    if remaining_budget[0] < 0:
-                                        raise BridgeRequestError(
-                                            413,
-                                            "Database dump exceeds backup size limit (200 MB).",
-                                        )
-                                    pg_status = "pg_dump"
-                                else:
-                                    if os.path.exists(dump_path):
-                                        os.unlink(dump_path)
-                                    pg_status = "failed"
-                            except (OSError, subprocess.TimeoutExpired):
+                                remaining_budget[0] -= written
+                                pg_status = "pg_dump"
+                            except BridgeRequestError:
+                                if proc is not None and proc.poll() is None:
+                                    proc.kill()
+                                    try:
+                                        proc.wait(timeout=5)
+                                    except (OSError, subprocess.TimeoutExpired):
+                                        pass
                                 if os.path.exists(dump_path):
                                     os.unlink(dump_path)
-                                pg_status = "failed"
+                                raise
+                            except (OSError, subprocess.TimeoutExpired) as exc:
+                                if proc is not None and proc.poll() is None:
+                                    proc.kill()
+                                    try:
+                                        proc.wait(timeout=5)
+                                    except (OSError, subprocess.TimeoutExpired):
+                                        pass
+                                if os.path.exists(dump_path):
+                                    os.unlink(dump_path)
+                                raise BridgeRequestError(
+                                    502,
+                                    f'Failed to dump running Postgres database for "{slug}": {exc}; refusing to copy live database files.',
+                                ) from exc
+                            finally:
+                                if timer is not None:
+                                    timer.cancel()
+                                if proc is not None:
+                                    if proc.stdout is not None:
+                                        proc.stdout.close()
+                                    if proc.stderr is not None:
+                                        proc.stderr.close()
+                        elif pg_state == "unknown":
+                            raise BridgeRequestError(
+                                502,
+                                f'Could not verify Postgres container state for "{slug}"; refusing to copy potentially live database files.',
+                            )
                         else:
                             pg_status = "skipped_stopped"
             except BridgeRequestError as exc:
-                if exc.status_code == 413:
+                if exc.status_code in (413, 502):
                     raise
+                pg_state = "unknown"
                 pg_status = "skipped_stopped" if has_postgres else "none"
 
-        skip_prefixes = ("postgres",) if pg_status == "pg_dump" else ()
+        skip_prefixes = ("postgres",) if (has_postgres and pg_state != "stopped") else ()
         data_files = self._copy_safe_tree_for_backup(
             os.path.join(app_dir, "data"),
             os.path.join(target_dir, "data"),
@@ -5160,6 +5304,9 @@ class RuntimeService:
         # `/v1/apps/statuses` so the Apps list and Safety Check never disagree.
         host_http_health: dict[str, Any] | None = None
         if _apply_host_health:
+            probe_cfg = self._read_app_probe_config(app_dir, slug)
+            if probe_cfg is not None and not probe_cfg["probeHttp"]:
+                self._clear_host_health(slug)
             cached_host_health = self._get_host_health(slug)
             if cached_host_health is not None:
                 host_http_health = {
@@ -5170,7 +5317,6 @@ class RuntimeService:
                     "lastOutput": cached_host_health.get("lastOutput"),
                 }
             else:
-                probe_cfg = self._read_app_probe_config(app_dir, slug)
                 monitoring_enabled = (
                     probe_cfg["probeHttp"]
                     if probe_cfg is not None
@@ -5980,6 +6126,7 @@ class RuntimeService:
             ("containers", ["container", "prune", "-f"]),
         ]
         if prune_images:
+            steps.append(("dangling-images", ["image", "prune", "-f"]))
             steps.append(
                 ("images", ["image", "prune", "-af", "--filter", "label!=vpsagent.managed=true"])
             )

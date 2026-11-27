@@ -537,6 +537,8 @@ export const api = {
     }),
 
   getOverview: () => apiFetch<OverviewResponse>("/api/overview"),
+  getMetrics: () =>
+    apiFetch<Pick<OverviewResponse, "metrics" | "disk">>("/api/metrics"),
   listApps: () => apiFetch<{ apps: AppRecord[] }>("/api/apps"),
   inspectGitRepo: (
     gitRepoUrl: string,

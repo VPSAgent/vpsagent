@@ -530,8 +530,18 @@ export function AppsTab({
     setNeedsRebuildBanner(false);
     try {
       const companions: CompanionService[] = [];
-      if (editPostgres) companions.push({ type: "postgres" });
-      if (editRedis) companions.push({ type: "redis" });
+      if (editPostgres) {
+        companions.push(
+          app.companions.find((c) => c.type === "postgres") ?? {
+            type: "postgres",
+          },
+        );
+      }
+      if (editRedis) {
+        companions.push(
+          app.companions.find((c) => c.type === "redis") ?? { type: "redis" },
+        );
+      }
 
       const res = await api.updateAppSettings(app.slug, {
         name: editName.trim() || app.name,

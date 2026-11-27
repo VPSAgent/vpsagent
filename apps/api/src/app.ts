@@ -69,6 +69,8 @@ export interface VpsAgentAppOptions {
   githubFetchFn?: typeof fetch | undefined;
   notificationFetchFn?: typeof fetch | undefined;
   telegramApiBaseUrl?: string | undefined;
+  notifier?: NotificationService | undefined;
+  healthAlerter?: AppHealthAlerter | undefined;
 }
 
 const ClaimInputSchema = z.object({
@@ -185,6 +187,44 @@ const MAX_GITHUB_WEBHOOK_BYTES = 1024 * 1024;
 const WEBHOOK_RATE_WINDOW_MS = 60_000;
 const WEBHOOK_MAX_REQUESTS_PER_WINDOW = 10;
 
+async function readBoundedRequestBody(
+  req: Request,
+  maxBytes: number,
+): Promise<Buffer | null> {
+  const rawLength = req.headers.get("content-length");
+  if (rawLength !== null) {
+    const parsedLength = Number.parseInt(rawLength, 10);
+    if (Number.isFinite(parsedLength) && parsedLength > maxBytes) {
+      return null;
+    }
+  }
+  if (!req.body) {
+    return Buffer.alloc(0);
+  }
+  const reader = req.body.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      if (value) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader.cancel().catch(() => {});
+          return null;
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+    return Buffer.concat(chunks, totalBytes);
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 function toStatusCode(code: number): ContentfulStatusCode {
   if (code >= 400 && code <= 599) {
     return code as ContentfulStatusCode;
@@ -244,12 +284,14 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   });
   const generatedClaimToken = sessions.ensureClaimToken();
 
-  const notifier = new NotificationService({
-    store,
-    lookupFn: options.lookupFn,
-    fetchFn: options.notificationFetchFn,
-    telegramApiBaseUrl: options.telegramApiBaseUrl,
-  });
+  const notifier =
+    options.notifier ??
+    new NotificationService({
+      store,
+      lookupFn: options.lookupFn,
+      fetchFn: options.notificationFetchFn,
+      telegramApiBaseUrl: options.telegramApiBaseUrl,
+    });
 
   let healthAlerter: AppHealthAlerter;
 
@@ -268,7 +310,8 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     onAppStarted: (slug) => healthAlerter.clearIntentionalStop(slug),
   });
 
-  healthAlerter = new AppHealthAlerter({ store, bridge, notifier });
+  healthAlerter =
+    options.healthAlerter ?? new AppHealthAlerter({ store, bridge, notifier });
   const webhookHitsBySlug = new Map<string, number[]>();
 
   const app = new Hono();
@@ -576,19 +619,6 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       );
     }
 
-    const rawLength = c.req.header("content-length");
-    if (rawLength !== undefined) {
-      const parsedLength = Number.parseInt(rawLength, 10);
-      if (Number.isFinite(parsedLength) && parsedLength > MAX_GITHUB_WEBHOOK_BYTES) {
-        return c.json({ error: "Webhook payload too large." }, 413);
-      }
-    }
-
-    const rawBuffer = Buffer.from(await c.req.arrayBuffer());
-    if (rawBuffer.byteLength > MAX_GITHUB_WEBHOOK_BYTES) {
-      return c.json({ error: "Webhook payload too large." }, 413);
-    }
-
     const appRecord = store.getApp(slug);
     const webhookSecret = appRecord
       ? store.getAppWebhookSecretForRuntime(slug)
@@ -603,6 +633,14 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         { error: "GitHub push webhook is not enabled for this app." },
         404,
       );
+    }
+
+    const rawBuffer = await readBoundedRequestBody(
+      c.req.raw,
+      MAX_GITHUB_WEBHOOK_BYTES,
+    );
+    if (!rawBuffer) {
+      return c.json({ error: "Webhook payload too large." }, 413);
     }
 
     const sigHeader = (c.req.header("x-hub-signature-256") ?? "").trim().toLowerCase();
@@ -703,30 +741,21 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     });
 
     try {
-      const started = await executor.startRebuildApp(slug, "system", {
-        waitMs: 0,
-      });
+      const queuedRes = await executor.queueOrStartWebhookRebuild(slug);
       return c.json(
         {
           ok: true,
-          triggered: true,
-          deploymentId: started.deployment.id,
+          triggered: queuedRes.triggered,
+          queued: queuedRes.queued,
+          ...(queuedRes.deploymentId
+            ? { deploymentId: queuedRes.deploymentId }
+            : {}),
+          ...(queuedRes.reason ? { reason: queuedRes.reason } : {}),
           branch: pushedBranch,
         },
         202,
       );
     } catch (err) {
-      if (err instanceof RuntimeBridgeError && err.statusCode === 409) {
-        return c.json(
-          {
-            ok: true,
-            triggered: false,
-            queued: false,
-            reason: err.message,
-          },
-          202,
-        );
-      }
       const { status, error } = handleError(err);
       return c.json({ error }, status);
     }
@@ -752,6 +781,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
   app.use("/api/setup/apps-base-domain", requireOwner);
   app.use("/api/setup/tls-recheck", requireOwner);
   app.use("/api/overview", requireOwner);
+  app.use("/api/metrics", requireOwner);
   app.use("/api/git/*", requireOwner);
   app.use("/api/deployments/*", requireOwner);
   app.use("/api/deployments", requireOwner);
@@ -1136,6 +1166,16 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         githubConnected: store.listGitCredentials().length > 0,
         setup: store.getSetupState(),
       });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.get("/api/metrics", async (c) => {
+    try {
+      const hostStats = await bridge.getHostStats();
+      return c.json(hostStats);
     } catch (err) {
       const { status, error } = handleError(err);
       return c.json({ error }, status);
@@ -2143,12 +2183,18 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       const body = UpdateNotificationsBodySchema.parse(await c.req.json());
       const current = store.getNotificationSettings();
       const targetChannel = body.channel ?? current.channel;
+      const isWebhookChannel = (ch: typeof targetChannel) =>
+        ch === "discord" || ch === "slack" || ch === "webhook";
+      const webhookProviderChanged =
+        isWebhookChannel(targetChannel) && targetChannel !== current.channel;
       const normalized = await notifier.validateAndNormalizeTarget({
         channel: targetChannel,
         webhookUrl: body.webhookUrl,
         telegramBotToken: body.telegramBotToken,
         telegramChatId: body.telegramChatId,
       });
+      const clearStaleWebhookUrl =
+        webhookProviderChanged && normalized.webhookUrl === undefined;
 
       const willEnable =
         targetChannel === "none" ? false : (body.enabled ?? current.enabled);
@@ -2176,22 +2222,33 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
           const effectiveUrl =
             normalized.webhookUrl !== undefined
               ? normalized.webhookUrl
-              : runtimeBefore.webhookUrl;
+              : clearStaleWebhookUrl
+                ? null
+                : runtimeBefore.webhookUrl;
           if (!effectiveUrl) {
             return c.json(
-              { error: "Enter a webhook URL before enabling alerts." },
+              {
+                error: webhookProviderChanged
+                  ? "Enter a webhook URL for the selected alert channel before enabling alerts."
+                  : "Enter a webhook URL before enabling alerts.",
+              },
               400,
             );
           }
         }
       }
 
+      const nextWebhookUrl =
+        normalized.webhookUrl !== undefined
+          ? normalized.webhookUrl
+          : clearStaleWebhookUrl
+            ? null
+            : undefined;
+
       const settings = store.updateNotificationSettings({
         ...(body.enabled !== undefined ? { enabled: body.enabled } : {}),
         ...(body.channel !== undefined ? { channel: body.channel } : {}),
-        ...(normalized.webhookUrl !== undefined
-          ? { webhookUrl: normalized.webhookUrl }
-          : {}),
+        ...(nextWebhookUrl !== undefined ? { webhookUrl: nextWebhookUrl } : {}),
         ...(normalized.telegramBotToken !== undefined
           ? { telegramBotToken: normalized.telegramBotToken }
           : {}),

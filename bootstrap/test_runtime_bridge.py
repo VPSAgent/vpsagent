@@ -4504,9 +4504,13 @@ class TestReleaseAlpha2Features(unittest.TestCase):
             json.dumps(
                 {
                     "images": {},
+                    "allImageIds": [],
                     "buildSeq": 0,
                     "failBuild": False,
                     "runningProjects": [],
+                    "serviceStates": {},
+                    "failPgDump": False,
+                    "oversizedPgDump": False,
                 }
             ),
             encoding="utf-8",
@@ -4561,7 +4565,10 @@ if args[:1] == ["build"]:
         sys.exit(1)
     tag = args[args.index("-t") + 1]
     st["buildSeq"] += 1
-    st["images"][tag] = f"sha256:img{{st['buildSeq']}}"
+    img_id = f"sha256:img{{st['buildSeq']}}"
+    st["images"][tag] = img_id
+    if img_id not in st.setdefault("allImageIds", []):
+        st["allImageIds"].append(img_id)
     save()
     print(f"Built {{tag}} -> {{st['images'][tag]}}")
     sys.exit(0)
@@ -4591,7 +4598,15 @@ if args[:1] == ["rmi"]:
     save()
     sys.exit(0)
 
-if args[:2] in (["container", "prune"], ["image", "prune"], ["builder", "prune"], ["volume", "prune"]):
+if args[:2] == ["image", "prune"]:
+    if "-a" not in args:
+        referenced = set(st["images"].values())
+        st["allImageIds"] = [i for i in st.get("allImageIds", []) if i in referenced]
+        save()
+    print("Total reclaimed space: 12MB")
+    sys.exit(0)
+
+if args[:2] in (["container", "prune"], ["builder", "prune"], ["volume", "prune"]):
     print("Total reclaimed space: 0B")
     sys.exit(0)
 
@@ -4603,10 +4618,28 @@ if args[:1] == ["compose"]:
         save()
         sys.exit(0)
     if "ps" in args:
-        if proj in st["runningProjects"]:
+        svc_rows = st.get("serviceStates", {{}}).get(proj)
+        if svc_rows is not None:
+            target_svc = args[-1] if args[-1] in ("postgres", "redis", "app") else None
+            for row in svc_rows:
+                if target_svc is None or row.get("Service") == target_svc:
+                    print(json.dumps(row))
+        elif proj in st["runningProjects"]:
             print(json.dumps({{"Name": proj, "State": "running", "Health": "healthy", "ExitCode": 0}}))
         sys.exit(0)
     if "exec" in args:
+        if st.get("failPgDump"):
+            sys.stderr.write("pg_dump: simulated connection refused\\n")
+            sys.exit(1)
+        if st.get("oversizedPgDump"):
+            chunk = b"X" * (1024 * 1024)
+            try:
+                for _ in range(210):
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+            except BrokenPipeError:
+                pass
+            sys.exit(0)
         sys.stdout.write("-- PostgreSQL database dump\\nSELECT 1;\\n")
         sys.exit(0)
 
@@ -4764,6 +4797,59 @@ sys.exit(0)
             st_after_rb["images"]["vpsagent-app-demo-rb:previous"], "sha256:img2"
         )
 
+        # Build #3 supersedes img2 -> docker_cleanup reclaims dangling img2 while keeping :latest (img3) & :previous (img1)
+        st_after_rb["failBuild"] = False
+        Path(self.state_file).write_text(json.dumps(st_after_rb), encoding="utf-8")
+        b3 = self.svc.build_git(
+            {
+                "slug": "demo-rb",
+                "gitRepoUrl": "https://github.com/acme/demo-rb.git",
+            }
+        )
+        self.assertTrue(b3["previousImageSaved"])
+        self.svc.docker_cleanup({"pruneImages": True})
+        calls_after = [
+            json.loads(line)
+            for line in Path(self.calls_file).read_text(encoding="utf-8").splitlines()
+        ]
+        self.assertIn(["image", "prune", "-f"], calls_after)
+        st_after_prune = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(st_after_prune["allImageIds"]), ["sha256:img1", "sha256:img3"]
+        )
+
+        # previousMode="preserve" keeps :previous intact; previousMode="clear" removes :previous
+        b4 = self.svc.build_git(
+            {
+                "slug": "demo-rb",
+                "gitRepoUrl": "https://github.com/acme/demo-rb.git",
+                "previousMode": "preserve",
+            }
+        )
+        self.assertFalse(b4["previousImageSaved"])
+        st_preserve = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        self.assertEqual(
+            st_preserve["images"]["vpsagent-app-demo-rb:previous"], "sha256:img1"
+        )
+
+        b5 = self.svc.build_git(
+            {
+                "slug": "demo-rb",
+                "gitRepoUrl": "https://github.com/acme/demo-rb.git",
+                "previousMode": "clear",
+            }
+        )
+        self.assertFalse(b5["previousImageSaved"])
+        st_clear = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        self.assertNotIn("vpsagent-app-demo-rb:previous", st_clear["images"])
+        self.assertIn("vpsagent-app-demo-rb:latest", st_clear["images"])
+
+        # remove_workload deletes both :latest and :previous tags
+        self.svc.remove_workload({"slug": "demo-rb", "removeFiles": True})
+        st_removed = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        self.assertNotIn("vpsagent-app-demo-rb:latest", st_removed["images"])
+        self.assertNotIn("vpsagent-app-demo-rb:previous", st_removed["images"])
+
     def test_backups_exclude_env_secrets_and_symlinks_and_include_dumps(self) -> None:
         self._write_minimal_app("pg-app", with_postgres=True)
         # Mark pg-app as running in fake docker so pg_dump executes
@@ -4829,6 +4915,79 @@ sys.exit(0)
         finally:
             if os.path.exists(core_tar):
                 os.unlink(core_tar)
+
+        # Even if the app container crashed (overall status=error) while Postgres is running,
+        # backup MUST still run pg_dump and NEVER copy live data/postgres files.
+        st_pg = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        st_pg["serviceStates"] = {
+            "vpsagent-pg-app": [
+                {
+                    "Service": "app",
+                    "Name": "vpsagent-app-pg-app",
+                    "State": "exited",
+                    "Health": "unhealthy",
+                    "ExitCode": 1,
+                },
+                {
+                    "Service": "postgres",
+                    "Name": "vpsagent-app-pg-app-postgres",
+                    "State": "running",
+                    "Health": "healthy",
+                    "ExitCode": 0,
+                },
+            ]
+        }
+        Path(self.state_file).write_text(json.dumps(st_pg), encoding="utf-8")
+        crashed_app_tar, _ = self.svc.create_app_backup({"slug": "pg-app"})
+        try:
+            with tarfile.open(crashed_app_tar, "r:gz") as tf:
+                crashed_names = tf.getnames()
+            self.assertTrue(any(n.endswith("/postgres.sql") for n in crashed_names))
+            self.assertFalse(any("data/postgres" in n for n in crashed_names))
+        finally:
+            if os.path.exists(crashed_app_tar):
+                os.unlink(crashed_app_tar)
+
+        # Failed pg_dump against a running Postgres must fail 502 instead of copying live DB files
+        st_pg["failPgDump"] = True
+        Path(self.state_file).write_text(json.dumps(st_pg), encoding="utf-8")
+        with self.assertRaises(rb.BridgeRequestError) as cm_dump_fail:
+            self.svc.create_app_backup({"slug": "pg-app"})
+        self.assertEqual(cm_dump_fail.exception.status_code, 502)
+
+        # Oversized pg_dump (>200 MB) must abort mid-stream with 413
+        st_pg["failPgDump"] = False
+        st_pg["oversizedPgDump"] = True
+        Path(self.state_file).write_text(json.dumps(st_pg), encoding="utf-8")
+        with self.assertRaises(rb.BridgeRequestError) as cm_dump_big:
+            self.svc.create_app_backup({"slug": "pg-app"})
+        self.assertEqual(cm_dump_big.exception.status_code, 413)
+
+    def test_disabling_probe_http_clears_cached_unhealthy_status(self) -> None:
+        self._write_minimal_app("probe-off")
+        st = json.loads(Path(self.state_file).read_text(encoding="utf-8"))
+        st["runningProjects"] = ["vpsagent-probe-off"]
+        Path(self.state_file).write_text(json.dumps(st), encoding="utf-8")
+
+        for _ in range(3):
+            self.svc._record_host_health(
+                "probe-off",
+                "/",
+                {"statusCode": 502, "ok": False, "error": "bad gateway"},
+            )
+        self.assertEqual(
+            self.svc._resolve_overall_status("probe-off", "running"), "error"
+        )
+
+        Path(os.path.join(self.apps_root, "probe-off", "probe.json")).write_text(
+            json.dumps({"probeHttp": False, "internalPort": 8080, "probePath": "/"}),
+            encoding="utf-8",
+        )
+        self.assertIsNone(self.svc.run_recurring_health_check_once("probe-off"))
+        self.assertIsNone(self.svc._get_host_health("probe-off"))
+        self.assertEqual(
+            self.svc._resolve_overall_status("probe-off", "running"), "running"
+        )
 
     def test_reset_password_cli_updates_hash_and_bumps_session_version(self) -> None:
         data_dir = os.path.join(self.vpsagent_root, "data")

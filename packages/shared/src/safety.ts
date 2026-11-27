@@ -545,23 +545,35 @@ export function validateHttpBaseUrl(
 
 /**
  * Validates an outbound HTTP(S) URL AND resolves its DNS records (checking every
- * returned IP address) against the metadata/private-network IP policy.
+ * returned IP address) against the metadata/private-network IP policy, returning
+ * the normalized URL along with the validated target addresses for connection pinning.
  */
-export async function validateHttpTargetWithDns(
+export async function resolveAndValidateHttpTarget(
   rawUrl: string,
   options?: {
     allowPrivateNetwork?: boolean;
     lookupFn?: HostLookupFn;
     preserveTrailingSlash?: boolean;
   },
-): Promise<string> {
+): Promise<{
+  url: string;
+  hostname: string;
+  addresses: Array<{ address: string; family: number }>;
+}> {
   const normalized = validateHttpBaseUrl(rawUrl, options);
   const parsed = new URL(normalized);
   const rawHostname = parsed.hostname.toLowerCase();
   const host = rawHostname.replace(/^\[|\]$/g, "").replace(/\.+$/, "");
 
-  if (net.isIP(host) !== 0 || host.includes(":")) {
-    return normalized;
+  const ipFamily = net.isIP(host);
+  if (ipFamily !== 0 || host.includes(":")) {
+    return {
+      url: normalized,
+      hostname: host,
+      addresses: [
+        { address: host, family: ipFamily || (host.includes(":") ? 6 : 4) },
+      ],
+    };
   }
 
   const records = options?.lookupFn
@@ -576,7 +588,27 @@ export async function validateHttpTargetWithDns(
     assertAllowedIpAddress(record.address, rawHostname, options);
   }
 
-  return normalized;
+  return {
+    url: normalized,
+    hostname: host,
+    addresses: records.map((r) => ({ address: r.address, family: r.family })),
+  };
+}
+
+/**
+ * Validates an outbound HTTP(S) URL AND resolves its DNS records (checking every
+ * returned IP address) against the metadata/private-network IP policy.
+ */
+export async function validateHttpTargetWithDns(
+  rawUrl: string,
+  options?: {
+    allowPrivateNetwork?: boolean;
+    lookupFn?: HostLookupFn;
+    preserveTrailingSlash?: boolean;
+  },
+): Promise<string> {
+  const resolved = await resolveAndValidateHttpTarget(rawUrl, options);
+  return resolved.url;
 }
 
 /**

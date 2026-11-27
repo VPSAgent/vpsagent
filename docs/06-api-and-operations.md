@@ -63,12 +63,18 @@ All persistent state lives inside `/var/lib/vpsagent`:
 To create a safe backup of your database and config:
 
 ```bash
-sudo sqlite3 /var/lib/vpsagent/data/registry.db ".backup '/tmp/registry-backup.db'"
-sudo tar -czf "$HOME/vpsagent-backup-$(date +%F).tar.gz" \
-  /var/lib/vpsagent/.env \
-  /tmp/registry-backup.db \
-  /var/lib/vpsagent/apps
-sudo rm -f /tmp/registry-backup.db
+TMP_BAK_DIR="$(sudo mktemp -d /tmp/vpsagent-bak-XXXXXX)"
+sudo chmod 700 "$TMP_BAK_DIR"
+sudo sqlite3 /var/lib/vpsagent/data/registry.db ".backup '${TMP_BAK_DIR}/registry-backup.db'"
+sudo chmod 600 "${TMP_BAK_DIR}/registry-backup.db"
+(
+  umask 077
+  sudo tar -czf "$HOME/vpsagent-backup-$(date +%F).tar.gz" \
+    /var/lib/vpsagent/.env \
+    "${TMP_BAK_DIR}/registry-backup.db" \
+    /var/lib/vpsagent/apps
+)
+sudo rm -rf "$TMP_BAK_DIR"
 ```
 
 ---

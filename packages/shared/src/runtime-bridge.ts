@@ -572,6 +572,7 @@ export interface RuntimeBuildGitInput {
   gitToken?: string | null | undefined;
   allowAutoDetect?: boolean | undefined;
   timeoutSeconds?: number | undefined;
+  previousMode?: "save" | "preserve" | "clear" | undefined;
 }
 
 export interface RuntimeInspectGitInput {
@@ -833,6 +834,7 @@ export class HttpRuntimeBridgeClient implements RuntimeBridge {
           ...(safeTimeoutSeconds !== undefined
             ? { timeoutSeconds: safeTimeoutSeconds }
             : {}),
+          ...(input.previousMode ? { previousMode: input.previousMode } : {}),
         },
         httpTimeoutMs,
       );

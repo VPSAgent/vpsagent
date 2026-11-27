@@ -119,22 +119,26 @@ export function App() {
     [],
   );
 
-  const recordOverviewSample = useCallback((ov: OverviewResponse) => {
-    const cpuPercent = Math.min(
-      100,
-      Math.round(
-        (ov.metrics.loadAverage1m / Math.max(1, ov.metrics.cpuCount)) * 100,
-      ),
-    );
-    setResourceHistory((prev) =>
-      appendResourceSample(prev, {
-        timestamp: ov.metrics.collectedAt,
-        cpu: cpuPercent,
-        memory: ov.metrics.memoryUsagePercent,
-        disk: ov.disk.usedPercent,
-      }),
-    );
-  }, []);
+  const recordOverviewSample = useCallback(
+    (sample: Pick<OverviewResponse, "metrics" | "disk">) => {
+      const cpuPercent = Math.min(
+        100,
+        Math.round(
+          (sample.metrics.loadAverage1m / Math.max(1, sample.metrics.cpuCount)) *
+            100,
+        ),
+      );
+      setResourceHistory((prev) =>
+        appendResourceSample(prev, {
+          timestamp: sample.metrics.collectedAt,
+          cpu: cpuPercent,
+          memory: sample.metrics.memoryUsagePercent,
+          disk: sample.disk.usedPercent,
+        }),
+      );
+    },
+    [],
+  );
 
   useEffect(() => {
     const syncFromHash = () => {
@@ -212,11 +216,16 @@ export function App() {
       return;
     }
     const timer = window.setInterval(() => {
+      if (document.hidden) return;
       void api
-        .getOverview()
-        .then((ov) => {
-          setOverview(ov);
-          recordOverviewSample(ov);
+        .getMetrics()
+        .then((sample) => {
+          setOverview((prev) =>
+            prev
+              ? { ...prev, metrics: sample.metrics, disk: sample.disk }
+              : prev,
+          );
+          recordOverviewSample(sample);
         })
         .catch(() => {
           // Ignore background poll errors; manual refresh surfaces connectivity issues.
@@ -230,6 +239,31 @@ export function App() {
     resourceDisplay,
     recordOverviewSample,
   ]);
+
+  useEffect(() => {
+    if (!session?.claimed || !session?.authenticated || tab !== "approvals") {
+      return;
+    }
+    let cancelled = false;
+    void api
+      .listApprovals()
+      .then((res) => {
+        if (cancelled) return;
+        setApprovals(res.approvals);
+        const pending = res.approvals.filter(
+          (a) => a.status === "pending",
+        ).length;
+        setOverview((prev) =>
+          prev ? { ...prev, pendingApprovals: pending } : prev,
+        );
+      })
+      .catch(() => {
+        // Non-fatal; manual refresh remains available.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [session?.claimed, session?.authenticated, tab]);
 
   const handleInspectSync = useCallback((inspect: InspectResult) => {
     setOverview((prev) =>

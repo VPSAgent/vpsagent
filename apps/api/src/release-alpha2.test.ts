@@ -34,7 +34,7 @@ def load_state():
     if os.path.exists(state_file):
         with open(state_file, "r", encoding="utf-8") as fh:
             return json.load(fh)
-    return {"projects": {}, "networks": [], "images": {}, "buildSeq": 0, "failLifecycle": False}
+    return {"projects": {}, "networks": [], "images": {}, "buildSeq": 0, "failLifecycle": False, "buildDelayMs": 0}
 
 def save_state(st):
     with open(state_file, "w", encoding="utf-8") as fh:
@@ -43,7 +43,12 @@ def save_state(st):
 st = load_state()
 
 if args[:1] == ["build"]:
+    delay_ms = int(st.get("buildDelayMs", 0) or 0)
+    if delay_ms > 0:
+        import time
+        time.sleep(delay_ms / 1000.0)
     tag = args[args.index("-t") + 1]
+    st = load_state()
     st["buildSeq"] = st.get("buildSeq", 0) + 1
     st.setdefault("images", {})[tag] = f"sha256:build-{st['buildSeq']}"
     save_state(st)
@@ -317,7 +322,13 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
     const gitBin = createFakeGitShim(tempDir, commitFile);
     const runtimeToken = "alpha2-runtime-bridge-secret-token";
 
+    let failLiveServer = false;
     const liveAppServer = http.createServer((_req, res) => {
+      if (failLiveServer) {
+        res.statusCode = 500;
+        res.end("unhealthy");
+        return;
+      }
       res.statusCode = 200;
       res.end("ok");
     });
@@ -357,7 +368,7 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
     });
 
     const claimToken = "alpha2-claim-token";
-    const { app, healthAlerter } = createVpsAgentApp({
+    const { app, notifier, healthAlerter } = createVpsAgentApp({
       store,
       bridge,
       appsRoot,
@@ -366,7 +377,7 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
       trustProxy: true,
       isLocalListener: false,
       defaultPeerIp: "172.18.0.2",
-      readinessTimeoutSeconds: 5,
+      readinessTimeoutSeconds: 2,
       readinessPollIntervalMs: 25,
       lookupFn: async () => [{ address: "140.82.121.4", family: 4 }],
       notificationFetchFn: mockFetch,
@@ -948,6 +959,354 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
         true,
       );
       expect(sysTarNames.some((n) => n.includes(".env"))).toBe(false);
+
+      // 8. Devin PR #10 regressions: chunked webhook cap, queued concurrent push, broken rebuild & rollback recovery,
+      // slug reuse cleanup, failed rollback restoration, probeHttp disable refresh, first-deploy alert link,
+      // channel switch clearing, and shared healthAlerter across listeners.
+
+      // 8a. Streaming webhook body >1 MB without Content-Length rejected with 413
+      const oversizedStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(600 * 1024).fill(97));
+          controller.enqueue(new Uint8Array(600 * 1024).fill(98));
+          controller.close();
+        },
+      });
+      const chunkedTooBig = await app.request(
+        new Request("https://vps.example.com/api/webhooks/github/my-git-app", {
+          method: "POST",
+          headers: {
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+            "x-github-event": "push",
+            "x-hub-signature-256": "sha256=deadbeef",
+            "content-type": "application/json",
+          },
+          body: oversizedStream,
+          duplex: "half",
+        } as RequestInit),
+      );
+      expect(chunkedTooBig.status).toBe(413);
+
+      // 8b. Concurrent GitHub push during an active rebuild queues a follow-up rebuild
+      const stDelay = JSON.parse(fs.readFileSync(stateFile, "utf8")) as Record<
+        string,
+        unknown
+      >;
+      stDelay.buildDelayMs = 450;
+      fs.writeFileSync(stateFile, JSON.stringify(stDelay), "utf8");
+      fs.writeFileSync(
+        commitFile,
+        "3333333333333333333333333333333333333333",
+        "utf8",
+      );
+      const firstAsyncRebuild = await app.request(
+        "https://vps.example.com/api/apps/my-git-app/rebuild?async=true",
+        {
+          method: "POST",
+          headers: httpsHeaders(),
+        },
+      );
+      expect(firstAsyncRebuild.status).toBe(202);
+
+      // Fire second push while first build holds lock
+      fs.writeFileSync(
+        commitFile,
+        "4444444444444444444444444444444444444444",
+        "utf8",
+      );
+      const concurrentPushBody = JSON.stringify({ ref: "refs/heads/release" });
+      const concurrentPush = await app.request(
+        "https://vps.example.com/api/webhooks/github/my-git-app",
+        {
+          method: "POST",
+          headers: {
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+            "x-github-event": "push",
+            "x-hub-signature-256": sign(concurrentPushBody),
+            "content-type": "application/json",
+          },
+          body: concurrentPushBody,
+        },
+      );
+      expect(concurrentPush.status).toBe(202);
+      const concurrentJson = (await concurrentPush.json()) as {
+        triggered: boolean;
+        queued: boolean;
+      };
+      expect(concurrentJson.triggered).toBe(false);
+      expect(concurrentJson.queued).toBe(true);
+
+      stDelay.buildDelayMs = 0;
+      fs.writeFileSync(stateFile, JSON.stringify(stDelay), "utf8");
+      for (let i = 0; i < 60; i++) {
+        const cur = store.getApp("my-git-app");
+        if (
+          cur?.lastCommitSha === "4444444444444444444444444444444444444444" &&
+          cur.status === "running"
+        ) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 75));
+      }
+      expect(store.getApp("my-git-app")?.lastCommitSha).toBe(
+        "4444444444444444444444444444444444444444",
+      );
+
+      // 8c. Broken Git rebuild records rollback immediately; consecutive broken rebuild preserves known-good commit
+      failLiveServer = true;
+      fs.writeFileSync(
+        commitFile,
+        "5555555555555555555555555555555555555555",
+        "utf8",
+      );
+      const broken1 = await app.request(
+        "https://vps.example.com/api/apps/my-git-app/rebuild",
+        { method: "POST", headers: httpsHeaders() },
+      );
+      expect(broken1.status).toBe(502);
+      expect(store.getApp("my-git-app")?.status).toBe("error");
+      expect(store.getApp("my-git-app")?.rollbackAvailable).toBe(true);
+      expect(store.getApp("my-git-app")?.previousCommitSha).toBe(
+        "4444444444444444444444444444444444444444",
+      );
+
+      fs.writeFileSync(
+        commitFile,
+        "6666666666666666666666666666666666666666",
+        "utf8",
+      );
+      const broken2 = await app.request(
+        "https://vps.example.com/api/apps/my-git-app/rebuild",
+        { method: "POST", headers: httpsHeaders() },
+      );
+      expect(broken2.status).toBe(502);
+      expect(store.getApp("my-git-app")?.previousCommitSha).toBe(
+        "4444444444444444444444444444444444444444",
+      );
+
+      failLiveServer = false;
+      const recoverRb = await app.request(
+        "https://vps.example.com/api/apps/my-git-app/rollback",
+        { method: "POST", headers: httpsHeaders() },
+      );
+      expect(recoverRb.status).toBe(200);
+      expect(store.getApp("my-git-app")?.lastCommitSha).toBe(
+        "4444444444444444444444444444444444444444",
+      );
+      expect(store.getApp("my-git-app")?.status).toBe("running");
+
+      // Deleting Git app and reusing same slug starts fresh with rollbackAvailable=false
+      const delGit = await app.request(
+        "https://vps.example.com/api/apps/my-git-app?removeFiles=true",
+        { method: "DELETE", headers: httpsHeaders() },
+      );
+      expect(delGit.status).toBe(200);
+      const reusedSlugRes = await app.request(
+        "https://vps.example.com/api/apps",
+        {
+          method: "POST",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({
+            slug: "my-git-app",
+            name: "Reused Slug App",
+            sourceType: "git",
+            gitRepoUrl: "https://github.com/acme/reused.git",
+            internalPort: livePort,
+            noDomain: true,
+          }),
+        },
+      );
+      expect(reusedSlugRes.status).toBe(201);
+      expect(store.getApp("my-git-app")?.rollbackAvailable).toBe(false);
+      expect(store.getApp("my-git-app")?.previousCommitSha).toBeNull();
+
+      // 8d. Failed rollback on Docker-image app restores pre-rollback compose/image and status
+      const imgDeploy = await app.request("https://vps.example.com/api/apps", {
+        method: "POST",
+        headers: httpsHeaders({ "content-type": "application/json" }),
+        body: JSON.stringify({
+          slug: "rb-img",
+          name: "Rollback Image App",
+          sourceType: "image",
+          image: "nginx:v1",
+          internalPort: livePort,
+          noDomain: true,
+        }),
+      });
+      expect(imgDeploy.status).toBe(201);
+      const imgPatch = await app.request(
+        "https://vps.example.com/api/apps/rb-img",
+        {
+          method: "PATCH",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ image: "nginx:v2" }),
+        },
+      );
+      expect(imgPatch.status).toBe(200);
+      expect(store.getApp("rb-img")?.rollbackAvailable).toBe(true);
+
+      failLiveServer = true;
+      const failedImgRb = await app.request(
+        "https://vps.example.com/api/apps/rb-img/rollback",
+        { method: "POST", headers: httpsHeaders() },
+      );
+      expect(failedImgRb.status).toBe(502);
+      expect(store.getApp("rb-img")?.image).toBe("nginx:v2");
+      expect(store.getApp("rb-img")?.status).toBe("running");
+      expect(
+        fs.readFileSync(path.join(appsRoot, "rb-img", "docker-compose.yml"), "utf8"),
+      ).toContain("nginx:v2");
+
+      // 8e. First-deploy failure alert links to /#approvals instead of missing app page
+      const firstDeployFail = await app.request(
+        "https://vps.example.com/api/apps",
+        {
+          method: "POST",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({
+            slug: "fail-first",
+            name: "Fail First",
+            sourceType: "image",
+            image: "nginx:fail",
+            internalPort: livePort,
+            noDomain: true,
+          }),
+        },
+      );
+      expect(firstDeployFail.status).toBe(502);
+      await new Promise((r) => setTimeout(r, 30));
+      const failAlertText = String(sentAlerts.at(-1)!.body.content);
+      expect(failAlertText).toContain("/#approvals");
+      expect(failAlertText).not.toContain("/#/apps/fail-first/deployments");
+      failLiveServer = false;
+
+      // 8f. Disabling HTTP check on an error app refreshes runtime status back to running
+      store.updateAppStatus("rb-img", "error");
+      const disableProbePatch = await app.request(
+        "https://vps.example.com/api/apps/rb-img",
+        {
+          method: "PATCH",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ probeHttp: false }),
+        },
+      );
+      expect(disableProbePatch.status).toBe(200);
+      expect(
+        ((await disableProbePatch.json()) as { app: { status: string } }).app
+          .status,
+      ).toBe("running");
+
+      // 8g. Shared healthAlerter suppresses outage alerts when stopped via secondary local listener
+      const { app: localApp } = createVpsAgentApp({
+        store,
+        bridge,
+        appsRoot,
+        sessionSecret: "alpha2-session-secret-32-bytes-ok",
+        claimToken,
+        trustProxy: false,
+        isLocalListener: true,
+        defaultPeerIp: "127.0.0.1",
+        notifier,
+        healthAlerter,
+      });
+      const localLogin = await localApp.request(
+        "http://127.0.0.1:3002/api/auth/login",
+        {
+          method: "POST",
+          headers: {
+            host: "127.0.0.1:3002",
+            origin: "http://127.0.0.1:3002",
+            "sec-fetch-site": "same-origin",
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ passphrase: "cli-recovered-pass-2026" }),
+        },
+      );
+      expect(localLogin.status).toBe(200);
+      const localCookie = localLogin.headers.get("set-cookie")!.split(";")[0]!;
+      await healthAlerter.checkOnce();
+      const alertsBeforeLocalStop = sentAlerts.length;
+      const localStop = await localApp.request(
+        "http://127.0.0.1:3002/api/apps/rb-img/stop",
+        {
+          method: "POST",
+          headers: {
+            cookie: localCookie,
+            host: "127.0.0.1:3002",
+            origin: "http://127.0.0.1:3002",
+            "sec-fetch-site": "same-origin",
+          },
+        },
+      );
+      expect(localStop.status).toBe(200);
+      await healthAlerter.checkOnce();
+      await new Promise((r) => setTimeout(r, 30));
+      expect(sentAlerts.length).toBe(alertsBeforeLocalStop);
+
+      // 8h. Switching webhook provider (discord -> slack) without new URL rejects enable and clears stale URL
+      const switchEnableNoUrl = await app.request(
+        "https://vps.example.com/api/notifications",
+        {
+          method: "PUT",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ enabled: true, channel: "slack" }),
+        },
+      );
+      expect(switchEnableNoUrl.status).toBe(400);
+
+      const switchPausedClearsUrl = await app.request(
+        "https://vps.example.com/api/notifications",
+        {
+          method: "PUT",
+          headers: httpsHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ enabled: false, channel: "slack" }),
+        },
+      );
+      expect(switchPausedClearsUrl.status).toBe(200);
+      const switchedJson = (await switchPausedClearsUrl.json()) as {
+        settings: { hasTargetSecret: boolean; targetHint: string | null };
+      };
+      expect(switchedJson.settings.hasTargetSecret).toBe(false);
+      expect(switchedJson.settings.targetHint).toBeNull();
+
+      // 8i. GET /api/metrics requires owner session and returns host metrics without inspecting workloads
+      const unauthMetrics = await app.request(
+        "https://vps.example.com/api/metrics",
+        {
+          headers: {
+            host: "vps.example.com",
+            "x-forwarded-proto": "https",
+          },
+        },
+      );
+      expect(unauthMetrics.status).toBe(401);
+
+      const origInspectWorkload = bridge.inspectWorkload.bind(bridge);
+      let inspectCalls = 0;
+      bridge.inspectWorkload = async (...args) => {
+        inspectCalls += 1;
+        return origInspectWorkload(...args);
+      };
+      try {
+        const metricsRes = await app.request(
+          "https://vps.example.com/api/metrics",
+          {
+            headers: httpsHeaders(),
+          },
+        );
+        expect(metricsRes.status).toBe(200);
+        const metricsJson = (await metricsRes.json()) as {
+          metrics: { hostname: string; cpuCount: number };
+          disk: { totalGb: number };
+        };
+        expect(metricsJson.metrics.cpuCount).toBeGreaterThanOrEqual(1);
+        expect(metricsJson.disk.totalGb).toBeGreaterThan(0);
+        expect(inspectCalls).toBe(0);
+      } finally {
+        bridge.inspectWorkload = origInspectWorkload;
+      }
     } finally {
       healthAlerter.stop();
       store.close();
@@ -957,5 +1316,5 @@ describe("Release v2.0.0-alpha.2 features (CSRF, Auth/CLI reset, App settings, R
       );
       fs.rmSync(tempDir, { recursive: true, force: true });
     }
-  }, 45_000);
+  }, 60_000);
 });

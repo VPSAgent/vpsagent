@@ -1,3 +1,5 @@
+import https from "node:https";
+import net from "node:net";
 import {
   type AppStatus,
   type ApprovalRequest,
@@ -7,8 +9,8 @@ import {
   type RegistryStore,
   type RuntimeBridge,
   redactSecrets,
+  resolveAndValidateHttpTarget,
   syncAppStatuses,
-  validateHttpTargetWithDns,
 } from "@vpsagent/shared";
 
 const DEFAULT_TELEGRAM_API_BASE = "https://api.telegram.org";
@@ -20,6 +22,7 @@ const DISCORD_WEBHOOK_HOSTS = new Set([
   "ptb.discord.com",
   "canary.discord.com",
 ]);
+const MAX_NOTIFICATION_RESPONSE_BYTES = 4096;
 
 export interface NotificationServiceOptions {
   store: RegistryStore;
@@ -47,21 +50,120 @@ function buildActiveDashboardBaseUrl(store: RegistryStore): string | null {
   return null;
 }
 
+function assertWebhookUrlMatchesChannel(
+  channel: NotificationChannel,
+  parsed: URL,
+): void {
+  if (parsed.protocol !== "https:") {
+    throw new Error("Alert webhook URL must use https://.");
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (
+    channel === "discord" &&
+    (!DISCORD_WEBHOOK_HOSTS.has(host) ||
+      !parsed.pathname.startsWith("/api/webhooks/"))
+  ) {
+    throw new Error(
+      "Discord webhook URL must start with https://discord.com/api/webhooks/.",
+    );
+  }
+  if (channel === "slack" && host !== "hooks.slack.com") {
+    throw new Error("Slack webhook URL must use https://hooks.slack.com/...");
+  }
+}
+
+async function postJsonPinnedHttps(
+  targetUrl: string,
+  payload: Record<string, unknown>,
+  addresses: Array<{ address: string; family: number }>,
+  timeoutMs: number,
+): Promise<{ ok: boolean; status: number; bodyText: string }> {
+  const parsed = new URL(targetUrl);
+  const bodyBuf = Buffer.from(JSON.stringify(payload), "utf8");
+  const rawHost = parsed.hostname.replace(/^\[|\]$/g, "");
+  const isIpLiteral = net.isIP(rawHost) !== 0;
+
+  return new Promise((resolve, reject) => {
+    const pinnedLookup = (
+      _hostname: string,
+      opts: unknown,
+      cb: (...args: unknown[]) => void,
+    ) => {
+      const wantAll =
+        typeof opts === "object" &&
+        opts !== null &&
+        (opts as { all?: boolean }).all === true;
+      if (wantAll) {
+        cb(null, addresses);
+      } else {
+        const first = addresses[0]!;
+        cb(null, first.address, first.family);
+      }
+    };
+
+    const req = https.request(
+      {
+        protocol: parsed.protocol,
+        hostname: rawHost,
+        port: parsed.port ? Number.parseInt(parsed.port, 10) : 443,
+        path: `${parsed.pathname}${parsed.search}`,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(bodyBuf.byteLength),
+        },
+        lookup: pinnedLookup as unknown as NonNullable<
+          https.RequestOptions["lookup"]
+        >,
+        ...(isIpLiteral ? {} : { servername: rawHost }),
+        signal: AbortSignal.timeout(timeoutMs),
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        let total = 0;
+        res.on("data", (chunk: Buffer) => {
+          if (total < MAX_NOTIFICATION_RESPONSE_BYTES) {
+            const slice = chunk.subarray(
+              0,
+              MAX_NOTIFICATION_RESPONSE_BYTES - total,
+            );
+            chunks.push(slice);
+            total += slice.length;
+          }
+        });
+        res.on("end", () => {
+          const status = res.statusCode ?? 0;
+          resolve({
+            ok: status >= 200 && status < 300,
+            status,
+            bodyText: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+        res.on("error", reject);
+      },
+    );
+
+    req.on("error", reject);
+    req.write(bodyBuf);
+    req.end();
+  });
+}
+
 /**
  * Sends instant plain-English alerts to Discord, Slack, Telegram, or a custom HTTPS webhook.
- * Every outbound target is validated against SSRF rules (HTTPS + public DNS/IP check) and all
- * payloads pass through `redactSecrets` so secrets never leave the server.
+ * Every outbound target is validated against SSRF rules (HTTPS + public DNS/IP check + pinned
+ * address connection + no redirects) and all payloads pass through `redactSecrets`.
  */
 export class NotificationService {
   private readonly store: RegistryStore;
   private readonly lookupFn: HostLookupFn | undefined;
-  private readonly fetchFn: typeof fetch;
+  private readonly customFetchFn: typeof fetch | undefined;
   private readonly telegramApiBaseUrl: string;
 
   constructor(options: NotificationServiceOptions) {
     this.store = options.store;
     this.lookupFn = options.lookupFn;
-    this.fetchFn = options.fetchFn ?? fetch;
+    this.customFetchFn = options.fetchFn;
     this.telegramApiBaseUrl = (
       options.telegramApiBaseUrl ?? DEFAULT_TELEGRAM_API_BASE
     ).replace(/\/+$/, "");
@@ -109,31 +211,13 @@ export class NotificationService {
 
     let cleanUrl: string | null | undefined = params.webhookUrl;
     if (typeof cleanUrl === "string" && cleanUrl.trim()) {
-      const normalized = await validateHttpTargetWithDns(cleanUrl.trim(), {
+      const resolved = await resolveAndValidateHttpTarget(cleanUrl.trim(), {
         allowPrivateNetwork: false,
         preserveTrailingSlash: true,
         ...(this.lookupFn ? { lookupFn: this.lookupFn } : {}),
       });
-      const parsed = new URL(normalized);
-      if (parsed.protocol !== "https:") {
-        throw new Error("Alert webhook URL must use https://.");
-      }
-      const host = parsed.hostname.toLowerCase();
-      if (
-        channel === "discord" &&
-        (!DISCORD_WEBHOOK_HOSTS.has(host) ||
-          !parsed.pathname.startsWith("/api/webhooks/"))
-      ) {
-        throw new Error(
-          "Discord webhook URL must start with https://discord.com/api/webhooks/.",
-        );
-      }
-      if (channel === "slack" && host !== "hooks.slack.com") {
-        throw new Error(
-          "Slack webhook URL must use https://hooks.slack.com/...",
-        );
-      }
-      cleanUrl = normalized;
+      assertWebhookUrlMatchesChannel(channel, new URL(resolved.url));
+      cleanUrl = resolved.url;
     }
 
     return {
@@ -177,6 +261,8 @@ export class NotificationService {
 
     try {
       let targetUrl: string;
+      let pinnedAddresses: Array<{ address: string; family: number }> | null =
+        null;
       let payload: Record<string, unknown>;
 
       if (cfg.channel === "telegram") {
@@ -186,10 +272,14 @@ export class NotificationService {
           );
         }
         if (this.telegramApiBaseUrl === DEFAULT_TELEGRAM_API_BASE) {
-          await validateHttpTargetWithDns(this.telegramApiBaseUrl, {
-            allowPrivateNetwork: false,
-            ...(this.lookupFn ? { lookupFn: this.lookupFn } : {}),
-          });
+          const resolved = await resolveAndValidateHttpTarget(
+            this.telegramApiBaseUrl,
+            {
+              allowPrivateNetwork: false,
+              ...(this.lookupFn ? { lookupFn: this.lookupFn } : {}),
+            },
+          );
+          pinnedAddresses = resolved.addresses;
         }
         targetUrl = `${this.telegramApiBaseUrl}/bot${cfg.telegramBotToken}/sendMessage`;
         payload = {
@@ -201,14 +291,15 @@ export class NotificationService {
         if (!cfg.webhookUrl) {
           throw new Error("Alert webhook URL is not configured.");
         }
-        targetUrl = await validateHttpTargetWithDns(cfg.webhookUrl, {
+        const resolved = await resolveAndValidateHttpTarget(cfg.webhookUrl, {
           allowPrivateNetwork: false,
           preserveTrailingSlash: true,
           ...(this.lookupFn ? { lookupFn: this.lookupFn } : {}),
         });
-        if (new URL(targetUrl).protocol !== "https:") {
-          throw new Error("Alert webhook URL must use https://.");
-        }
+        assertWebhookUrlMatchesChannel(cfg.channel, new URL(resolved.url));
+        targetUrl = resolved.url;
+        pinnedAddresses = resolved.addresses;
+
         if (cfg.channel === "discord") {
           payload = { content: textMessage };
         } else if (cfg.channel === "slack") {
@@ -226,17 +317,47 @@ export class NotificationService {
         }
       }
 
-      const res = await this.fetchFn(targetUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(payload),
-        redirect: "error",
-        signal: AbortSignal.timeout(10_000),
-      });
+      let ok: boolean;
+      let status: number;
+      let bodyText: string;
 
-      if (!res.ok) {
-        const errText = redactSecrets((await res.text()).trim()).slice(0, 200);
-        const msg = `Alert target returned HTTP ${res.status}${errText ? `: ${errText}` : ""}`;
+      if (this.customFetchFn) {
+        const res = await this.customFetchFn(targetUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+          redirect: "error",
+          signal: AbortSignal.timeout(10_000),
+        });
+        ok = res.ok;
+        status = res.status;
+        bodyText = await res.text();
+      } else if (pinnedAddresses && targetUrl.startsWith("https://")) {
+        const res = await postJsonPinnedHttps(
+          targetUrl,
+          payload,
+          pinnedAddresses,
+          10_000,
+        );
+        ok = res.ok;
+        status = res.status;
+        bodyText = res.bodyText;
+      } else {
+        const res = await fetch(targetUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+          redirect: "error",
+          signal: AbortSignal.timeout(10_000),
+        });
+        ok = res.ok;
+        status = res.status;
+        bodyText = await res.text();
+      }
+
+      if (!ok) {
+        const errText = redactSecrets(bodyText.trim()).slice(0, 200);
+        const msg = `Alert target returned HTTP ${status}${errText ? `: ${errText}` : ""}`;
         this.store.recordNotificationDelivery(false, msg);
         return { ok: false, error: msg };
       }
@@ -271,6 +392,7 @@ export class NotificationService {
     slug: string,
     deployment: DeploymentRecord,
     errorMessage: string,
+    options?: { appExists?: boolean },
   ): void {
     const cfg = this.store.getNotificationConfigForRuntime();
     if (!cfg.enabled || !cfg.notifyOnDeployFailure || cfg.channel === "none") {
@@ -281,7 +403,10 @@ export class NotificationService {
       title: `VPSAgent: ${deployment.action === "rollback_app" ? "Rollback" : "Build"} Failed for "${slug}"`,
       body: redactSecrets(errorMessage).slice(0, 400),
       slug,
-      linkPath: `/#/apps/${slug}/deployments`,
+      linkPath:
+        options?.appExists === false
+          ? "/#approvals"
+          : `/#/apps/${slug}/deployments`,
     }).catch(() => {});
   }
 
