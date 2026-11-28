@@ -180,6 +180,22 @@ export interface AppEnvEntry {
   updatedAt: string;
 }
 
+export interface RequestedEnvKey {
+  key: string;
+  description?: string;
+  isSecret: boolean;
+  required: boolean;
+}
+
+export interface AppEnvRequest {
+  slug: string;
+  note: string | null;
+  keys: RequestedEnvKey[];
+  rebuildAfterSave: boolean;
+  requestedBy: string;
+  updatedAt: string;
+}
+
 export interface SystemMetrics {
   hostname: string;
   platform: string;
@@ -771,9 +787,11 @@ export const api = {
       },
     ),
   getAppEnv: (slug: string) =>
-    apiFetch<{ envVars: AppEnvEntry[]; missingEnvKeys: string[] }>(
-      `/api/apps/${encodeURIComponent(slug)}/env`,
-    ),
+    apiFetch<{
+      envVars: AppEnvEntry[];
+      missingEnvKeys: string[];
+      envRequest?: AppEnvRequest | null;
+    }>(`/api/apps/${encodeURIComponent(slug)}/env`),
   updateAppEnv: (
     slug: string,
     vars: Array<{ key: string; value: string; isSecret?: boolean }>,
@@ -782,6 +800,9 @@ export const api = {
       app: AppRecord;
       envVars: AppEnvEntry[];
       missingEnvKeys: string[];
+      envRequest?: AppEnvRequest | null;
+      needsRebuild?: boolean;
+      changedBuildTimeKeys?: string[];
     }>(`/api/apps/${encodeURIComponent(slug)}/env`, {
       method: "PUT",
       body: JSON.stringify({ vars, deleteKeys: [] }),
@@ -791,9 +812,34 @@ export const api = {
       app: AppRecord;
       envVars: AppEnvEntry[];
       missingEnvKeys: string[];
+      envRequest?: AppEnvRequest | null;
+      needsRebuild?: boolean;
+      changedBuildTimeKeys?: string[];
     }>(`/api/apps/${encodeURIComponent(slug)}/env/${encodeURIComponent(key)}`, {
       method: "DELETE",
     }),
+  setAppEnvVisibility: (slug: string, key: string, isSecret: boolean) =>
+    apiFetch<{
+      app: AppRecord;
+      envVars: AppEnvEntry[];
+      missingEnvKeys: string[];
+      envRequest?: AppEnvRequest | null;
+      needsRebuild?: boolean;
+      changedBuildTimeKeys?: string[];
+    }>(
+      `/api/apps/${encodeURIComponent(slug)}/env/${encodeURIComponent(key)}/visibility`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ isSecret }),
+      },
+    ),
+  dismissAppEnvRequest: (slug: string) =>
+    apiFetch<{ ok: true; envRequest: null }>(
+      `/api/apps/${encodeURIComponent(slug)}/env-request`,
+      {
+        method: "DELETE",
+      },
+    ),
 
   listApprovals: () =>
     apiFetch<{ approvals: ApprovalRequest[] }>("/api/approvals"),

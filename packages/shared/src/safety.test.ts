@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   assertHttpsForRemoteHost,
+  extractBuildTimePublicEnvVars,
   formatEnvFile,
   formatGitTokenHint,
+  isBuildTimePublicEnvKey,
   isGithubHttpsRepoUrl,
   isLoopbackHost,
+  parseEnvBlock,
   parseGithubRepoOwnerAndName,
   quoteEnvValue,
   redactSecrets,
@@ -217,5 +220,56 @@ describe("safety validators and secret redaction", () => {
         expect(msg).not.toContain(sample);
       }
     }
+  });
+
+  it("extracts only safe public build-time env vars and parses .env blocks", () => {
+    expect(isBuildTimePublicEnvKey("NEXT_PUBLIC_SUPABASE_URL")).toBe(true);
+    expect(isBuildTimePublicEnvKey("VITE_API_BASE")).toBe(true);
+    expect(isBuildTimePublicEnvKey("SUPABASE_SERVICE_ROLE_KEY")).toBe(false);
+    expect(isBuildTimePublicEnvKey("VPSAGENT_SECRET")).toBe(false);
+
+    const extracted = extractBuildTimePublicEnvVars({
+      NEXT_PUBLIC_SUPABASE_URL: "https://demo.supabase.co",
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: "anon-123",
+      VITE_APP_NAME: "MyApp",
+      SUPABASE_SERVICE_ROLE_KEY: "super-secret",
+      DATABASE_URL: "postgres://secret",
+    });
+    expect(extracted).toEqual({
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: "anon-123",
+      NEXT_PUBLIC_SUPABASE_URL: "https://demo.supabase.co",
+      VITE_APP_NAME: "MyApp",
+    });
+
+    expect(() =>
+      extractBuildTimePublicEnvVars({
+        NEXT_PUBLIC_MULTILINE: "line1\nline2",
+      }),
+    ).toThrow(/cannot contain newlines/);
+
+    const parsed = parseEnvBlock(
+      [
+        "# Comment line",
+        'export NEXT_PUBLIC_URL="https://example.com?a=1&b=2" # staging',
+        "POLAR_SECRET='tok_#123' # keep hash inside quotes",
+        "MAIL_FROM='O\\'Brien' # escaped apostrophe",
+        "ASSET_DIR='C:\\assets\\'",
+        "WIN_COMMENT='C:\\assets\\' # Windows path '",
+        'ESCAPED="say \\"hi\\" # kept" # trailing comment',
+        "INLINE=hello # trailing comment",
+        "BAD_LINE",
+      ].join("\n"),
+    );
+    expect(parsed.vars).toEqual([
+      { key: "NEXT_PUBLIC_URL", value: "https://example.com?a=1&b=2" },
+      { key: "POLAR_SECRET", value: "tok_#123" },
+      { key: "MAIL_FROM", value: "O'Brien" },
+      { key: "ASSET_DIR", value: "C:\\assets\\" },
+      { key: "WIN_COMMENT", value: "C:\\assets\\" },
+      { key: "ESCAPED", value: 'say "hi" # kept' },
+      { key: "INLINE", value: "hello" },
+    ]);
+    expect(parsed.errors).toHaveLength(1);
+    expect(parsed.errors[0]?.line).toBe(9);
   });
 });

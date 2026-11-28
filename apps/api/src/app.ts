@@ -15,6 +15,7 @@ import {
   RuntimeBridgeError,
   type RuntimeTailscaleStatus,
   type SetupState,
+  isBuildTimePublicEnvKey,
   redactSecrets,
   scrubTokenFromText,
   syncAppStatuses,
@@ -1255,6 +1256,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     return c.json({
       app: appRecord,
       envVars: store.listAppEnvVars(appRecord.slug),
+      envRequest: store.getAppEnvRequest(appRecord.slug),
     });
   });
 
@@ -1527,6 +1529,7 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
     return c.json({
       envVars: store.listAppEnvVars(slug),
       missingEnvKeys: executor.getMissingEnvKeys(slug),
+      envRequest: store.getAppEnvRequest(slug),
     });
   });
 
@@ -1535,10 +1538,22 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
       const slug = c.req.param("slug");
       const body = UpdateAppEnvInputSchema.parse(await c.req.json());
       const updated = await executor.updateAppEnv(slug, body, "user");
+      const changedKeys = [
+        ...body.vars.map((v) => v.key),
+        ...body.deleteKeys,
+      ];
+      const changedBuildTimeKeys = Array.from(
+        new Set(changedKeys.filter((k) => isBuildTimePublicEnvKey(k))),
+      );
+      const needsRebuild =
+        updated.sourceType === "git" && changedBuildTimeKeys.length > 0;
       return c.json({
         app: updated,
         envVars: store.listAppEnvVars(slug),
         missingEnvKeys: executor.getMissingEnvKeys(slug),
+        envRequest: store.getAppEnvRequest(slug),
+        needsRebuild,
+        changedBuildTimeKeys,
       });
     } catch (err) {
       const { status, error } = handleError(err);
@@ -1555,15 +1570,53 @@ export function createVpsAgentApp(options: VpsAgentAppOptions): {
         { vars: [], deleteKeys: [key] },
         "user",
       );
+      const changedBuildTimeKeys = isBuildTimePublicEnvKey(key) ? [key] : [];
+      const needsRebuild =
+        updated.sourceType === "git" && changedBuildTimeKeys.length > 0;
       return c.json({
         app: updated,
         envVars: store.listAppEnvVars(slug),
         missingEnvKeys: executor.getMissingEnvKeys(slug),
+        envRequest: store.getAppEnvRequest(slug),
+        needsRebuild,
+        changedBuildTimeKeys,
       });
     } catch (err) {
       const { status, error } = handleError(err);
       return c.json({ error }, status);
     }
+  });
+
+  app.patch("/api/apps/:slug/env/:key/visibility", async (c) => {
+    try {
+      const slug = c.req.param("slug");
+      const key = c.req.param("key");
+      const { isSecret } = z
+        .object({ isSecret: z.boolean() })
+        .parse(await c.req.json());
+      const { app: appRecord, needsRebuild, changedBuildTimeKeys } =
+        await executor.setAppEnvVisibility(slug, key, isSecret, "user");
+      return c.json({
+        app: appRecord,
+        envVars: store.listAppEnvVars(slug),
+        missingEnvKeys: executor.getMissingEnvKeys(slug),
+        envRequest: store.getAppEnvRequest(slug),
+        needsRebuild,
+        changedBuildTimeKeys,
+      });
+    } catch (err) {
+      const { status, error } = handleError(err);
+      return c.json({ error }, status);
+    }
+  });
+
+  app.delete("/api/apps/:slug/env-request", (c) => {
+    const slug = c.req.param("slug");
+    if (!store.getApp(slug)) {
+      return c.json({ error: "App not found." }, 404);
+    }
+    store.clearAppEnvRequest(slug);
+    return c.json({ ok: true, envRequest: null });
   });
 
   // Tab 3 — Approvals & History

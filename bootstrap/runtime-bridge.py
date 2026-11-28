@@ -260,6 +260,17 @@ DISALLOWED_ENV_PREFIXES = ("VPSAGENT_", "VPS_OS_", "DOCKER_", "LD_")
 DISALLOWED_ENV_EXACT = frozenset(
     {"PATH", "HOME", "HOSTALIASES", "IFS", "ENV", "BASH_ENV"}
 )
+BUILD_TIME_PUBLIC_ENV_PREFIXES = (
+    "NEXT_PUBLIC_",
+    "VITE_",
+    "PUBLIC_",
+    "NUXT_PUBLIC_",
+    "REACT_APP_",
+    "EXPO_PUBLIC_",
+    "GATSBY_",
+)
+MAX_BUILD_ARGS = 64
+MAX_BUILD_ARGS_BYTES = 16 * 1024
 
 PEM_KEY_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----"
@@ -547,6 +558,54 @@ def validate_probe_path(raw: Any) -> str:
     return raw
 
 
+def validate_build_args(raw: Any) -> dict[str, str]:
+    """
+    Validates optional public build-time Docker build arguments (`NEXT_PUBLIC_*`,
+    `VITE_*`, etc.). Strictly rejects server secrets, forbidden keys, and control
+    characters so secrets can never be baked into Docker image layer history.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise BridgeRequestError(400, "Field 'buildArgs' must be an object of key/value strings.")
+    if len(raw) > MAX_BUILD_ARGS:
+        raise BridgeRequestError(
+            400, f"Too many buildArgs (max {MAX_BUILD_ARGS})."
+        )
+    out: dict[str, str] = {}
+    total_bytes = 0
+    for k, v in raw.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise BridgeRequestError(
+                400, "Each entry in 'buildArgs' must have a string key and string value."
+            )
+        if not ENV_KEY_PATTERN.match(k):
+            raise BridgeRequestError(400, f'Invalid buildArg key "{k}".')
+        if k in DISALLOWED_ENV_EXACT or any(
+            k.startswith(prefix) for prefix in DISALLOWED_ENV_PREFIXES
+        ):
+            raise BridgeRequestError(
+                400, f'Reserved environment variable "{k}" cannot be used as a buildArg.'
+            )
+        if not any(k.startswith(prefix) for prefix in BUILD_TIME_PUBLIC_ENV_PREFIXES):
+            raise BridgeRequestError(
+                400,
+                f'Build argument "{k}" is not an allowed public build-time variable (must start with NEXT_PUBLIC_, VITE_, PUBLIC_, NUXT_PUBLIC_, REACT_APP_, EXPO_PUBLIC_, or GATSBY_).',
+            )
+        if "\0" in v or "\n" in v or "\r" in v:
+            raise BridgeRequestError(
+                400, f'Build argument "{k}" cannot contain null bytes or newlines.'
+            )
+        entry_bytes = len(f"{k}={v}\n".encode("utf-8"))
+        if total_bytes + entry_bytes > MAX_BUILD_ARGS_BYTES:
+            raise BridgeRequestError(
+                400, f"Total 'buildArgs' size exceeds {MAX_BUILD_ARGS_BYTES} bytes."
+            )
+        total_bytes += entry_bytes
+        out[k] = v
+    return out
+
+
 def validate_git_branch(raw: Any) -> str | None:
     if raw is None:
         return None
@@ -693,12 +752,19 @@ def _inspect_cloned_repo(
     resolved_branch: str | None,
     commit_sha: str | None,
     dockerfile_rel: str,
+    build_arg_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Safely inspects a cloned public repository (strictly no symlink escapes, bounded reads,
     never extracts .env.example values) to detect its runtime, port, companion databases,
     required env key names, and optional auto-generated Locked-Apartment Dockerfile.
     """
+    arg_lines = [
+        f"ARG {k}"
+        for k in sorted(set(build_arg_keys or []))
+        if ENV_KEY_PATTERN.match(k)
+        and any(k.startswith(prefix) for prefix in BUILD_TIME_PUBLIC_ENV_PREFIXES)
+    ]
     suggested_slug, suggested_name = _derive_slug_and_name_from_repo_url(repo_url)
     env_example_keys = _extract_env_example_keys(clone_dir)
     env_key_names = {item["key"] for item in env_example_keys}
@@ -812,6 +878,7 @@ def _inspect_cloned_repo(
                     "ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0",
                     *install_lines,
                     "COPY . .",
+                    *arg_lines,
                     f"RUN {build_cmd}",
                     "RUN chown -R node:node /app",
                     "USER node",
@@ -868,6 +935,7 @@ def _inspect_cloned_repo(
                     "WORKDIR /app",
                     *install_lines,
                     "COPY . .",
+                    *arg_lines,
                     f"RUN {build_cmd}",
                     "",
                     "FROM nginxinc/nginx-unprivileged:alpine",
@@ -922,6 +990,7 @@ def _inspect_cloned_repo(
             "COPY . .",
         ]
         if has_build:
+            node_lines.extend(arg_lines)
             node_lines.append(f"RUN {run_prefix} build")
         node_lines.extend(
             [
@@ -3751,6 +3820,7 @@ class RuntimeService:
         allow_auto_detect = bool(
             payload.get("allowAutoDetect", dockerfile_rel in ("Dockerfile", "auto"))
         )
+        build_args = validate_build_args(payload.get("buildArgs"))
 
         raw_timeout = payload.get("timeoutSeconds", DEFAULT_BUILD_TIMEOUT_S)
         if (
@@ -3810,7 +3880,12 @@ class RuntimeService:
                 )
 
                 inspected = _inspect_cloned_repo(
-                    clone_dir, repo_url, resolved_branch, commit_sha, dockerfile_rel
+                    clone_dir,
+                    repo_url,
+                    resolved_branch,
+                    commit_sha,
+                    dockerfile_rel,
+                    build_arg_keys=list(build_args.keys()),
                 )
                 real_clone_dir = os.path.realpath(clone_dir)
                 used_auto_dockerfile = False
@@ -3883,19 +3958,28 @@ class RuntimeService:
                             )
                         os.chmod(dockerignore_path, 0o600)
 
-                build_proc = self._run_docker(
+                docker_build_cmd = [
+                    "build",
+                    "--label",
+                    "vpsagent.managed=true",
+                    "--label",
+                    f"vpsagent.slug={slug}",
+                ]
+                for arg_key in sorted(build_args):
+                    docker_build_cmd.extend(
+                        ["--build-arg", f"{arg_key}={build_args[arg_key]}"]
+                    )
+                docker_build_cmd.extend(
                     [
-                        "build",
-                        "--label",
-                        "vpsagent.managed=true",
-                        "--label",
-                        f"vpsagent.slug={slug}",
                         "-t",
                         image_tag,
                         "-f",
                         real_dockerfile,
                         real_clone_dir,
-                    ],
+                    ]
+                )
+                build_proc = self._run_docker(
+                    docker_build_cmd,
                     timeout=remaining_s,
                     check=False,
                 )
@@ -3909,8 +3993,30 @@ class RuntimeService:
                     if line.strip()
                 ][-MAX_BUILD_LOG_LINES:]
 
+                err_excerpt = (
+                    log_tail[-1] if log_tail else "unknown Docker build error"
+                )
+
+                if build_args and not used_auto_dockerfile:
+                    try:
+                        with open(real_dockerfile, "r", encoding="utf-8", errors="ignore") as dffh:
+                            custom_df_text = dffh.read(MAX_INSPECT_FILE_BYTES)
+                    except OSError:
+                        custom_df_text = ""
+                    missing_df_args = [
+                        k
+                        for k in sorted(build_args)
+                        if not re.search(rf"(?m)^\s*ARG\s+{re.escape(k)}(?:\s|=|$)", custom_df_text)
+                    ]
+                    if missing_df_args:
+                        log_tail = (
+                            log_tail
+                            + [
+                                f"[vpsagent] Note: custom Dockerfile does not declare ARG for {', '.join(missing_df_args)}. Add ARG lines to your build stage if your frontend needs them at build time."
+                            ]
+                        )[-MAX_BUILD_LOG_LINES:]
+
                 if build_proc.returncode != 0:
-                    err_excerpt = log_tail[-1] if log_tail else "unknown Docker build error"
                     raise BridgeRequestError(
                         502,
                         _scrub_secret_values(

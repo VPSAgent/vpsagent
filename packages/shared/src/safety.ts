@@ -151,6 +151,237 @@ export function validateEnvKey(key: string): string {
   return key;
 }
 
+export const BUILD_TIME_PUBLIC_ENV_PREFIXES = [
+  "NEXT_PUBLIC_",
+  "VITE_",
+  "PUBLIC_",
+  "NUXT_PUBLIC_",
+  "REACT_APP_",
+  "EXPO_PUBLIC_",
+  "GATSBY_",
+] as const;
+
+export const MAX_BUILD_ARGS = 64;
+export const MAX_BUILD_ARGS_BYTES = 16 * 1024;
+
+/**
+ * Returns true when an environment variable key is a client-side public build-time
+ * variable (e.g. `NEXT_PUBLIC_*`, `VITE_*`) that frontend bundlers inline at build time.
+ * Server secrets are never matched and must never be passed as Docker `--build-arg`s.
+ */
+export function isBuildTimePublicEnvKey(key: string): boolean {
+  if (!ENV_KEY_PATTERN.test(key) || isForbiddenAppEnvKey(key)) {
+    return false;
+  }
+  return BUILD_TIME_PUBLIC_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+/**
+ * Extracts only safe, public build-time environment variables (e.g. `NEXT_PUBLIC_*`,
+ * `VITE_*`) from an app's env map for forwarding as Docker `--build-arg`s.
+ * Throws a clear error if a build-time public variable contains null bytes/newlines
+ * or if the total count/byte budget is exceeded, rather than silently omitting values.
+ */
+export function extractBuildTimePublicEnvVars(
+  envMap: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  let count = 0;
+  let totalBytes = 0;
+  for (const key of Object.keys(envMap).sort()) {
+    if (!isBuildTimePublicEnvKey(key)) {
+      continue;
+    }
+    const value = envMap[key];
+    if (typeof value !== "string") {
+      continue;
+    }
+    if (value.includes("\0") || value.includes("\n") || value.includes("\r")) {
+      throw new Error(
+        `Build-time public variable "${key}" cannot contain newlines or null bytes.`,
+      );
+    }
+    const entryBytes = Buffer.byteLength(`${key}=${value}\n`, "utf8");
+    if (count >= MAX_BUILD_ARGS) {
+      throw new Error(
+        `Too many build-time public variables (max ${MAX_BUILD_ARGS}).`,
+      );
+    }
+    if (totalBytes + entryBytes > MAX_BUILD_ARGS_BYTES) {
+      throw new Error(
+        `Total size of build-time public variables exceeds ${MAX_BUILD_ARGS_BYTES} bytes (at "${key}").`,
+      );
+    }
+    out[key] = value;
+    count += 1;
+    totalBytes += entryBytes;
+  }
+  return out;
+}
+
+export interface ParsedEnvEntry {
+  key: string;
+  value: string;
+}
+
+export interface ParsedEnvError {
+  line: number;
+  message: string;
+}
+
+function parseQuotedEnvValue(
+  rawVal: string,
+  lineNo: number,
+  key: string,
+): { value: string } | { error: string } {
+  const quote = rawVal[0];
+  if (quote === '"') {
+    let decoded = "";
+    let i = 1;
+    while (i < rawVal.length) {
+      const ch = rawVal[i]!;
+      if (ch === "\\") {
+        if (i + 1 >= rawVal.length) {
+          return {
+            error: `Line ${lineNo}: unterminated double-quoted value for "${key}".`,
+          };
+        }
+        const next = rawVal[i + 1]!;
+        if (next === "n") decoded += "\n";
+        else if (next === "r") decoded += "\r";
+        else if (next === "t") decoded += "\t";
+        else if (next === '"') decoded += '"';
+        else if (next === "\\") decoded += "\\";
+        else decoded += `\\${next}`;
+        i += 2;
+        continue;
+      }
+      if (ch === '"') {
+        const suffix = rawVal.slice(i + 1).trim();
+        if (suffix.length > 0 && !suffix.startsWith("#")) {
+          return {
+            error: `Line ${lineNo}: unexpected characters after closing quote for "${key}".`,
+          };
+        }
+        return { value: decoded };
+      }
+      decoded += ch;
+      i += 1;
+    }
+    return {
+      error: `Line ${lineNo}: unterminated double-quoted value for "${key}".`,
+    };
+  }
+  if (quote === "'") {
+    let decoded = "";
+    let i = 1;
+    while (i < rawVal.length) {
+      const ch = rawVal[i]!;
+      if (ch === "\\" && i + 1 < rawVal.length && rawVal[i + 1] === "'") {
+        const afterQuote = rawVal.slice(i + 2);
+        const afterTrimmed = afterQuote.trim();
+        const isClosingQuote =
+          afterTrimmed.length === 0 ||
+          (/^\s+#/.test(afterQuote) && afterTrimmed.startsWith("#"));
+        if (!isClosingQuote) {
+          decoded += "'";
+          i += 2;
+          continue;
+        }
+      }
+      if (ch === "'") {
+        const suffix = rawVal.slice(i + 1).trim();
+        if (suffix.length > 0 && !suffix.startsWith("#")) {
+          return {
+            error: `Line ${lineNo}: unexpected characters after closing quote for "${key}".`,
+          };
+        }
+        return { value: decoded };
+      }
+      decoded += ch;
+      i += 1;
+    }
+    return {
+      error: `Line ${lineNo}: unterminated single-quoted value for "${key}".`,
+    };
+  }
+  let unquoted = rawVal;
+  const commentIdx = unquoted.search(/\s+#/);
+  if (commentIdx >= 0) {
+    unquoted = unquoted.slice(0, commentIdx).trimEnd();
+  }
+  return { value: unquoted };
+}
+
+/**
+ * Parses a multi-line `.env` text block into validated key/value pairs.
+ * Supports `#` comments, blank lines, optional `export ` prefixes, single/double quotes
+ * (including trailing `#` comments after the closing quote), and inline `#` comments on
+ * unquoted values. Later lines win on duplicate keys.
+ */
+export function parseEnvBlock(rawText: string): {
+  vars: ParsedEnvEntry[];
+  errors: ParsedEnvError[];
+} {
+  const byKey = new Map<string, string>();
+  const errors: ParsedEnvError[] = [];
+  const lines = rawText.split(/\r?\n/);
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const lineNo = i + 1;
+    let trimmed = lines[i]!.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+    if (trimmed.startsWith("export ")) {
+      trimmed = trimmed.slice("export ".length).trim();
+    }
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx <= 0) {
+      errors.push({
+        line: lineNo,
+        message: `Line ${lineNo}: expected KEY=VALUE format.`,
+      });
+      continue;
+    }
+    const key = trimmed.slice(0, eqIdx).trim();
+    if (!ENV_KEY_PATTERN.test(key)) {
+      errors.push({
+        line: lineNo,
+        message: `Line ${lineNo}: invalid key "${key}" (use letters, numbers, and underscores).`,
+      });
+      continue;
+    }
+    if (isForbiddenAppEnvKey(key)) {
+      errors.push({
+        line: lineNo,
+        message: `Line ${lineNo}: "${key}" is reserved and cannot be set.`,
+      });
+      continue;
+    }
+    const rawVal = trimmed.slice(eqIdx + 1).trim();
+    const parsedVal = parseQuotedEnvValue(rawVal, lineNo, key);
+    if ("error" in parsedVal) {
+      errors.push({ line: lineNo, message: parsedVal.error });
+      continue;
+    }
+    const { value } = parsedVal;
+    if (value.includes("\0")) {
+      errors.push({
+        line: lineNo,
+        message: `Line ${lineNo}: value for "${key}" cannot contain null bytes.`,
+      });
+      continue;
+    }
+    byKey.set(key, value);
+  }
+
+  return {
+    vars: Array.from(byKey.entries()).map(([key, value]) => ({ key, value })),
+    errors,
+  };
+}
+
 /**
  * Returns true if an environment variable key is reserved/forbidden inside user apps
  * (such as host control-plane prefixes or dynamic linker variables).

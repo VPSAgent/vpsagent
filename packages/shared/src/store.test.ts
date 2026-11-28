@@ -578,6 +578,44 @@ describe("RegistryStore (SQLite WAL)", () => {
         expect(migrated.getNotificationSettings().lastError).not.toContain(
           "secret999",
         );
+
+        // App env checklists: upsert, partial prune, full prune, and public build-time isSecret default
+        const req = migrated.upsertAppEnvRequest({
+          slug: "git-demo",
+          note: "Supabase + Polar",
+          keys: [
+            { key: "NEXT_PUBLIC_SUPABASE_URL", description: "Project URL" },
+            { key: "POLAR_ACCESS_TOKEN", description: "Secret token" },
+          ],
+          requestedBy: "Claude",
+        });
+        expect(req.rebuildAfterSave).toBe(true);
+        expect(req.keys[0]?.isSecret).toBe(false);
+        expect(req.keys[1]?.isSecret).toBe(true);
+
+        const partial = migrated.pruneFulfilledEnvRequestKeys("git-demo", [
+          "NEXT_PUBLIC_SUPABASE_URL",
+        ]);
+        expect(partial?.keys.map((k) => k.key)).toEqual(["POLAR_ACCESS_TOKEN"]);
+
+        const cleared = migrated.pruneFulfilledEnvRequestKeys("git-demo", [
+          "POLAR_ACCESS_TOKEN",
+        ]);
+        expect(cleared).toBeNull();
+        expect(migrated.getAppEnvRequest("git-demo")).toBeNull();
+
+        const storedEnv = migrated.setAppEnvVars("git-demo", [
+          { key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: "public-anon-123" },
+          { key: "SUPABASE_SERVICE_ROLE_KEY", value: "secret-role-456" },
+        ]);
+        const anonEntry = storedEnv.find(
+          (e) => e.key === "NEXT_PUBLIC_SUPABASE_ANON_KEY",
+        );
+        const secretEntry = storedEnv.find(
+          (e) => e.key === "SUPABASE_SERVICE_ROLE_KEY",
+        );
+        expect(anonEntry?.isSecret).toBe(false);
+        expect(secretEntry?.isSecret).toBe(true);
       } finally {
         migrated.close();
       }
